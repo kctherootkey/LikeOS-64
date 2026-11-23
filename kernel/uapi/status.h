@@ -36,6 +36,8 @@ typedef enum {
 		       // whose target the VFS follows from here (vfs_link_hop)
 	ST_NAMETOOLONG = -25, // a path grew past the longest one — ENAMETOOLONG
 	ST_NXIO = -26, // no such device behind the name (/dev/tty without one) — ENXIO
+	ST_UCLEAN = -27, // the journal must be replayed first and the mount asked
+			 // to be told (option recovery=ask) — EUCLEAN
 } status_t;
 
 #endif // LIKEOS_STATUS_H

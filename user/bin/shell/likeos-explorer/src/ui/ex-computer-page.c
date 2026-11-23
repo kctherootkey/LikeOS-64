@@ -185,7 +185,11 @@ static GtkWidget *drive_tile(ExComputerPage *p, const ExVolume *v)
 		GtkWidget *bar = gtk_level_bar_new_for_interval(0, 1);
 		char *fr = ex_format_size(v->free);
 		char *sz = ex_format_size(v->size);
-		char *sub = g_strdup_printf("%s free of %s", fr, sz);
+		char *sub = g_strdup_printf("%s free of %s%s", fr, sz,
+					    v->kind == EX_VOLUME_DRIVE &&
+							    v->readonly ?
+						    "  ·  Read-only" :
+						    "");
 		GtkWidget *sl = gtk_label_new(sub);
 
 		/* The theme colours the bar; its own low/high/full steps
@@ -211,17 +215,21 @@ static GtkWidget *drive_tile(ExComputerPage *p, const ExVolume *v)
 		g_free(sub);
 		g_free(fr);
 		g_free(sz);
-	} else if (v->kind == EX_VOLUME_USB && !v->root) {
-		/* A USB drive not opened: its size and why, in one line. */
+	} else if (v->kind == EX_VOLUME_DRIVE && !v->root) {
+		/* A drive not opened: its size and why, in one line. */
 		char *cap = ex_format_size(v->capacity);
 		char *fs = ex_devd_volume_fs_name(ex_devd_get_default(),
 						  v->fs_type, v->supported);
-		char *sub = strcmp(v->state, "formatting") == 0 ?
+		const char *ro = v->readonly ? "  ·  Read-only" : "";
+		char *sub = ex_volume_no_disc(v) ?
+				    g_strdup("No disc") :
+			    strcmp(v->state, "formatting") == 0 ?
 				    g_strdup_printf("%s  ·  Formatting…", cap) :
 			    !v->supported ?
 				    g_strdup_printf("%s  ·  %s, can't be opened",
 						    cap, fs) :
-				    g_strdup_printf("%s USB drive", cap);
+				    g_strdup_printf("%s %s%s", cap,
+						    ex_volume_type_text(v), ro);
 		GtkWidget *sl = gtk_label_new(sub);
 
 		gtk_label_set_xalign(GTK_LABEL(sl), 0);

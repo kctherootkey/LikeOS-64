@@ -680,6 +680,7 @@ static void ejected(GObject *src, GAsyncResult *res, gpointer w)
 typedef struct {
 	ExWindow *w;
 	char *name;
+	gboolean optical; /* a CD/DVD drive: its tray opens */
 } EjectReq;
 
 static void devd_ejected(GObject *src, GAsyncResult *res, gpointer data)
@@ -693,9 +694,9 @@ static void devd_ejected(GObject *src, GAsyncResult *res, gpointer data)
 		ex_window_show_error(r->w, what, e->message);
 		g_free(what);
 		g_error_free(e);
-	} else {
+	} else if (!r->optical) {
 		/* The drive leaves the list; this says it may leave the
-		 * computer too. */
+		 * computer too.  (A disc needs no word: the tray opened.) */
 		GtkWidget *d = gtk_message_dialog_new(
 			GTK_WINDOW(r->w), GTK_DIALOG_DESTROY_WITH_PARENT,
 			GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE,
@@ -724,15 +725,24 @@ static void a_eject(GSimpleAction *a, GVariant *p, gpointer w)
 
 	if (!v && l && ex_location_file(l))
 		v = ex_volumes_find(vols, ex_location_file(l));
-	if (v && v->kind == EX_VOLUME_USB) {
+	if (v && v->kind == EX_VOLUME_DRIVE) {
 		/* The device service unmounts every volume of the disk and
-		 * marks it safe to unplug.  The tabs inside the drive leave
-		 * it first, so nothing here holds it open. */
-		EjectReq *r = g_new0(EjectReq, 1);
-		char *disk = g_strdup(v->disk);
+		 * marks it safe to unplug (a CD/DVD drive opens its tray).
+		 * The tabs inside the drive leave it first, so nothing here
+		 * holds it open.  A built-in disk is never ejected. */
+		EjectReq *r;
+		char *disk;
 
+		if (!ex_volume_can_eject(v)) {
+			if (l)
+				ex_location_unref(l);
+			return;
+		}
+		r = g_new0(EjectReq, 1);
+		disk = g_strdup(v->disk);
 		r->w = g_object_ref(EX_WINDOW(w));
 		r->name = g_strdup(v->name);
+		r->optical = v->drive == EX_DRIVE_OPTICAL;
 		ex_volumes_release(vols, v);
 		ex_devd_eject_async(ex_devd_get_default(), disk, NULL,
 				    devd_ejected, r);
@@ -752,8 +762,50 @@ static void a_format_drive(GSimpleAction *a, GVariant *p, gpointer w)
 	ExLocation *l = ex_location_parse(g_variant_get_string(p, NULL));
 	const ExVolume *v = ex_volumes_for_location(ex_volumes_get_default(), l);
 
-	if (v && v->kind == EX_VOLUME_USB)
+	if (ex_volume_can_format(v))
 		ex_format_dialog_show(EX_WINDOW(w), v->device);
+	if (l)
+		ex_location_unref(l);
+}
+
+static void devd_unmounted(GObject *src, GAsyncResult *res, gpointer data)
+{
+	EjectReq *r = data;
+	GError *e = NULL;
+
+	if (!ex_devd_unmount_finish(EX_DEVD(src), res, &e)) {
+		char *what = g_strdup_printf("%s could not be unmounted", r->name);
+
+		ex_window_show_error(r->w, what, e->message);
+		g_free(what);
+		g_error_free(e);
+	}
+	g_object_unref(r->w);
+	g_free(r->name);
+	g_free(r);
+}
+
+/* A built-in disk's partition: unmounted, it stays listed (a click mounts
+ * it again).  The tabs inside it leave it first. */
+static void a_unmount_drive(GSimpleAction *a, GVariant *p, gpointer w)
+{
+	ExLocation *l = ex_location_parse(g_variant_get_string(p, NULL));
+	ExVolumes *vols = ex_volumes_get_default();
+	const ExVolume *v = ex_volumes_for_location(vols, l);
+
+	if (!v && l && ex_location_file(l))
+		v = ex_volumes_find(vols, ex_location_file(l));
+	if (ex_volume_can_unmount(v)) {
+		EjectReq *r = g_new0(EjectReq, 1);
+		char *dev = g_strdup(v->device);
+
+		r->w = g_object_ref(EX_WINDOW(w));
+		r->name = g_strdup(v->name);
+		ex_volumes_release(vols, v);
+		ex_devd_unmount_async(ex_devd_get_default(), dev, NULL,
+				      devd_unmounted, r);
+		g_free(dev);
+	}
 	if (l)
 		ex_location_unref(l);
 }
@@ -1207,6 +1259,7 @@ static const GActionEntry entries[] = {
 	{ "restore-all", a_restore_all },
 	{ "eject", a_eject, "s" },
 	{ "format-drive", a_format_drive, "s" },
+	{ "unmount-drive", a_unmount_drive, "s" },
 	{ "operations", a_operations },
 	{ "options", a_options },
 	{ "view-mode", a_view_mode, "s", "'details'" },

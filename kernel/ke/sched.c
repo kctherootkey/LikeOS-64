@@ -18,6 +18,7 @@
  * Copyright (C) 2026 The LikeOS Project
  */
 
+#include <kernel/ke/task_path.h>
 #include <kernel/fs/file.h>
 #include <kernel/ke/sched.h>
 #include <kernel/io/console.h>
@@ -2097,8 +2098,8 @@ static void task_init_common(task_t *t)
 	t->start_tick = timer_ticks();
 	t->utime_us = 0;
 	t->stime_us = 0;
-	t->cwd[0] = '/';
-	t->cwd[1] = 0;
+	t->fs_cwd = NULL; /* "/" (task_path.h) */
+	t->fs_root = NULL;
 	// Credentials policy (mirrors the conventional inheritance model):
 	//   - kernel tasks (bootstrap/idle/kernel threads) run with privileged
 	//     (root) credentials — they execute kernel code with full access;
@@ -2141,7 +2142,7 @@ static void task_init_common(task_t *t)
 	/* No executable yet: a task that has not exec'd has no path to report,
 	 * and an uninitialised one would be handed to a debugger as a filename
 	 * to open. */
-	t->exe_path[0] = '\0';
+	t->fs_exe = NULL;
 	t->syscall_regs_valid = 0;
 	t->syscall_frame = NULL;
 	t->incarnation = task_next_incarnation();
@@ -3927,6 +3928,9 @@ void sched_remove_task(task_t *task)
 	 * one -- including a thread's empty one.  Released here, with the
 	 * task_t it belongs to. */
 	mm_regions_free(task);
+	/* Its working directory, root and executable path (references:
+	 * readers elsewhere may hold their own). */
+	task_paths_release(task);
 	if (task->signals.sigfd_wq) {
 		kfree(task->signals.sigfd_wq);
 		task->signals.sigfd_wq = NULL;
@@ -4037,6 +4041,10 @@ task_t *sched_fork_current(void)
 
 	// Copy parent
 	mm_memcpy(child, cur, sizeof(task_t));
+	/* The working directory, root and executable path are references:
+	 * none is taken yet, so a failure before the child is listed has
+	 * nothing to give back (task_paths_fork below takes them). */
+	task_paths_clear(child);
 	child->blk_cpl_ctx = NULL; /* the creator's stack, not ours */
 	child->plug = NULL; /* likewise */
 	child->vfs_walk = NULL; /* likewise */
@@ -4244,6 +4252,10 @@ task_t *sched_fork_current(void)
 
 	/* The region table was copied by mm_regions_clone() above, which had to
 	 * run immediately after the task_t copy; nothing to do here. */
+
+	/* Nothing can fail the child from here: its own references to the
+	 * parent's working directory, root and executable path. */
+	task_paths_fork(child, cur);
 
 	// Add to global task list
 	uint64_t flags;

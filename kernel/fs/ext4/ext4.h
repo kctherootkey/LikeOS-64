@@ -80,7 +80,11 @@
 #define EXT4_FEATURE_RO_COMPAT_LARGE_FILE 0x0002
 #define EXT4_FEATURE_RO_COMPAT_HUGE_FILE 0x0008
 #define EXT4_FEATURE_RO_COMPAT_GDT_CSUM 0x0010
+#define EXT4_FEATURE_RO_COMPAT_DIR_NLINK 0x0020
+#define EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE 0x0040
+#define EXT4_FEATURE_RO_COMPAT_BIGALLOC 0x0200
 #define EXT4_FEATURE_RO_COMPAT_METADATA_CSUM 0x0400
+#define EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT 0x10000
 
 /* inode i_flags bits */
 #define EXT4_INODE_IMMUTABLE_FL 0x00000010 /* may not be modified at all      */
@@ -160,16 +164,47 @@ typedef struct ext4_super_block {
 	uint16_t s_min_extra_isize; /* 0x15C */
 	uint16_t s_want_extra_isize; /* 0x15E */
 	uint32_t s_flags; /* 0x160 */
-	uint8_t s_pad_0164[0x175 - 0x164]; /* raid/mmp/raid_stripe (unused)   */
+	uint8_t s_pad_0164[0x174 - 0x164]; /* raid/mmp/raid_stripe (unused)   */
+	uint8_t s_log_groups_per_flex; /* 0x174  flex_bg group size, log2 */
 	uint8_t s_checksum_type; /* 0x175  1 => crc32c              */
 	uint8_t s_pad_0176[0x194 - 0x176]; /* encrypt/snapshot (unused)       */
 	uint32_t s_error_count; /* 0x194  # of errors seen         */
-	uint8_t s_pad_0198[0x270 -
-			   0x198]; /* first/last-error records (unused) */
+	/* The first and the most recent error: when (seconds, the high
+	 * bits in *_time_hi below), the inode and block concerned (0: none),
+	 * and the function and source line that found it. */
+	uint32_t s_first_error_time; /* 0x198 */
+	uint32_t s_first_error_ino; /* 0x19C */
+	uint64_t s_first_error_block; /* 0x1A0 */
+	char s_first_error_func[32]; /* 0x1A8 */
+	uint32_t s_first_error_line; /* 0x1C8 */
+	uint32_t s_last_error_time; /* 0x1CC */
+	uint32_t s_last_error_ino; /* 0x1D0 */
+	uint32_t s_last_error_line; /* 0x1D4 */
+	uint64_t s_last_error_block; /* 0x1D8 */
+	char s_last_error_func[32]; /* 0x1E0 */
+	uint8_t s_pad_0200[0x248 - 0x200]; /* mount opts, quota (unused) */
+	uint32_t s_overhead_clusters; /* 0x248  metadata blocks (may be 0)  */
+	uint32_t s_backup_bgs[2]; /* 0x24C  sparse_super2 backup groups */
+	uint8_t s_pad_0254[0x270 - 0x254]; /* quota inodes etc. (unused)   */
 	uint32_t s_checksum_seed; /* 0x270  crc32c(~0, s_uuid)       */
-	uint8_t s_pad_0274[0x3FC - 0x274]; /* quota/encrypt/... (unused)      */
+	uint8_t s_pad_0274[0x278 - 0x274]; /* time high bytes (unused) */
+	uint8_t s_first_error_time_hi; /* 0x278 */
+	uint8_t s_last_error_time_hi; /* 0x279 */
+	uint8_t s_first_error_errcode; /* 0x27A  EXT4_ERR_* */
+	uint8_t s_last_error_errcode; /* 0x27B  EXT4_ERR_* */
+	uint8_t s_pad_027c[0x3FC - 0x27C]; /* encoding/quota/... (unused)    */
 	uint32_t s_checksum; /* 0x3FC  crc32c of SB[0..0x3FC)   */
 } __attribute__((packed)) ext4_super_block; /* exactly 1024 bytes */
+
+_Static_assert(__builtin_offsetof(ext4_super_block, s_last_error_func) ==
+		       0x1E0,
+	       "s_last_error_func");
+_Static_assert(__builtin_offsetof(ext4_super_block, s_last_error_errcode) ==
+		       0x27B,
+	       "s_last_error_errcode");
+
+/* The error code kept with the first and the last error (s_*_errcode). */
+#define EXT4_ERR_EFSCORRUPTED 5
 
 typedef struct ext4_group_desc {
 	uint32_t bg_block_bitmap_lo;
@@ -324,7 +359,7 @@ _Static_assert(sizeof(ext4_xattr_entry) == 16, "ext4_xattr_entry size");
  * IMPORTANT: unlike the ext4 filesystem structures above (which are
  * little-endian and read directly on x86-64), the jbd2 journal is stored
  * **big-endian** on disk.  Every multi-byte field below must be byte-swapped
- * before use (see the be16/be32 helpers in ext4.c).
+ * before use (see the be16/be32 helpers in ext4_int.h and journal.c).
  * =================================================================== */
 
 #define JBD2_MAGIC_NUMBER 0xc03b3998U
@@ -445,6 +480,9 @@ typedef struct ext4_fs {
 	unsigned int inodes_per_group;
 	unsigned int blocks_per_group;
 	unsigned long blocks_count;
+	/* Blocks of the filesystem's own structures (statfs leaves them
+	 * out of the total), set at mount. */
+	unsigned long overhead_blocks;
 	unsigned long inodes_count;
 	unsigned int first_data_block; /* 1 if block_size==1024 else 0      */
 	unsigned int desc_size; /* 32 or 64                          */
@@ -466,6 +504,10 @@ typedef struct ext4_fs {
 	/* metadata_csum (crc32c).  has_metadata_csum gates all csum work;
      * csum_seed is crc32c(~0, s_uuid) (or s_checksum_seed if CSUM_SEED).    */
 	int has_metadata_csum;
+	/* Group descriptors carry a checksum (metadata_csum: crc32c form,
+	 * else gdt_csum / uninit_bg: crc16 form); gates the UNINIT flags and
+	 * bg_itable_unused as well. */
+	int has_gd_csum;
 	uint32_t csum_seed;
 	/* Journaled-writes (ordered mode) state.  j_enabled gates it all.        */
 	int j_enabled; /* journal writes active this mount  */
@@ -479,12 +521,12 @@ typedef struct ext4_fs {
 	uint32_t j_csum_seed; /* crc32c(~0, j_uuid) for tag/desc/  */
 	/* commit csums (NOT the sb csum)    */
 	/* Everything else the mounted filesystem keeps: locks, caches, the
-	 * journal batch (struct ext4_state, private to ext4.c).  Allocated by
+	 * journal batch (struct ext4_state, private to the driver: ext4_int.h).  Allocated by
 	 * ext4_mount(). */
 	struct ext4_state *st;
 	/* The mount this filesystem is (NULL until registered). */
 	struct vfs_mount *mnt;
-	/* What mount(2) asked for beyond the flags (EXT4_MNT_*, ext4.c). */
+	/* What mount(2) asked for beyond the flags (EXT4_MNT_*, ext4_int.h). */
 	unsigned mnt_opts;
 } ext4_fs_t;
 

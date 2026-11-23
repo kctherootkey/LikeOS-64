@@ -1835,11 +1835,12 @@ static void xhci_handle_port_event(xhci_controller_t *ctrl, xhci_trb_t *trb)
 	xhci_dbg("Port status change event: Port %d, PORTSC=0x%08x\n", port,
 		 portsc);
 
-	// If this is a Connect Status Change (CSC), flag the port for the
-	// main-loop hot-plug handler.  We don't enumerate here because
-	// enumeration requires control transfers that can't be issued from
-	// IRQ context with xhci_lock held.
-	if ((portsc & XHCI_PORTSC_CSC) && port > 0 && port <= XHCI_MAX_PORTS) {
+	if (port == 0 || port > XHCI_MAX_PORTS)
+		return;
+
+	// A connect change on a port that had a configured device and is
+	// empty now: mark that device gone at once (see below).
+	if ((portsc & XHCI_PORTSC_CSC) && !(portsc & XHCI_PORTSC_CCS)) {
 		/* A disconnect: whatever is configured on the port is gone
 		 * from now on.  Transfers in flight to it fail at once
 		 * (they watch dev->gone) instead of running into their
@@ -1847,26 +1848,31 @@ static void xhci_handle_port_event(xhci_controller_t *ctrl, xhci_trb_t *trb)
 		 * port that had a configured device is recorded as gone: the
 		 * link of a device being enumerated may drop during its port
 		 * reset. */
-		if (!(portsc & XHCI_PORTSC_CCS)) {
-			int had = 0;
-			for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
-				usb_device_t *d = &ctrl->devices[i];
-				if (d->configured && d->port == port) {
-					d->gone = 1;
-					had = 1;
-				}
+		int had = 0;
+		for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
+			usb_device_t *d = &ctrl->devices[i];
+			if (d->configured && d->port == port) {
+				d->gone = 1;
+				had = 1;
 			}
-			if (had)
-				__atomic_or_fetch(&ctrl->port_gone,
-						  1U << (port - 1),
-						  __ATOMIC_SEQ_CST);
 		}
-		__atomic_or_fetch(&ctrl->hotplug_ports, 1U << (port - 1),
-				  __ATOMIC_SEQ_CST);
+		if (had)
+			__atomic_or_fetch(&ctrl->port_gone, 1U << (port - 1),
+					  __ATOMIC_SEQ_CST);
 	}
 
-	// NOTE: Don't clear change bits here - let xhci_port_reset / hotplug_poll
-	// handle them.  The reset code polls for these bits.
+	// Flag the port for the hot-plug poll on ANY change bit, not only a
+	// connect change.  The controller raises a port status change event
+	// only when the port's change bits go from all clear to one set:
+	// a change bit left set (link state, enable, reset, over-current,
+	// config error) silences the port, and a later plug-in raises no
+	// event at all.  The poll clears every change bit it finds.  It does
+	// not run here: enumeration needs control transfers, which cannot
+	// be issued from interrupt context with xhci_lock held, and the
+	// port reset code polls PRC/WRC itself.
+	if (portsc & XHCI_PORTSC_WPR_MASK)
+		__atomic_or_fetch(&ctrl->hotplug_ports, 1U << (port - 1),
+				  __ATOMIC_SEQ_CST);
 }
 
 //=============================================================================
@@ -2128,19 +2134,37 @@ void xhci_hotplug_poll(xhci_controller_t *ctrl)
 		uint32_t off = XHCI_OP_PORTSC_BASE + (port - 1) * 0x10;
 		uint32_t portsc = xhci_op_read32(ctrl, off);
 
-		// Clear the CSC bit (RW1C) while preserving PP, then look at
-		// the port again: a change after this clear raises a new
-		// event instead of being wiped by it.
+		// Clear EVERY change bit that is set (all RW1C) while
+		// preserving PP, then look at the port again: a change after
+		// this clear raises a new event instead of being wiped by it.
+		// One change bit left set would keep the port from raising
+		// any further status change event (see xhci_handle_port_event).
 		// CRITICAL: Do NOT include PED in the write value!  PED is RW1CS,
 		// meaning writing 1 to it CLEARS it, which disables the port and
 		// kills any active transfers on that port.
 		int changed = 0;
-		if (portsc & XHCI_PORTSC_CSC) {
-			uint32_t clear =
-				(portsc & XHCI_PORTSC_PP) | XHCI_PORTSC_CSC;
-			xhci_op_write32(ctrl, off, clear);
+		uint32_t chg = portsc & XHCI_PORTSC_WPR_MASK;
+		if (chg) {
+			xhci_op_write32(ctrl, off,
+					(portsc & XHCI_PORTSC_PP) | chg);
+			if (chg & XHCI_PORTSC_OCC)
+				kprintf("[XHCI] Port %d: over-current change "
+					"(over-current %s)\n",
+					port,
+					(portsc & XHCI_PORTSC_OCA) ? "active"
+								   : "gone");
+			// A connect change, a port the hardware disabled (an
+			// enable change leaving it disabled) or a SuperSpeed
+			// link that fell into SS.Inactive: the device there
+			// has to be looked at again.  Other changes (reset,
+			// link state, config error) only needed clearing.
+			if ((chg & XHCI_PORTSC_CSC) ||
+			    ((chg & XHCI_PORTSC_PEC) &&
+			     !(portsc & XHCI_PORTSC_PED)) ||
+			    ((chg & XHCI_PORTSC_PLC) &&
+			     ((portsc & XHCI_PORTSC_PLS_MASK) >> 5) == 6))
+				changed = 1;
 			portsc = xhci_op_read32(ctrl, off);
-			changed = 1;
 		}
 
 		// A connect change while the port is connected, and its device
@@ -2182,8 +2206,13 @@ void xhci_hotplug_rescan(xhci_controller_t *ctrl)
 	     port <= ctrl->max_ports && port <= XHCI_MAX_PORTS; port++) {
 		uint32_t portsc = xhci_op_read32(
 			ctrl, XHCI_OP_PORTSC_BASE + (port - 1) * 0x10);
-		if ((portsc & XHCI_PORTSC_CCS) &&
-		    !xhci_port_has_device(ctrl, port))
+		// A connected port without a device, or any port with a
+		// change bit left set (its event may have been drained during
+		// the boot phase; while it stays set the port raises no
+		// further event): the hot-plug poll looks at it.
+		if (((portsc & XHCI_PORTSC_CCS) &&
+		     !xhci_port_has_device(ctrl, port)) ||
+		    (portsc & XHCI_PORTSC_WPR_MASK))
 			__atomic_or_fetch(&ctrl->hotplug_ports,
 					  1U << (port - 1), __ATOMIC_SEQ_CST);
 	}

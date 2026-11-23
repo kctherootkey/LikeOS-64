@@ -13,39 +13,44 @@
 #include <kernel/ke/syscalls.h>
 #include <kernel/fs/file.h>
 #include <kernel/fs/namei.h>
+#include <kernel/fs/pathbuf.h>
+#include <kernel/fs/mount.h> /* vfs_canon */
+#include <kernel/ke/task_path.h>
 
 static int64_t ftruncate_held(task_t *cur, vfs_file_t *f, uint64_t length);
 static int64_t fchmod_held(task_t *cur, vfs_file_t *f, uint64_t mode);
 static int64_t fchown_held(task_t *cur, vfs_file_t *f, uint64_t owner, uint64_t group);
 
-int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
+/* The open itself, on the absolute path `path' the caller has worked out:
+ * shared by open() and openat(). */
+static int64_t open_resolved_canon(task_t *cur, const char *path,
+				   uint64_t flags, uint64_t mode);
+
+static int64_t open_resolved(task_t *cur, const char *path, uint64_t flags,
+			     uint64_t mode)
 {
-	might_sleep();
-	task_t *cur = sched_current();
-	BUG_ON(cur == NULL);
-	if (!cur)
-		return -EFAULT;
+	/* Which name it is -- a /dev node, a /dev/fd alias -- is decided on
+	 * the canonical path: "//dev/tty" and "/dev/./tty" are /dev/tty (and
+	 * meet its rules), "/dev/../x" is not in /dev at all. */
+	char *cbuf = NULL;
+	const char *cp = path;
+	int64_t ret;
 
-	if (!validate_user_ptr(pathname, 1)) {
-		return -EFAULT;
+	if (path[0] == '/') {
+		cbuf = pathbuf_get();
+		if (!cbuf)
+			return -ENOMEM;
+		cp = vfs_canon(path, cbuf);
 	}
+	ret = open_resolved_canon(cur, cp, flags, mode);
+	pathbuf_put(cbuf);
+	return ret;
+}
 
-	// Copy user path to kernel buffer first
-	char kpath[VFS_MAX_PATH];
-	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
-
+static int64_t open_resolved_canon(task_t *cur, const char *path,
+				   uint64_t flags, uint64_t mode)
+{
 	vfs_file_t *file = NULL;
-	const char *path = kpath;
-	char full[VFS_MAX_PATH];
-	if (path[0] != '/' || cur->root[0]) {
-		int brest =
-			build_at_path(cur, AT_FDCWD, path, full, sizeof(full));
-		if (brest != 0)
-			return brest;
-		path = full;
-	}
 
 	/* /dev/fd/N and friends: open == duplicate the caller's descriptor */
 	int devfd = devfs_fd_alias_target(path);
@@ -101,6 +106,43 @@ int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
 	return fd;
 }
 
+int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
+{
+	might_sleep();
+	task_t *cur = sched_current();
+	BUG_ON(cur == NULL);
+	if (!cur)
+		return -EFAULT;
+
+	if (!validate_user_ptr(pathname, 1)) {
+		return -EFAULT;
+	}
+
+	// Copy user path to kernel buffer first
+	char *kpath, *full = NULL;
+	int64_t ret = user_path_get(pathname, &kpath);
+	if (ret != 0)
+		return ret;
+
+	const char *path = kpath;
+	if (path[0] != '/' || task_root(cur)[0]) {
+		full = pathbuf_get();
+		if (!full) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		ret = build_at_path(cur, AT_FDCWD, path, full, PATHBUF_SIZE);
+		if (ret != 0)
+			goto out;
+		path = full;
+	}
+	ret = open_resolved(cur, path, flags, mode);
+out:
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return ret;
+}
+
 // SYS_OPENAT - open a file relative to dirfd
 int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
 		   uint64_t mode)
@@ -112,72 +154,33 @@ int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
 		return -EFAULT;
 
 	// Copy user path string to kernel buffer first
-	char kpath[VFS_MAX_PATH];
-	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
+	char *kpath, *full = NULL;
+	int64_t ret = user_path_get(pathname, &kpath);
+	if (ret != 0)
+		return ret;
 
-	char full[VFS_MAX_PATH];
-	int ret;
-	if (kpath[0] == '/') {
-		size_t i = 0;
-		for (; kpath[i] && i < sizeof(full) - 1; ++i)
-			full[i] = kpath[i];
-		full[i] = '\0';
+	const char *path = kpath;
+	if (kpath[0] != '/' || task_root(cur)[0]) {
 		/* A jailed task's absolute paths must be canonicalised and
-		 * prefixed with the jail root; build_at_path does both.  No-op
-		 * (verbatim copy stands) when the task is not chrooted. */
-		if (cur->root[0]) {
-			int _cr = build_at_path(cur, AT_FDCWD, kpath, full,
-						sizeof(full));
-			if (_cr != 0)
-				return _cr;
+		 * prefixed with the jail root; build_at_path does both (the
+		 * descriptor is ignored for an absolute path).  Otherwise an
+		 * absolute path is used as it was given. */
+		full = pathbuf_get();
+		if (!full) {
+			ret = -ENOMEM;
+			goto out;
 		}
-	} else {
-		ret = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
+		ret = build_at_path(cur, (int)dirfd, kpath, full,
+				    PATHBUF_SIZE);
 		if (ret != 0)
-			return ret;
+			goto out;
+		path = full;
 	}
-	/* /dev/fd/N and friends: open == duplicate the caller's descriptor */
-	int devfd = devfs_fd_alias_target(full);
-	if (devfd >= 0)
-		return sys_dup((uint64_t)devfd);
-
-	vfs_file_t *file = NULL;
-	if (full[0] == '/' && full[1] == 'd' && full[2] == 'e' &&
-	    full[3] == 'v' && (full[4] == '/' || full[4] == '\0')) {
-		int pr = devfs_open_perm(cur, full, flags);
-		if (pr < 0)
-			return pr;
-		ret = devfs_open_for_task(full, (int)flags,
-					  creat_mode(cur, mode), &file, cur);
-		if (ret == ST_OK && file) {
-			file->refcount = 1;
-			file->flags = (int)flags;
-		}
-	} else {
-		/* Same as sys_open: the creation mode must reach the fs. */
-		ret = vfs_open_mode(full, (int)flags, creat_mode(cur, mode),
-				    &file);
-	}
-	if (ret != ST_OK || file == NULL) {
-		return vfs_status_to_errno(ret);
-	}
-	/* Claim the descriptor only once the object exists — see sys_open. */
-	int fd = fd_install(cur, file);
-	if (fd < 0) {
-		fd_release_entry(file);
-		return fd;
-	}
-	/* O_CLOEXEC must be recorded: exec now honours FD_CLOEXEC instead of
-	 * closing every descriptor, so a descriptor opened with O_CLOEXEC only
-	 * disappears across exec if the flag is stored here. */
-	if (flags & O_CLOEXEC)
-		task_set_fd_flags(cur, (unsigned)fd, FD_CLOEXEC);
-	/* O_TRUNC modifies contents → drop set-id bits for a non-root caller. */
-	if ((flags & O_TRUNC) && cur->cred.euid != 0)
-		strip_setid_file(file);
-	return fd;
+	ret = open_resolved(cur, path, flags, mode);
+out:
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return ret;
 }
 
 // SYS_CLOSE - close a file descriptor
@@ -292,34 +295,16 @@ int64_t sys_close(uint64_t fd)
 	return 0;
 }
 
-int64_t sys_access(uint64_t pathname, uint64_t mode)
+/* access()/faccessat() on the absolute path `path'; `use_real': with the
+ * real ids, else the effective ones (AT_EACCESS). */
+static int64_t access_resolved(task_t *cur, const char *path, uint64_t mode,
+			       int use_real)
 {
-	task_t *cur = sched_current();
-	if (!cur)
-		return -EFAULT;
-	if (!validate_user_ptr(pathname, 1))
-		return -EFAULT;
-
-	// Copy user path to kernel buffer first
-	char kpath[VFS_MAX_PATH];
-	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
-
-	const char *path = kpath;
-	char full[VFS_MAX_PATH];
-	if (path[0] != '/' || cur->root[0]) {
-		int retb =
-			build_at_path(cur, AT_FDCWD, path, full, sizeof(full));
-		if (retb != 0)
-			return retb;
-		path = full;
-	}
 	/* Ancestor search first (so an unsearchable prefix → EACCES, not
      * ENOENT, and F_OK requires reachability), then existence, then the mode.
-     * access(2) checks the REAL uid/gid; R_OK/W_OK/X_OK (4/2/1) == MAY_*. */
-	int tr = perm_traverse_cred(path,
-				    1); /* real-id search to match the check */
+     * access(2) checks the REAL uid/gid; R_OK/W_OK/X_OK (4/2/1) == MAY_*.
+     * The prefix search uses the same ids as the final check. */
+	int tr = perm_traverse_cred(path, use_real);
 	if (tr < 0)
 		return tr;
 	struct kstat st;
@@ -329,12 +314,48 @@ int64_t sys_access(uint64_t pathname, uint64_t mode)
 			return -ENOENT;
 		if (ret == ST_IO)
 			return -EIO; /* corrupt metadata, not absent */
+		if (ret == ST_NAMETOOLONG || ret == ST_LOOP ||
+		    ret == ST_NOMEM)
+			return vfs_status_to_errno(ret);
 		return -EINVAL;
 	}
-	int want = (int)(mode & 7);
+	int want = (int)(mode & 7); /* R_OK/W_OK/X_OK == MAY_READ/WRITE/EXEC */
 	if (want == 0)
 		return 0; /* F_OK: exists and reachable */
-	return perm_access(cur, path, &st, want, 1);
+	return perm_access(cur, path, &st, want, use_real);
+}
+
+int64_t sys_access(uint64_t pathname, uint64_t mode)
+{
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+	if (!validate_user_ptr(pathname, 1))
+		return -EFAULT;
+
+	// Copy user path to kernel buffer first
+	char *kpath, *full = NULL;
+	int64_t ret = user_path_get(pathname, &kpath);
+	if (ret != 0)
+		return ret;
+
+	const char *path = kpath;
+	if (path[0] != '/' || task_root(cur)[0]) {
+		full = pathbuf_get();
+		if (!full) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		ret = build_at_path(cur, AT_FDCWD, path, full, PATHBUF_SIZE);
+		if (ret != 0)
+			goto out;
+		path = full;
+	}
+	ret = access_resolved(cur, path, mode, 1);
+out:
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return ret;
 }
 
 int64_t sys_faccessat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
@@ -348,52 +369,33 @@ int64_t sys_faccessat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
 	}
 
 	// Copy user path to kernel buffer first
-	char kpath[VFS_MAX_PATH];
-	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
+	char *kpath, *full = NULL;
+	int64_t ret = user_path_get(pathname, &kpath);
+	if (ret != 0)
+		return ret;
 
-	char full[VFS_MAX_PATH];
-	if (kpath[0] == '/') {
-		size_t i = 0;
-		for (; kpath[i] && i < sizeof(full) - 1; ++i)
-			full[i] = kpath[i];
-		full[i] = '\0';
+	const char *path = kpath;
+	if (kpath[0] != '/' || task_root(cur)[0]) {
 		/* A jailed task's absolute paths must be canonicalised and
-		 * prefixed with the jail root; build_at_path does both.  No-op
-		 * (verbatim copy stands) when the task is not chrooted. */
-		if (cur->root[0]) {
-			int _cr = build_at_path(cur, AT_FDCWD, kpath, full,
-						sizeof(full));
-			if (_cr != 0)
-				return _cr;
+		 * prefixed with the jail root; build_at_path does both.  An
+		 * absolute path otherwise stands as given. */
+		full = pathbuf_get();
+		if (!full) {
+			ret = -ENOMEM;
+			goto out;
 		}
-	} else {
-		int ret = build_at_path(cur, (int)dirfd, kpath, full,
-					sizeof(full));
+		ret = build_at_path(cur, (int)dirfd, kpath, full,
+				    PATHBUF_SIZE);
 		if (ret != 0)
-			return ret;
+			goto out;
+		path = full;
 	}
-	/* AT_EACCESS checks with the effective/fs IDs; otherwise the real IDs — the
-     * prefix search must use the same ids as the final check. */
-	int use_real = (flags & AT_EACCESS) ? 0 : 1;
-	int tr = perm_traverse_cred(
-		full, use_real); /* ancestor search before existence */
-	if (tr < 0)
-		return tr;
-	struct kstat st;
-	int st_ret = vfs_stat(full, &st);
-	if (st_ret != ST_OK) {
-		if (st_ret == ST_NOT_FOUND)
-			return -ENOENT;
-		if (st_ret == ST_IO)
-			return -EIO; /* corrupt metadata, not absent */
-		return -EINVAL;
-	}
-	int want = (int)(mode & 7); /* R_OK/W_OK/X_OK == MAY_READ/WRITE/EXEC */
-	if (want == 0)
-		return 0; /* F_OK: exists and reachable */
-	return perm_access(cur, full, &st, want, (flags & AT_EACCESS) ? 0 : 1);
+	/* AT_EACCESS checks with the effective/fs IDs; otherwise the real IDs. */
+	ret = access_resolved(cur, path, mode, (flags & AT_EACCESS) ? 0 : 1);
+out:
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return ret;
 }
 
 int64_t sys_chdir(uint64_t pathname)
@@ -406,42 +408,70 @@ int64_t sys_chdir(uint64_t pathname)
 	}
 
 	// Copy user path to kernel buffer first
-	char kpath[VFS_MAX_PATH];
-	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
-
-	char full[VFS_MAX_PATH];
-	const char *cwd = (cur->cwd[0] != 0) ? cur->cwd : "/";
-	int ret = normalize_path(cwd, kpath, full, sizeof(full));
+	char *kpath, *full = NULL, *real = NULL;
+	int64_t ret = user_path_get(pathname, &kpath);
 	if (ret != 0)
 		return ret;
+
+	full = pathbuf_get();
+	real = pathbuf_get();
+	if (!full || !real) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	/* Two names for the new directory: the one the task keeps as its
+	 * working directory (`full', inside its root, as every relative path
+	 * is resolved: build_at_path), and the real one (`real', the root in
+	 * front) that is looked at and checked -- in a chroot, `full' alone
+	 * would name a directory outside the jail. */
+	ret = build_at_path(cur, AT_FDCWD, kpath, real, PATHBUF_SIZE);
+	if (ret != 0)
+		goto out;
+	ret = normalize_path(task_cwd(cur), kpath, full, PATHBUF_SIZE);
+	if (ret != 0)
+		goto out;
 	struct kstat st;
-	int vret = vfs_stat(full, &st);
+	int vret = vfs_stat(real, &st);
 	if (vret == ST_NOT_FOUND)
-		return -ENOENT;
-	if (vret == ST_IO)
-		return -EIO; /* corrupt metadata, not "not a dir" */
-	if (vret != ST_OK)
-		return -ENOTDIR;
-	if ((st.st_mode & S_IFMT) != S_IFDIR)
-		return -ENOTDIR;
+		ret = -ENOENT;
+	else if (vret == ST_IO)
+		ret = -EIO; /* corrupt metadata, not "not a dir" */
+	else if (vret == ST_NAMETOOLONG || vret == ST_LOOP ||
+		 vret == ST_NOMEM)
+		ret = vfs_status_to_errno(vret);
+	else if (vret != ST_OK)
+		ret = -ENOTDIR;
+	else if ((st.st_mode & S_IFMT) != S_IFDIR)
+		ret = -ENOTDIR;
+	if (ret != 0)
+		goto out;
 	/* Entering a directory requires search on it and on every ancestor. */
-	int tr = perm_traverse(full);
-	if (tr < 0)
-		return tr;
-	int pr = perm_access(cur, full, &st, MAY_EXEC, 0);
-	if (pr < 0)
-		return pr;
+	ret = perm_traverse(real);
+	if (ret < 0)
+		goto out;
+	ret = perm_access(cur, real, &st, MAY_EXEC, 0);
+	if (ret < 0)
+		goto out;
+	/* The new working directory's string first: without memory for it
+	 * nothing changes (ENOMEM).  "/" is the default (NULL). */
+	struct task_path *np = NULL;
+	if (!(full[0] == '/' && full[1] == '\0')) {
+		np = task_path_new(full);
+		if (!np) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
 	// Update FAT32 layer's cwd cluster
-	vfs_chdir(full);
+	vfs_chdir(real);
 	// Update task cwd string with canonical absolute path
-	mm_memset(cur->cwd, 0, sizeof(cur->cwd));
-	size_t i = 0;
-	for (; full[i] && i < sizeof(cur->cwd) - 1; ++i)
-		cur->cwd[i] = full[i];
-	cur->cwd[i] = '\0';
-	return 0;
+	task_path_set(cur, TASK_PATH_CWD, np);
+	ret = 0;
+out:
+	pathbuf_put(real);
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return ret;
 }
 
 /* SYS_CHROOT — confine the calling task (and its future children) to a
@@ -462,28 +492,37 @@ int64_t sys_chroot(uint64_t pathname)
 	if (!capable())
 		return -EPERM;
 
-	char kpath[VFS_MAX_PATH];
-	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
-
-	/* Resolve to a canonical absolute path WITH any current jail applied. */
-	char full[VFS_MAX_PATH];
-	int ret = build_at_path(cur, AT_FDCWD, kpath, full, sizeof(full));
+	char *kpath, *full = NULL;
+	int64_t ret = user_path_get(pathname, &kpath);
 	if (ret != 0)
 		return ret;
+
+	/* Resolve to a canonical absolute path WITH any current jail applied. */
+	full = pathbuf_get();
+	if (!full) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	ret = build_at_path(cur, AT_FDCWD, kpath, full, PATHBUF_SIZE);
+	if (ret != 0)
+		goto out;
 
 	/* Target must exist and be a directory. */
 	struct kstat st;
 	int vret = vfs_stat(full, &st);
 	if (vret == ST_NOT_FOUND)
-		return -ENOENT;
-	if (vret == ST_IO)
-		return -EIO;
-	if (vret != ST_OK)
-		return -ENOTDIR;
-	if ((st.st_mode & S_IFMT) != S_IFDIR)
-		return -ENOTDIR;
+		ret = -ENOENT;
+	else if (vret == ST_IO)
+		ret = -EIO;
+	else if (vret == ST_NAMETOOLONG || vret == ST_LOOP ||
+		 vret == ST_NOMEM)
+		ret = vfs_status_to_errno(vret);
+	else if (vret != ST_OK)
+		ret = -ENOTDIR;
+	else if ((st.st_mode & S_IFMT) != S_IFDIR)
+		ret = -ENOTDIR;
+	if (ret != 0)
+		goto out;
 
 	/* Store as the new jail root (drop a trailing slash; "/" clears it). */
 	size_t n = 0;
@@ -491,14 +530,21 @@ int64_t sys_chroot(uint64_t pathname)
 		n++;
 	while (n > 1 && full[n - 1] == '/')
 		n--;
-	if (n >= sizeof(cur->root))
-		return -ENAMETOOLONG;
-	mm_memset(cur->root, 0, sizeof(cur->root));
+	full[n] = '\0';
+	struct task_path *np = NULL;
 	if (!(n == 1 && full[0] == '/')) {
-		for (size_t i = 0; i < n; i++)
-			cur->root[i] = full[i];
+		np = task_path_new(full);
+		if (!np) {
+			ret = -ENOMEM;
+			goto out;
+		}
 	}
-	return 0;
+	task_path_set(cur, TASK_PATH_ROOT, np);
+	ret = 0;
+out:
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return ret;
 }
 
 int64_t sys_getcwd(uint64_t buf, uint64_t size)
@@ -509,7 +555,7 @@ int64_t sys_getcwd(uint64_t buf, uint64_t size)
 	if (!validate_user_ptr(buf, size)) {
 		return -EFAULT;
 	}
-	const char *src = (cur->cwd[0] != 0) ? cur->cwd : "/";
+	const char *src = task_cwd(cur); /* (our own: holds still) */
 	size_t len = 0;
 	while (src[len])
 		len++;
@@ -599,14 +645,13 @@ static int64_t chmod_path(task_t *cur, const char *kpath, uint64_t mode)
 
 int64_t sys_chmod(uint64_t pathname, uint64_t mode)
 {
-	char kpath[VFS_MAX_PATH];
-	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	char *kpath;
+	int64_t c = user_path_get_canon(pathname, &kpath);
 	if (c)
 		return c;
-	c = canon_task_path(kpath, sizeof(kpath));
-	if (c)
-		return c;
-	return chmod_path(sched_current(), kpath, mode);
+	c = chmod_path(sched_current(), kpath, mode);
+	pathbuf_put(kpath);
+	return c;
 }
 
 /* fchmodat(dirfd, path, mode, flags).  A symbolic link has no mode of its
@@ -617,8 +662,8 @@ int64_t sys_fchmodat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
 		     uint64_t flags)
 {
 	task_t *cur = sched_current();
-	char kpath[VFS_MAX_PATH], full[VFS_MAX_PATH];
-	int c;
+	char *kpath = NULL, *full = NULL;
+	int64_t c;
 
 	if (!cur)
 		return -EFAULT;
@@ -626,31 +671,50 @@ int64_t sys_fchmodat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
 		return -EINVAL;
 	if (!pathname)
 		return -EFAULT;
-	c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	c = user_path_get(pathname, &kpath);
 	if (c)
 		return c;
-	if (kpath[0] == '\0') {
-		if (!(flags & AT_EMPTY_PATH))
-			return -ENOENT;
-		if ((int)dirfd == AT_FDCWD) {
-			c = build_at_path(cur, AT_FDCWD, ".", full,
-					  sizeof(full));
-			return c ? c : chmod_path(cur, full, mode);
-		}
-		return sys_fchmod(dirfd, mode);
+	if (kpath[0] == '\0' && (int)dirfd != AT_FDCWD &&
+	    (flags & AT_EMPTY_PATH)) {
+		c = sys_fchmod(dirfd, mode);
+		goto out;
 	}
-	c = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
+	full = pathbuf_get();
+	if (!full) {
+		c = -ENOMEM;
+		goto out;
+	}
+	if (kpath[0] == '\0') {
+		if (!(flags & AT_EMPTY_PATH)) {
+			c = -ENOENT;
+			goto out;
+		}
+		/* (AT_FDCWD: the working directory itself.) */
+		c = build_at_path(cur, AT_FDCWD, ".", full, PATHBUF_SIZE);
+		if (c == 0)
+			c = chmod_path(cur, full, mode);
+		goto out;
+	}
+	c = build_at_path(cur, (int)dirfd, kpath, full, PATHBUF_SIZE);
 	if (c)
-		return c;
+		goto out;
 	if (flags & AT_SYMLINK_NOFOLLOW) {
 		struct kstat st;
 		int r = vfs_lstat(full, &st);
-		if (r != ST_OK)
-			return vfs_status_to_errno(r);
-		if (S_ISLNK(st.st_mode))
-			return -EOPNOTSUPP;
+		if (r != ST_OK) {
+			c = vfs_status_to_errno(r);
+			goto out;
+		}
+		if (S_ISLNK(st.st_mode)) {
+			c = -EOPNOTSUPP;
+			goto out;
+		}
 	}
-	return chmod_path(cur, full, mode);
+	c = chmod_path(cur, full, mode);
+out:
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return c;
 }
 
 int64_t sys_fchmod(uint64_t fd, uint64_t mode)
@@ -740,14 +804,13 @@ static int64_t chown_path(task_t *cur, const char *kpath, uint64_t owner,
 
 int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group)
 {
-	char kpath[VFS_MAX_PATH];
-	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	char *kpath;
+	int64_t c = user_path_get_canon(pathname, &kpath);
 	if (c)
 		return c;
-	c = canon_task_path(kpath, sizeof(kpath));
-	if (c)
-		return c;
-	return chown_path(sched_current(), kpath, owner, group, 0);
+	c = chown_path(sched_current(), kpath, owner, group, 0);
+	pathbuf_put(kpath);
+	return c;
 }
 
 /* fchownat(dirfd, path, owner, group, flags): AT_SYMLINK_NOFOLLOW changes a
@@ -757,8 +820,8 @@ int64_t sys_fchownat(uint64_t dirfd, uint64_t pathname, uint64_t owner,
 		     uint64_t group, uint64_t flags)
 {
 	task_t *cur = sched_current();
-	char kpath[VFS_MAX_PATH], full[VFS_MAX_PATH];
-	int c;
+	char *kpath = NULL, *full = NULL;
+	int64_t c;
 
 	if (!cur)
 		return -EFAULT;
@@ -766,31 +829,45 @@ int64_t sys_fchownat(uint64_t dirfd, uint64_t pathname, uint64_t owner,
 		return -EINVAL;
 	if (!pathname)
 		return -EFAULT;
-	c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	c = user_path_get(pathname, &kpath);
 	if (c)
 		return c;
-	if (kpath[0] == '\0') {
-		if (!(flags & AT_EMPTY_PATH))
-			return -ENOENT;
-		if ((int)dirfd == AT_FDCWD) {
-			c = build_at_path(cur, AT_FDCWD, ".", full,
-					  sizeof(full));
-			if (c)
-				return c;
-			return chown_path(cur, full, owner, group, 0);
-		}
+	if (kpath[0] == '\0' && (int)dirfd != AT_FDCWD &&
+	    (flags & AT_EMPTY_PATH)) {
 		vfs_file_t *f = fdget(cur, (int)dirfd);
-		if (!f)
-			return -EBADF;
-		int64_t r = fchown_held(cur, f, owner, group);
+		if (!f) {
+			c = -EBADF;
+			goto out;
+		}
+		c = fchown_held(cur, f, owner, group);
 		fdput(f);
-		return r;
+		goto out;
 	}
-	c = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
+	full = pathbuf_get();
+	if (!full) {
+		c = -ENOMEM;
+		goto out;
+	}
+	if (kpath[0] == '\0') {
+		if (!(flags & AT_EMPTY_PATH)) {
+			c = -ENOENT;
+			goto out;
+		}
+		/* (AT_FDCWD: the working directory itself.) */
+		c = build_at_path(cur, AT_FDCWD, ".", full, PATHBUF_SIZE);
+		if (c == 0)
+			c = chown_path(cur, full, owner, group, 0);
+		goto out;
+	}
+	c = build_at_path(cur, (int)dirfd, kpath, full, PATHBUF_SIZE);
 	if (c)
-		return c;
-	return chown_path(cur, full, owner, group,
-			  (flags & AT_SYMLINK_NOFOLLOW) ? 1 : 0);
+		goto out;
+	c = chown_path(cur, full, owner, group,
+		       (flags & AT_SYMLINK_NOFOLLOW) ? 1 : 0);
+out:
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return c;
 }
 
 int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group)

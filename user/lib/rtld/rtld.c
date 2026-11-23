@@ -310,11 +310,15 @@ __attribute__((noreturn)) static void rtld_die(const char *msg)
  * the entries are small beside the mappings they describe. */
 #define MAX_DSOS 1024
 
-/* Object names are at most a basename ("libXfont2.so.2"), so a small fixed
- * buffer is enough and keeps the loader allocation-free. */
+/* Object names are normally a short basename ("libXfont2.so.2") and paths a
+ * few dozen bytes, so each object carries buffers of these sizes inline and
+ * the loader stays allocation-free in the usual case.  A longer name or path
+ * -- a library dlopen'd from deep in a tree, up to PATH_MAX -- gets pages of
+ * its own instead (rtld_dso_set_str), released when the object is. */
 #define RTLD_NAME_MAX 96
-/* Long enough for the deepest path anything here is loaded from. */
 #define RTLD_PATH_MAX 256
+/* The longest path the kernel accepts, the NUL included. */
+#define RTLD_PATH_LIMIT 4096
 
 /* ---- The debugger rendezvous ------------------------------------------------
  *
@@ -358,6 +362,12 @@ typedef struct dso {
 	 * a debugger as link_map.l_name; see rtld_load_dso_from_file. */
 	const char *path;
 	char path_buf[RTLD_PATH_MAX];
+	/* Pages holding name or path when they did not fit the buffers above
+	 * (NULL otherwise), and their lengths; unmapped with the object. */
+	char *name_map;
+	size_t name_map_len;
+	char *path_map;
+	size_t path_map_len;
 	uint64_t base;
 
 	const Elf64_Phdr *phdrs;
@@ -430,6 +440,15 @@ typedef struct dso {
 	int is_main;
 	int refcount;
 	int bind_now;
+	/* Load bookkeeping for the dlopen in progress (see rtld_load_begin):
+	 * `loading' marks an object that dlopen brought in, discarded again if
+	 * the dlopen fails, numbered in allocation order so that the objects
+	 * loaded for one that fails are told apart from its siblings;
+	 * `load_refs' counts the references it took on an object that was
+	 * already loaded, given back if it fails.  Both are zero outside a
+	 * dlopen's load phase. */
+	int loading;
+	int load_refs;
 
 	/* PT_GNU_RELRO: made read-only after relocation (see
 	 * rtld_protect_relro).  relro_done keeps that to once. */
@@ -470,7 +489,8 @@ static uint64_t g_tls_reserved; /* bytes below tp available for TLS */
 static uint64_t g_tls_static_limit;
 static uint64_t g_page_size = 4096;
 
-static char g_dlerror_buf[256];
+/* Room for a message naming a library by its full path. */
+static char g_dlerror_buf[RTLD_PATH_LIMIT + 128];
 static int g_dlerror_set;
 
 /* Counts of objects added and removed over the process's life, reported through
@@ -480,6 +500,21 @@ static int g_dlerror_set;
  * or a stale entry is trusted after the library behind it is gone. */
 static unsigned long long g_dl_adds;
 static unsigned long long g_dl_subs;
+
+/* A dlopen's load phase in progress (rtld_load_begin .. commit/abort): every
+ * object allocated meanwhile is marked `loading', and any failure fails the
+ * whole tree.  Outside it -- the start-up path -- a dependency that cannot be
+ * found is reported and the program runs on. */
+static int g_load_active;
+static int g_load_seq; /* the last `loading' number handed out */
+/* Why the load failed, for dlerror(): the reason, how much it says (a file
+ * that could not be opened is a weaker reason than one that was opened and
+ * found wanting, so a later attempt under another path can override the
+ * former only), and the dependency that failed, "" when it was the object
+ * named.  Copied, because the name lives in a string table being unmapped. */
+static const char *g_load_why;
+static int g_load_why_rank;
+static char g_load_dep[RTLD_PATH_LIMIT];
 
 /* ------------------------------------------------------------------ *
  * The loader lock.
@@ -582,20 +617,15 @@ static void rtld_set_error(const char *msg)
 	g_dlerror_set = 1;
 }
 
-/* "<what>: <name>" -- dlerror() has to say WHICH object failed, or a program
- * probing for several optional libraries cannot tell which probe it is. */
-static void rtld_set_error2(const char *what, const char *name)
+/* Append `s` to the dlerror buffer at *pos, truncating at its end. */
+static void rtld_error_cat(size_t *pos, const char *s)
 {
-	size_t i = 0, j = 0;
+	size_t i = *pos;
 
-	while (what[i] && i < sizeof(g_dlerror_buf) - 3)
-		g_dlerror_buf[i] = what[i], i++;
-	g_dlerror_buf[i++] = ':';
-	g_dlerror_buf[i++] = ' ';
-	while (name[j] && i < sizeof(g_dlerror_buf) - 1)
-		g_dlerror_buf[i++] = name[j++];
+	while (*s && i < sizeof(g_dlerror_buf) - 1)
+		g_dlerror_buf[i++] = *s++;
 	g_dlerror_buf[i] = '\0';
-	g_dlerror_set = 1;
+	*pos = i;
 }
 
 /* ================================================================== */
@@ -727,6 +757,7 @@ static dso_t *rtld_alloc_dso(void)
 			dso_t *d = &g_dsos[i];
 			rtld_memset(d, 0, sizeof(*d));
 			d->refcount = 1;
+			d->loading = g_load_active ? ++g_load_seq : 0;
 			return d;
 		}
 	}
@@ -735,7 +766,57 @@ static dso_t *rtld_alloc_dso(void)
 	dso_t *d = &g_dsos[g_ndsos++];
 	rtld_memset(d, 0, sizeof(*d));
 	d->refcount = 1;
+	d->loading = g_load_active ? ++g_load_seq : 0;
 	return d;
+}
+
+static size_t rtld_strlen(const char *s)
+{
+	size_t n = 0;
+
+	while (s[n])
+		n++;
+	return n;
+}
+
+static size_t rtld_page_round(size_t n)
+{
+	return (n + g_page_size - 1) & ~(size_t)(g_page_size - 1);
+}
+
+/* Copy `src` into an object's inline buffer `buf` of `cap` bytes, or into
+ * pages of its own when it does not fit (recorded in *map / *map_len for
+ * rtld_dso_free_strs).  Returns the copy, or NULL when no memory was to be
+ * had -- the caller then records no string rather than a truncated one,
+ * which would name a different file or fail every lookup by name. */
+static const char *rtld_dso_set_str(char *buf, size_t cap, char **map,
+				    size_t *map_len, const char *src)
+{
+	size_t n = rtld_strlen(src);
+	char *dst = buf;
+
+	if (n >= cap) {
+		size_t len = rtld_page_round(n + 1);
+		void *m = rtld_mmap(NULL, len, PROT_READ | PROT_WRITE,
+				    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (m == MAP_FAILED)
+			return NULL;
+		*map = dst = m;
+		*map_len = len;
+	}
+	rtld_memcpy(dst, src, n + 1);
+	return dst;
+}
+
+/* Release what rtld_dso_set_str mapped for an object being discarded. */
+static void rtld_dso_free_strs(dso_t *d)
+{
+	if (d->name_map)
+		rtld_munmap(d->name_map, d->name_map_len);
+	if (d->path_map)
+		rtld_munmap(d->path_map, d->path_map_len);
+	d->name_map = d->path_map = NULL;
+	d->name_map_len = d->path_map_len = 0;
 }
 
 /* ================================================================== */
@@ -1140,10 +1221,11 @@ static dso_t *rtld_dso_by_modid(int modid)
 	return NULL;
 }
 
-static void rtld_assign_tls(dso_t *d)
+/* Returns 0, or -1 when the object cannot be given the TLS it needs. */
+static int rtld_assign_tls(dso_t *d)
 {
 	if (!d->tls_memsz)
-		return;
+		return 0;
 	d->tls_modid = g_tls_next_modid++;
 
 	/* Arrived through dlopen, after every thread's block was sized.
@@ -1156,7 +1238,7 @@ static void rtld_assign_tls(dso_t *d)
 	    d->tls_modid <= RTLD_DTV_SLOTS) {
 		d->tls_dynamic = 1;
 		d->tls_offset = 0;
-		return;
+		return 0;
 	}
 
 	/* Use the object's OWN p_align, never a rounded-up minimum.  For
@@ -1180,14 +1262,19 @@ static void rtld_assign_tls(dso_t *d)
 
 	/* Objects loaded after the block was laid out (dlopen) can only be
 	 * given space that was already reserved as surplus — the block cannot
-	 * grow, because every thread already has one at a fixed size. */
+	 * grow, because every thread already has one at a fixed size.
+	 *
+	 * Then the object cannot be loaded at all: its initial-exec accesses
+	 * would reach whatever lies at the offsets it was linked for.  Only a
+	 * dlopen gets here (the block is laid out after start-up has loaded
+	 * everything), and the dlopen fails and undoes the load. */
 	if (g_tls_initialised && want > g_tls_static_limit) {
 		rtld_write_str("ld-likeos.so: ");
 		rtld_write_str(d->name ? d->name : "?");
 		rtld_write_str(": no static TLS space left for this object\n");
 		d->tls_memsz = 0;
 		d->tls_offset = 0;
-		return;
+		return -1;
 	}
 
 	g_tls_static_size = want;
@@ -1207,6 +1294,7 @@ static void rtld_assign_tls(dso_t *d)
 		rtld_memset(g_tls_tp + d->tls_offset, 0, d->tls_memsz);
 		d->tls_needs_init = 1;
 	}
+	return 0;
 }
 
 /* This thread's DTV.  Lives at the bottom of the thread's own reservation;
@@ -1568,6 +1656,118 @@ static uint64_t g_lib_mmap_base = 0x7F0001000000ULL;
 static dso_t *rtld_load_library(const char *name);
 static void rtld_report_missing(const char *name);
 
+/* ---- Undoing a load that failed ---------------------------------------------
+ *
+ * A dlopen loads a whole tree -- the object named and every dependency not yet
+ * present -- before anything is relocated.  When any part of it fails, all of
+ * it has to go again: an object left behind with its name registered but its
+ * load unfinished is found by the next dlopen of that name and handed out as
+ * a working handle, and a dependency left behind for a parent that never
+ * arrived is a mapping nobody will ever close. */
+
+/* What the load in progress started from, restored if it fails. */
+static int g_load_snap_modid;
+static uint64_t g_load_snap_tls_size;
+static uint64_t g_load_snap_tls_align;
+
+/* Record why the load failed.  rank 1: the file could not be opened (another
+ * path may still work); rank 2: it was opened and could not be loaded. */
+static void rtld_load_why(const char *why, int rank)
+{
+	if (rank > g_load_why_rank) {
+		g_load_why = why;
+		g_load_why_rank = rank;
+	}
+}
+
+static void rtld_load_why_open(int err)
+{
+	rtld_load_why(err == -2  ? "no such file" :
+		      err == -13 ? "permission denied" :
+		      err == -36 ? "file name too long" :
+		      err == -20 ? "a path component is not a directory" :
+				   "cannot open file",
+		      1);
+}
+
+/* Throw away an object that never finished loading: its mappings, the pages
+ * holding its name and path, and its slot (a zeroed slot is a free one, see
+ * rtld_alloc_dso).  Not yet on the debugger's list or relocated, so nothing
+ * else refers to it. */
+static void rtld_discard_dso(dso_t *d)
+{
+	if (d->map_base && d->map_size)
+		rtld_munmap((void *)d->map_base, d->map_size);
+	rtld_dso_free_strs(d);
+	rtld_memset(d, 0, sizeof(*d));
+	/* Balances the add rtld_alloc_dso counted, for dl_iterate_phdr
+	 * callers that cache per object. */
+	g_dl_subs++;
+}
+
+/* Throw away `d' together with everything loaded for it: the objects
+ * allocated after it in this load are its dependencies, the ones loaded
+ * before it are its siblings and stay (a sibling's failure discards them
+ * through its parent, or the dlopen does so through rtld_load_abort). */
+static void rtld_discard_tree(dso_t *d)
+{
+	int seq = d->loading;
+
+	if (!seq) {
+		rtld_discard_dso(d);
+		return;
+	}
+	for (int i = 0; i < g_ndsos; i++)
+		if (g_dsos[i].loading >= seq)
+			rtld_discard_dso(&g_dsos[i]);
+}
+
+static void rtld_load_begin(void)
+{
+	g_load_active = 1;
+	g_load_seq = 0;
+	g_load_why = NULL;
+	g_load_why_rank = 0;
+	g_load_dep[0] = '\0';
+	g_load_snap_modid = g_tls_next_modid;
+	g_load_snap_tls_size = g_tls_static_size;
+	g_load_snap_tls_align = g_tls_static_align;
+}
+
+static void rtld_load_commit(void)
+{
+	g_load_active = 0;
+	for (int i = 0; i < g_ndsos; i++) {
+		g_dsos[i].loading = 0;
+		g_dsos[i].load_refs = 0;
+	}
+}
+
+/* Undo everything since rtld_load_begin.  Every object marked `loading' came
+ * from this load, and the TLS module ids and static TLS space handed out
+ * since were all handed to them -- the loader lock is held throughout and no
+ * constructor has run -- so those go back too.  The library address range
+ * (g_lib_mmap_base) is left where it is: there is plenty of it, and handing
+ * an unmapped stretch back to MAP_FIXED placement is not worth the risk of
+ * something else having been mapped there meanwhile. */
+static void rtld_load_abort(void)
+{
+	g_load_active = 0;
+	for (int i = 0; i < g_ndsos; i++) {
+		dso_t *d = &g_dsos[i];
+
+		if (d->loading) {
+			rtld_discard_dso(d);
+		} else if (d->load_refs) {
+			d->refcount -= d->load_refs;
+			d->load_refs = 0;
+		}
+	}
+	g_tls_next_modid = g_load_snap_modid;
+	g_tls_static_size = g_load_snap_tls_size;
+	g_tls_static_align = g_load_snap_tls_align;
+}
+
 /* Seek+read helper for the header-only load path. */
 static int rtld_pread(int fd, void *buf, size_t n, long off)
 {
@@ -1607,9 +1807,13 @@ static int rtld_pread(int fd, void *buf, size_t n, long off)
 
 static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 {
+	dso_t *d = NULL;
+	const char *why = "not a valid shared object";
 	int fd = rtld_open(path, O_RDONLY);
-	if (fd < 0)
+	if (fd < 0) {
+		rtld_load_why_open(fd);
 		return NULL;
+	}
 
 	/* Demand paging: read ONLY the ELF header and program headers.
 	 * Read-only/executable segments are mapped straight from the file
@@ -1664,20 +1868,18 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 	uint64_t map = g_lib_mmap_base;
 	g_lib_mmap_base = (map + span + g_page_size - 1) & ~(g_page_size - 1);
 
-	dso_t *d = rtld_alloc_dso();
+	d = rtld_alloc_dso();
 	/* Own the name (see the field comment): `soname` usually points into
 	 * the requesting object's string table, which can be unmapped while
 	 * this object is still loaded. */
 	{
-		size_t n = 0;
-		if (soname) {
-			while (soname[n] && n < RTLD_NAME_MAX - 1) {
-				d->name_buf[n] = soname[n];
-				n++;
-			}
+		d->name = rtld_dso_set_str(d->name_buf, sizeof(d->name_buf),
+					   &d->name_map, &d->name_map_len,
+					   soname ? soname : "");
+		if (!d->name) {
+			why = "out of memory";
+			goto fail;
 		}
-		d->name_buf[n] = '\0';
-		d->name = d->name_buf;
 
 		/* The PATH this was opened from, kept separately from the
 		 * soname, because a debugger needs to open the same file.
@@ -1689,15 +1891,11 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 		 * library symbols" and every frame in that library printed as
 		 * `?? ()'.  The loader knows the path here and used to discard
 		 * it. */
-		n = 0;
-		if (path) {
-			while (path[n] && n < RTLD_PATH_MAX - 1) {
-				d->path_buf[n] = path[n];
-				n++;
-			}
-		}
-		d->path_buf[n] = '\0';
-		d->path = d->path_buf;
+		d->path = rtld_dso_set_str(d->path_buf, sizeof(d->path_buf),
+					   &d->path_map, &d->path_map_len,
+					   path ? path : "");
+		if (!d->path)
+			d->path = ""; /* then l_name falls back to the name */
 	}
 	d->base = map - lo;
 	d->map_base = map;
@@ -1717,6 +1915,7 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 	 * touch essentially all of .data anyway, so laziness buys nothing
 	 * and the eager read keeps kernel-write-under-lock faults out of
 	 * the picture. */
+	why = "cannot map its segments";
 	for (int i = 0; i < ehdr->e_phnum; i++) {
 		if (phdrs[i].p_type != PT_LOAD)
 			continue;
@@ -1770,8 +1969,10 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 			if (phdrs[i].p_offset + phdrs[i].p_filesz >
 				    (uint64_t)file_size ||
 			    rtld_pread(fd, (void *)va, phdrs[i].p_filesz,
-				       (long)phdrs[i].p_offset) != 0)
+				       (long)phdrs[i].p_offset) != 0) {
+				why = "cannot read its data";
 				goto fail;
+			}
 		}
 		if (!(prot & PROT_WRITE))
 			rtld_mprotect((void *)alv, len, prot);
@@ -1853,22 +2054,51 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 		d->phnum = 0;
 
 	rtld_parse_dynamic(d);
-	rtld_assign_tls(d);
+	if (rtld_assign_tls(d) != 0) {
+		why = "no static TLS space left for it";
+		goto fail;
+	}
 
-	/* Recursive DT_NEEDED */
+	/* Recursive DT_NEEDED.
+	 *
+	 * Inside a dlopen a dependency that cannot be loaded fails this object
+	 * too, and with it the whole dlopen (which then discards everything
+	 * the load brought in, see rtld_load_abort): handing out an object
+	 * whose dependency is missing leaves its references to it unresolved,
+	 * to be found by the first call through one.  The innermost name is
+	 * kept for dlerror, being the one that is actually missing.  At
+	 * start-up the dependency is reported and the program runs on. */
 	if (d->dynamic)
 		for (const Elf64_Dyn *e = d->dynamic; e->d_tag != DT_NULL; e++)
 			if (e->d_tag == DT_NEEDED) {
 				const char *need = d->strtab + e->d_un.d_val;
-				if (!rtld_find_dso(need))
-					if (!rtld_load_library(need))
-						rtld_report_missing(need);
+				if (rtld_find_dso(need) || rtld_load_library(need))
+					continue;
+				if (!g_load_active) {
+					rtld_report_missing(need);
+					continue;
+				}
+				if (!g_load_dep[0]) {
+					size_t k = 0;
+					while (need[k] && k < sizeof(g_load_dep) - 1) {
+						g_load_dep[k] = need[k];
+						k++;
+					}
+					g_load_dep[k] = '\0';
+				}
+				rtld_discard_tree(d);
+				return NULL;
 			}
 	return d;
 
 fail:
 	if (fd >= 0)
 		rtld_close(fd);
+	/* Nothing of a half-loaded object may stay registered: the next
+	 * lookup of its name would find it and take it for a loaded one. */
+	if (d)
+		rtld_discard_tree(d);
+	rtld_load_why(why, 2);
 	return NULL;
 }
 
@@ -1877,21 +2107,45 @@ static dso_t *rtld_load_library(const char *name)
 	dso_t *e = rtld_find_dso(name);
 	if (e) {
 		e->refcount++;
+		if (g_load_active && !e->loading)
+			e->load_refs++; /* given back if the dlopen fails */
 		return e;
 	}
 
-	char path[512];
+	/* "/lib/" + name.  Names are short as a rule, so a small buffer on the
+	 * stack serves; a longer one (up to a whole path) gets pages for the
+	 * duration of the search rather than a PATH_MAX array on the stack of
+	 * whichever thread called dlopen. */
+	char sbuf[256];
+	char *path = sbuf;
+	size_t map_len = 0;
 	dso_t *d;
+	size_t n = rtld_strlen(name);
+
+	if (n + sizeof("/lib/") > RTLD_PATH_LIMIT) {
+		rtld_load_why("file name too long", 2);
+		return NULL; /* no such path can be opened */
+	}
+	if (n + sizeof("/lib/") > sizeof(sbuf)) {
+		map_len = rtld_page_round(n + sizeof("/lib/"));
+		path = rtld_mmap(NULL, map_len, PROT_READ | PROT_WRITE,
+				 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (path == MAP_FAILED) {
+			rtld_load_why("out of memory", 2);
+			return NULL;
+		}
+	}
 
 	rtld_strcpy(path, "/lib/");
 	rtld_strcat(path, name);
 	d = rtld_load_dso_from_file(path, name);
-	if (d)
-		return d;
-
-	rtld_strcpy(path, "/");
-	rtld_strcat(path, name);
-	d = rtld_load_dso_from_file(path, name);
+	if (!d) {
+		rtld_strcpy(path, "/");
+		rtld_strcat(path, name);
+		d = rtld_load_dso_from_file(path, name);
+	}
+	if (map_len)
+		rtld_munmap(path, map_len);
 	if (d)
 		return d;
 
@@ -2107,6 +2361,7 @@ static void *rtld_dlopen_locked(const char *filename, int flags)
 	}
 
 	dso_t *ld = NULL;
+	rtld_load_begin();
 	if (filename[0] == '/') {
 		/* Objects are registered under their basename, so an absolute
 		 * path has to be matched against that too — otherwise
@@ -2118,6 +2373,7 @@ static void *rtld_dlopen_locked(const char *filename, int flags)
 				bn = p + 1;
 		d = rtld_find_dso(bn);
 		if (d) {
+			rtld_load_commit(); /* nothing was loaded */
 			d->refcount++;
 			return d;
 		}
@@ -2126,9 +2382,22 @@ static void *rtld_dlopen_locked(const char *filename, int flags)
 		ld = rtld_load_library(filename);
 	}
 	if (!ld) {
-		rtld_set_error2("cannot load shared library", filename);
+		/* Leave nothing behind: a later dlopen of the same name must
+		 * try again from scratch, not find the remains of this one. */
+		rtld_load_abort();
+		size_t pos = 0;
+		rtld_error_cat(&pos, "cannot load shared library: ");
+		rtld_error_cat(&pos, filename);
+		if (g_load_dep[0]) {
+			rtld_error_cat(&pos, ": dependency ");
+			rtld_error_cat(&pos, g_load_dep);
+		}
+		rtld_error_cat(&pos, ": ");
+		rtld_error_cat(&pos, g_load_why ? g_load_why : "load failed");
+		g_dlerror_set = 1;
 		return NULL;
 	}
+	rtld_load_commit();
 
 	/* Relocate and initialise everything that is not done yet, not just the
 	 * object named above: loading it may have pulled in its own DT_NEEDED
@@ -2286,6 +2555,7 @@ static int rtld_dlclose_locked(void *handle)
 
 	if (d->map_base && d->map_size)
 		rtld_munmap((void *)d->map_base, d->map_size);
+	rtld_dso_free_strs(d);
 	/* Zero the entire DSO entry so subsequent rtld_lookup_symbol iterations
      * skip it (symtab/strtab checks will be NULL) and stale pointers into
      * the now-unmapped library pages can never be dereferenced. */
@@ -2646,7 +2916,7 @@ uint64_t _dl_main(uint64_t *sp, uint64_t own_base)
 		}
 	}
 	rtld_parse_dynamic(main_dso);
-	rtld_assign_tls(main_dso);
+	(void)rtld_assign_tls(main_dso); /* cannot fail before the block exists */
 
 	/* ---- Load DT_NEEDED libraries ---- */
 	if (main_dso->dynamic)

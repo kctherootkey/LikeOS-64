@@ -3,7 +3,9 @@
 //   devctl list                         the disks and volumes
 //   devctl monitor                      print device events as they come
 //   devctl fstypes                      the filesystems devd knows
-//   devctl mount <name>                 mount a volume (prints the path)
+//   devctl mount [--recover] <name>     mount a volume (prints the path);
+//                                       --recover replays a journal that
+//                                       must be replayed first
 //   devctl unmount <name>
 //   devctl eject <disk>
 //   devctl format <name> <fs> [--label L] [--full] [--cluster N]
@@ -27,6 +29,7 @@
 static int g_fd = -1;
 static char g_in[DEVP_LINE_MAX * 2];
 static size_t g_inlen;
+static char g_errname[32]; /* of the last ERR line */
 
 static void die(const char *msg)
 {
@@ -130,6 +133,8 @@ static int final_line(char **tok, int n)
 	if (strcmp(tok[0], "OK") == 0)
 		return 0;
 	/* ERR <verb> [<name>] <ERRNAME> <message> */
+	if (n >= 4 && strlen(tok[n - 2]) < sizeof(g_errname))
+		strcpy(g_errname, tok[n - 2]);
 	if (n >= 4 && devp_decode(msg, sizeof(msg), tok[n - 1]) >= 0)
 		fprintf(stderr, "devctl: %s: %s (%s)\n", tok[1], msg,
 			tok[n - 2]);
@@ -166,13 +171,13 @@ static int cmd_list(void)
 	char line[DEVP_LINE_MAX];
 
 	send_line("LIST\n");
-	printf("%-10s %-9s %8s %-8s %-3s %-3s %-3s %-16s %s\n", "NAME",
-	       "KIND", "SIZE", "FSTYPE", "USB", "SYS", "MNT", "LABEL",
+	printf("%-10s %-9s %8s %-8s %-5s %-3s %-3s %-3s %-16s %s\n", "NAME",
+	       "KIND", "SIZE", "FSTYPE", "CLASS", "RO", "SYS", "MNT", "LABEL",
 	       "MOUNTED");
 	for (;;) {
 		char *tok[DEVP_MAX_TOKENS];
 		char a[128], b[16], c[16], d[200], e[260], f[16], g[8], h[8],
-			sz[16];
+			sz[16], ro[8], cls[8];
 		uint64_t size = 0;
 		int n;
 
@@ -192,10 +197,23 @@ static int cmd_list(void)
 		kv(tok, n, "fstype", c, sizeof(c));
 		kv(tok, n, "label", d, sizeof(d));
 		kv(tok, n, "mounted", e, sizeof(e));
-		kv(tok, n, "usb", g, sizeof(g));
 		kv(tok, n, "system", h, sizeof(h));
-		printf("%-10s %-9s %8s %-8s %-3s %-3s %-3s %-16s %s\n", a, b, sz,
-		       c, g, h,
+		/* keys an older devd does not send read as "" */
+		if (strcmp(kv(tok, n, "optical", g, sizeof(g)), "1") == 0)
+			strcpy(cls, "cd");
+		else if (strcmp(kv(tok, n, "internal", g, sizeof(g)), "1") ==
+			 0)
+			strcpy(cls, "int");
+		else if (strcmp(kv(tok, n, "usb", g, sizeof(g)), "1") == 0)
+			strcpy(cls, "usb");
+		else
+			strcpy(cls, "-");
+		strcpy(ro, strcmp(kv(tok, n, "readonly", g, sizeof(g)), "1") ==
+				   0 ?
+				   "1" :
+				   "0");
+		printf("%-10s %-9s %8s %-8s %-5s %-3s %-3s %-3s %-16s %s\n", a,
+		       b, sz, c, cls, ro, h,
 		       strcmp(kv(tok, n, "supported", f, sizeof(f)), "1") == 0 ?
 			       "yes" :
 			       "no",
@@ -277,7 +295,8 @@ static int cmd_format(int argc, char **argv)
 		else
 			return -1;
 	}
-	if (devp_encode(enc, sizeof(enc), label, strlen(label)) >= 512)
+	/* the longest label devd takes (NTFS: 384 bytes) all escaped */
+	if (devp_encode(enc, sizeof(enc), label, strlen(label)) >= 1536)
 		die("label too long");
 	{
 		char n1[256], n2[64], n3[64];
@@ -306,6 +325,13 @@ static int cmd_format(int argc, char **argv)
 			fflush(stdout);
 			continue;
 		}
+		if (strcmp(tok[0], "PROGRESS") == 0 && n == 4 &&
+		    strcmp(tok[3], "busy") == 0) {
+			printf("\r%s: %s%%, writing the file system", argv[2],
+			       tok[2]);
+			fflush(stdout);
+			continue;
+		}
 		if (is_final(tok[0])) {
 			printf("\n");
 			return final_line(tok, n);
@@ -317,7 +343,8 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: devctl list | monitor | fstypes\n"
-		"       devctl mount <name> | unmount <name> | eject <disk>\n"
+		"       devctl mount [--recover] <name> | unmount <name> | "
+		"eject <disk>\n"
 		"       devctl format <name> <fs> [--label L] [--full] "
 		"[--cluster N]\n");
 	exit(2);
@@ -344,6 +371,13 @@ int main(int argc, char **argv)
 		r = cmd_monitor();
 	} else if (strcmp(argv[1], "fstypes") == 0 && argc == 2) {
 		r = cmd_simple("FSTYPES\n", 1);
+	} else if (strcmp(argv[1], "mount") == 0 && argc == 4 &&
+		   strcmp(argv[2], "--recover") == 0) {
+		if (devp_encode(enc, sizeof(enc), argv[3], strlen(argv[3])) >=
+		    sizeof(enc))
+			usage();
+		snprintf(req, sizeof(req), "MOUNT %s recover\n", enc);
+		r = cmd_simple(req, 0);
 	} else if ((strcmp(argv[1], "mount") == 0 ||
 		    strcmp(argv[1], "unmount") == 0 ||
 		    strcmp(argv[1], "eject") == 0) &&
@@ -356,6 +390,11 @@ int main(int argc, char **argv)
 			usage();
 		snprintf(req, sizeof(req), "%s %s\n", verb, enc);
 		r = cmd_simple(req, 0);
+		if (r && verb[0] == 'M' && strcmp(g_errname, "EUCLEAN") == 0)
+			fprintf(stderr,
+				"devctl: 'devctl mount --recover %s' replays "
+				"the journal and mounts it\n",
+				argv[2]);
 	} else if (strcmp(argv[1], "format") == 0) {
 		r = cmd_format(argc, argv);
 		if (r < 0)

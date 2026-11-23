@@ -34,6 +34,7 @@ ExDevdErrorCode ex_devd_error_code(const char *errname)
 		{ "ENOSPC", EX_DEVD_ERROR_NOSPC },   { "EAGAIN", EX_DEVD_ERROR_AGAIN },
 		{ "ENOTSUP", EX_DEVD_ERROR_NOTSUP }, { "EOPNOTSUPP", EX_DEVD_ERROR_NOTSUP },
 		{ "ENOSYS", EX_DEVD_ERROR_NOTSUP },  { "EROFS", EX_DEVD_ERROR_ROFS },
+		{ "EUCLEAN", EX_DEVD_ERROR_UNCLEAN },
 	};
 
 	for (gsize i = 0; errname && i < G_N_ELEMENTS(map); i++)
@@ -70,6 +71,9 @@ const char *ex_devd_error_explain(ExDevdErrorCode code)
 		return "The device service is not running.";
 	case EX_DEVD_ERROR_PROTOCOL:
 		return "The device service gave an answer that could not be read.";
+	case EX_DEVD_ERROR_UNCLEAN:
+		return "The drive's file system was not closed properly; its "
+		       "journal must be replayed before it can be opened.";
 	case EX_DEVD_ERROR_FAILED:
 	default:
 		return "Something went wrong.";
@@ -343,6 +347,11 @@ ExDevdDevice *ex_devd_device_from_line(const ExDevdLine *l)
 	d->mountuid = u;
 	d->ejected = flag(l, "ejected");
 	d->state = ident(l, "state", 16, "busy");
+	d->readonly = flag(l, "readonly");
+	d->optical = flag(l, "optical");
+	/* An optical drive is never a built-in disk, whatever else the line
+	 * says. */
+	d->internal = flag(l, "internal") && !d->optical;
 	return d;
 }
 

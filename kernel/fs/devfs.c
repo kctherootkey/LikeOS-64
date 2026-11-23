@@ -413,6 +413,8 @@ static int devfs_dir_lookup(const char *path, struct devfs_node_snap *s)
 		tmp[n] = path[n];
 		n++;
 	}
+	if (path[n])
+		return 0; /* longer than any node's path: none */
 	tmp[n] = 0;
 	if (n > 1 && tmp[n - 1] == '/')
 		tmp[n - 1] = 0;
@@ -2267,6 +2269,14 @@ int devfs_is_fb0(vfs_file_t *f)
 		return 0;
 	devfs_file_t *df = (devfs_file_t *)f->fs_private;
 	return df && df->type == DEVFS_TYPE_FB0;
+}
+
+int devfs_is_zero(vfs_file_t *f)
+{
+	if (!f || f->ops != &g_devfs_ops)
+		return 0;
+	devfs_file_t *df = (devfs_file_t *)f->fs_private;
+	return df && df->type == DEVFS_TYPE_ZERO;
 }
 
 /* The shared memory object behind a handle, or NULL.  mmap() uses this to map

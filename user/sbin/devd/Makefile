@@ -29,8 +29,8 @@ LDFLAGS = -pie -nostdlib -T $(LDSCRIPT) --hash-style=gnu \
 CRT1 = $(LIBC_DIR)/crt1.o
 LIBS = -lc -l:ld-likeos.so
 
-DEVD_SRCS = devd.c devproto.c names.c probe.c fstab.c devtable.c mount.c \
-	format.c auth.c events.c clients.c util.c
+DEVD_SRCS = devd.c devproto.c names.c probe.c fstab.c policy.c devtable.c \
+	mount.c format.c auth.c events.c clients.c util.c
 DEVCTL_SRCS = devctl.c devproto.c
 DEVD_OBJS = $(DEVD_SRCS:.c=.o)
 DEVCTL_OBJS = $(DEVCTL_SRCS:.c=.o)

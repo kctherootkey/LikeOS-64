@@ -45,7 +45,7 @@ int script_parse_shebang(const char *buf, size_t len, char *interp,
 int script_load_rewrite(char **kpath_io, char ***kargv_io, int depth);
 
 /* Conservative pre-check that argv/envp will fit elf_setup_stack's
- * one-page initial-stack budget.  Returns 0 or -E2BIG. */
+ * initial-stack block (EXEC_STACK_BLOCK_MAX, elf.h).  Returns 0 or -E2BIG. */
 int script_check_stack_fit(char *const argv[], char *const envp[]);
 
 #endif // _KERNEL_SCRIPT_LOADER_H_

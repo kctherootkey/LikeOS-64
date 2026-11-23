@@ -7,6 +7,7 @@
 //
 // Copyright (C) 2026 The LikeOS Project
 
+#include <kernel/ke/task_path.h>
 #include <kernel/ke/cred.h>
 #include <kernel/ke/sched.h> /* task_t, sched_current() */
 #include <kernel/ke/syscall.h> /* EPERM, EACCES */
@@ -323,8 +324,7 @@ cred_t *current_cred(void)
  * search-permission traversal. */
 const char *current_cwd(void)
 {
-	task_t *t = sched_current();
-	return (t && t->cwd[0]) ? t->cwd : "/";
+	return task_cwd(sched_current());
 }
 
 uint32_t current_uid(void)

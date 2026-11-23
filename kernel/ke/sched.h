@@ -398,6 +398,9 @@ typedef void (*task_entry_t)(void *arg);
  * nests a few at most: the mount it runs on, a second one for a two-name
  * operation, one taken again by a check inside it. */
 #define TASK_MNT_HOLDS 8
+/* The paths a task keeps (working directory, chroot root, executable) are
+ * reference-counted strings of their own: kernel/ke/task_path.h. */
+struct task_path;
 
 typedef enum {
 	TASK_READY = 0,
@@ -909,8 +912,11 @@ typedef struct task {
 	 * other way to find the binary -- and without it, symbols, breakpoints
 	 * and shared-library relocation are all unavailable for a process it did
 	 * not start itself.  Systems with a per-process filesystem publish the
-	 * same string as /proc/PID/exe; this one reports it through ptrace. */
-	char exe_path[256];
+	 * same string as /proc/PID/exe; this one reports it through ptrace.
+	 *
+	 * A task_path (task_path.h): read with task_exe() by the task itself,
+	 * task_path_ref() by anybody else.  NULL: none. */
+	struct task_path *fs_exe;
 
 	// Full command line (argv joined by spaces, set on execve)
 	char cmdline[1024];
@@ -927,8 +933,9 @@ typedef struct task {
 	uint64_t utime_us; // Time spent in user mode
 	uint64_t stime_us; // Time spent in kernel mode
 
-	// Current working directory
-	char cwd[256];
+	/* Current working directory, canonical and absolute (inside the chroot
+	 * root): a task_path, as fs_exe.  NULL: "/". */
+	struct task_path *fs_cwd;
 
 	/* ppoll()/pselect() install a temporary signal mask for the duration of
 	 * the wait.  The caller's mask must NOT be put back before the kernel
@@ -945,7 +952,7 @@ typedef struct task {
 	 * canonicalised absolute path, and the canonicaliser already clamps
 	 * ".." at "/", so a jailed task cannot escape upward.  Inherited across
 	 * fork and preserved across exec. */
-	char root[256];
+	struct task_path *fs_root; /* a task_path, as fs_exe; NULL: no jail */
 
 	// Implicit console I/O flags (O_NONBLOCK etc., for when fd 0/1/2 are
 	// not backed by a real vfs_file but use the console TTY directly).

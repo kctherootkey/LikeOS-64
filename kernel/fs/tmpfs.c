@@ -56,6 +56,7 @@
 #include <kernel/fs/tmpfs.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/fs/mount.h>
+#include <kernel/fs/pathbuf.h>
 #include <kernel/uapi/status.h>
 #include <kernel/uapi/stat.h>
 #include <kernel/uapi/dirent.h>
@@ -659,15 +660,21 @@ static int tfs_split(struct tfs_sb *sb, const char *path,
 	if (start == 0) {
 		dir = &sb->root;
 	} else {
-		char prefix[VFS_MAX_PATH];
+		/* The directory part, as a string of its own (a path
+		 * buffer: never on the stack). */
+		char *prefix;
 
-		if (start >= sizeof(prefix))
-			return ST_INVALID;
+		if (start >= PATHBUF_SIZE)
+			return ST_NAMETOOLONG;
+		prefix = pathbuf_get();
+		if (!prefix)
+			return ST_NOMEM;
 		mm_memcpy(prefix, rel, start);
 		prefix[start] = 0;
 		dir = tfs_resolve(sb, &sb->root, prefix, 1, 0,
 				  path[0] == '/' ? path : NULL,
 				  (size_t)(rel - path));
+		pathbuf_put(prefix);
 		if (!dir || dir->inode->type != TFS_DIR)
 			return ST_NOT_FOUND;
 	}

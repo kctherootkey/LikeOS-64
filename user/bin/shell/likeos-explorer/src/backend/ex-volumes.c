@@ -88,6 +88,12 @@ static void got_space(GObject *src, GAsyncResult *res, gpointer data)
 					i, G_FILE_ATTRIBUTE_FILESYSTEM_SIZE);
 				v->free = g_file_info_get_attribute_uint64(
 					i, G_FILE_ATTRIBUTE_FILESYSTEM_FREE);
+				v->used = g_file_info_has_attribute(
+						  i, G_FILE_ATTRIBUTE_FILESYSTEM_USED) ?
+						  g_file_info_get_attribute_uint64(
+							  i,
+							  G_FILE_ATTRIBUTE_FILESYSTEM_USED) :
+						  G_MAXUINT64;
 				if (!v->fs_type || !*v->fs_type) {
 					g_free(v->fs_type);
 					v->fs_type = g_strdup(
@@ -119,6 +125,7 @@ static void ask_space(ExVolumes *v, ExVolume *vol)
 		vol->root,
 		G_FILE_ATTRIBUTE_FILESYSTEM_SIZE
 		"," G_FILE_ATTRIBUTE_FILESYSTEM_FREE
+		"," G_FILE_ATTRIBUTE_FILESYSTEM_USED
 		"," G_FILE_ATTRIBUTE_FILESYSTEM_TYPE,
 		G_PRIORITY_LOW, NULL, got_space, r);
 }
@@ -178,7 +185,7 @@ static void add_system_mounts(GPtrArray *list, GPtrArray *usb)
 				     strcmp(dir, "/ram") == 0)) {
 					GFile *root = g_file_new_for_path(dir);
 
-					/* A USB drive the device service mounted
+					/* A drive the device service mounted
 					 * is shown as the service describes it. */
 					if (!have_root(list, root) &&
 					    !have_root(usb, root)) {
@@ -262,14 +269,24 @@ static char *icon_name_of(GIcon *icon)
 	return g_strdup("drive-removable-media");
 }
 
-/* Whether a device of the service's table is a volume to show: a USB
- * drive's partition, or the whole disk when there is a filesystem directly
- * on it -- or nothing on it at all, so that it can be formatted.  A system
- * device (the stick LikeOS runs from) is the System disk already, and an
- * ejected one is safe to unplug: neither is shown. */
-static gboolean is_usb_volume(GPtrArray *devs, const ExDevdDevice *d)
+/* Whether a device of the service's table is a volume to show:
+ *  - a USB drive's partition, or the whole disk when there is a filesystem
+ *    directly on it -- or nothing on it at all, so that it can be
+ *    formatted;
+ *  - a CD/DVD drive, with a disc or without one;
+ *  - a partition of a built-in disk with a filesystem LikeOS can open.
+ * A system device (the stick LikeOS runs from, the disk with the root) is
+ * the System disk already, and an ejected one is safe to unplug: neither
+ * is shown. */
+static gboolean is_drive_volume(GPtrArray *devs, const ExDevdDevice *d)
 {
-	if (!d->usb || d->system || d->ejected || d->size == 0)
+	if (d->system || d->ejected)
+		return FALSE;
+	if (d->optical)
+		return d->is_disk;
+	if (d->internal)
+		return d->supported && d->size > 0;
+	if (!d->usb || d->size == 0)
 		return FALSE;
 	if (!d->is_disk || strcmp(d->fstype, "none") != 0)
 		return TRUE;
@@ -282,7 +299,31 @@ static gboolean is_usb_volume(GPtrArray *devs, const ExDevdDevice *d)
 	return TRUE;
 }
 
-static GPtrArray *usb_volumes(void)
+static ExDriveClass drive_class(const ExDevdDevice *d)
+{
+	if (d->optical)
+		return EX_DRIVE_OPTICAL;
+	if (d->internal)
+		return EX_DRIVE_INTERNAL;
+	return EX_DRIVE_USB;
+}
+
+static char *drive_name(const ExDevdDevice *d, const char *label)
+{
+	if (*label)
+		return g_strdup(label);
+	switch (drive_class(d)) {
+	case EX_DRIVE_OPTICAL:
+		return g_strdup(EX_OPTICAL_DRIVE_NAME);
+	case EX_DRIVE_INTERNAL:
+		return g_strdup_printf(EX_LOCAL_DISK_NAME " (%s)", d->name);
+	case EX_DRIVE_USB:
+	default:
+		return g_strdup(EX_USB_DRIVE_NAME);
+	}
+}
+
+static GPtrArray *drive_volumes(void)
 {
 	GPtrArray *devs = ex_devd_devices(ex_devd_get_default());
 	GPtrArray *out = g_ptr_array_new_with_free_func(
@@ -293,16 +334,17 @@ static GPtrArray *usb_volumes(void)
 		ExVolume *v;
 		char *label;
 
-		if (!is_usb_volume(devs, d))
+		if (!is_drive_volume(devs, d))
 			continue;
 		v = g_new0(ExVolume, 1);
 		label = g_strstrip(g_strdup(d->label));
-		v->kind = EX_VOLUME_USB;
-		v->name = *label ? g_strdup(label) : g_strdup(EX_USB_DRIVE_NAME);
-		v->icon_name = g_strdup("drive-removable-media-usb");
+		v->kind = EX_VOLUME_DRIVE;
+		v->drive = drive_class(d);
+		v->readonly = d->readonly || d->optical;
+		v->name = drive_name(d, label);
 		v->root = *d->mounted ? g_file_new_for_path(d->mounted) : NULL;
 		v->fs_type = g_strdup(d->fstype);
-		v->removable = TRUE;
+		v->removable = v->drive != EX_DRIVE_INTERNAL;
 		v->device = g_strdup(d->name);
 		v->disk = g_strdup(d->disk);
 		v->label = label;
@@ -310,6 +352,7 @@ static GPtrArray *usb_volumes(void)
 		v->capacity = d->size;
 		v->supported = d->supported;
 		v->state = g_strdup(d->state);
+		v->icon_name = g_strdup(ex_volume_drive_icon(v));
 		g_ptr_array_add(out, v);
 	}
 	/* Two drives of the same name are told apart by their device. */
@@ -318,8 +361,8 @@ static GPtrArray *usb_volumes(void)
 		gboolean twin = FALSE;
 
 		for (guint j = 0; j < out->len && !twin; j++)
-			twin = j != i && strcmp(a->label, ((ExVolume *)g_ptr_array_index(
-								  out, j))->label) == 0;
+			twin = j != i && strcmp(a->name, ((ExVolume *)g_ptr_array_index(
+								 out, j))->name) == 0;
 		if (twin) {
 			char *n = g_strdup_printf("%s (%s)", a->name, a->device);
 
@@ -330,14 +373,15 @@ static GPtrArray *usb_volumes(void)
 	return out;
 }
 
-/* The USB drives that went, or were unmounted, between two lists. */
+/* The drives of the device service that went, or were unmounted,
+ * between two lists. */
 static void announce_removals(ExVolumes *v, GPtrArray *old)
 {
 	for (guint i = 0; old && i < old->len; i++) {
 		ExVolume *o = g_ptr_array_index(old, i);
 		const ExVolume *n;
 
-		if (o->kind != EX_VOLUME_USB)
+		if (o->kind != EX_VOLUME_DRIVE)
 			continue;
 		n = ex_volumes_find_device(v, o->device);
 		if (!n)
@@ -351,7 +395,7 @@ static void rebuild(ExVolumes *v)
 {
 	GPtrArray *list = g_ptr_array_new_with_free_func(
 		(GDestroyNotify)volume_free);
-	GPtrArray *usb = usb_volumes();
+	GPtrArray *usb = drive_volumes();
 	GPtrArray *old;
 	GList *mounts = v->mon ? g_volume_monitor_get_mounts(v->mon) : NULL;
 
@@ -530,6 +574,69 @@ void ex_volumes_refresh(ExVolumes *v)
 {
 	for (guint i = 0; v->list && i < v->list->len; i++)
 		ask_space(v, g_ptr_array_index(v->list, i));
+}
+
+gboolean ex_volume_can_eject(const ExVolume *vol)
+{
+	return vol && vol->kind == EX_VOLUME_DRIVE &&
+	       vol->drive != EX_DRIVE_INTERNAL;
+}
+
+gboolean ex_volume_can_format(const ExVolume *vol)
+{
+	return vol && vol->kind == EX_VOLUME_DRIVE &&
+	       vol->drive == EX_DRIVE_USB && !vol->readonly;
+}
+
+gboolean ex_volume_can_unmount(const ExVolume *vol)
+{
+	return vol && vol->kind == EX_VOLUME_DRIVE &&
+	       vol->drive == EX_DRIVE_INTERNAL && vol->root;
+}
+
+const char *ex_volume_drive_icon(const ExVolume *vol)
+{
+	switch (vol->drive) {
+	case EX_DRIVE_OPTICAL:
+		return vol->capacity > 0 ? "media-optical" : "drive-optical";
+	case EX_DRIVE_INTERNAL:
+		return "drive-harddisk";
+	case EX_DRIVE_USB:
+	default:
+		return "drive-removable-media-usb";
+	}
+}
+
+gboolean ex_volume_no_disc(const ExVolume *vol)
+{
+	return vol && vol->kind == EX_VOLUME_DRIVE &&
+	       vol->drive == EX_DRIVE_OPTICAL && vol->capacity == 0;
+}
+
+const char *ex_volume_type_text(const ExVolume *vol)
+{
+	switch (vol->kind) {
+	case EX_VOLUME_DRIVE:
+		switch (vol->drive) {
+		case EX_DRIVE_OPTICAL:
+			return "CD/DVD drive";
+		case EX_DRIVE_INTERNAL:
+			return "Local disk";
+		case EX_DRIVE_USB:
+		default:
+			return "USB drive";
+		}
+	case EX_VOLUME_RAM:
+		return "RAM disk";
+	case EX_VOLUME_NETWORK:
+		return "Network share";
+	case EX_VOLUME_OTHER:
+		return "Removable drive";
+	case EX_VOLUME_SYSTEM:
+	case EX_VOLUME_LOCAL:
+	default:
+		return "Local disk";
+	}
 }
 
 void ex_volume_eject_async(const ExVolume *vol, GMountOperation *mop,

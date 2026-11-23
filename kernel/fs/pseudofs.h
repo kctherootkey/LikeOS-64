@@ -86,8 +86,12 @@ struct pfs_node {
 	long (*read_at)(struct pfs_node *n, uint64_t off, char *buf, long cap);
 	void *arg;
 	uint64_t arg2;
-	/* symlinks: target, absolute or relative to the link's directory */
+	/* symlinks: target, absolute or relative to the link's directory --
+	 * in link[], or, longer (a process's working directory or open file,
+	 * up to a whole path), in link_long, which a transient node owns
+	 * (pfs_set_link; freed with the node).  Read it with pfs_link(). */
 	char link[128];
+	char *link_long;
 	/* dynamic directories */
 	pfs_list_snap_t list_snap; /* takes precedence over `list' */
 	void (*list_free)(struct pfs_node *dir, void *snap);
@@ -117,6 +121,15 @@ struct pfs {
 	vfs_ops_t ops;
 	uint64_t next_ino;
 };
+
+/* A link node's target. */
+static inline const char *pfs_link(const struct pfs_node *n)
+{
+	return n->link_long ? n->link_long : n->link;
+}
+
+/* Set a (transient) link node's target, of any length: ST_OK or ST_NOMEM. */
+int pfs_set_link(struct pfs_node *n, const char *target);
 
 void pfs_init(struct pfs *fs, const char *mount);
 const vfs_ops_t *pfs_ops(struct pfs *fs);

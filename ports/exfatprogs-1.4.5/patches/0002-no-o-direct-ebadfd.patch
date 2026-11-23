@@ -1,0 +1,37 @@
+The LikeOS libc has neither O_DIRECT nor EBADFD.
+
+  O_DIRECT: mkfs.exfat --verify re-reads what it wrote with the device
+      switched to O_DIRECT so that the read cannot be served from a page
+      cache.  LikeOS block device nodes have no page cache in front of
+      them (every read() goes to the drive), so a plain read verifies the
+      same thing; the fcntl() is left out where O_DIRECT is not defined.
+  EBADFD: the "no /dev/zero descriptor" error of the zero-page mapping
+      helper becomes EBADF (the descriptor is not valid), the nearest
+      code the libc has.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/lib/libexfat.c	2026-11-20 15:59:09.685876614 +0100
++++ b/lib/libexfat.c	2026-11-20 15:59:20.434912306 +0100
+@@ -1547,7 +1547,9 @@
+ 		buf = zm;
+ 	}
+ 
++#ifdef O_DIRECT
+ 	fcntl(bd->dev_fd, F_SETFL, flags|O_DIRECT);
++#endif
+ 	ret = exfat_read2(bd->dev_fd, verify, &aligned_len, &aligned_off);
+ 	if (ret) {
+ 		exfat_debug("%s verify read failed (off=%llu, len=%llu)\n", what,
+@@ -1612,7 +1614,11 @@
+ 			return ret;
+ 		}
+ 	} else if (*mapped) {
++#ifdef EBADFD
+ 		errno = EBADFD;
++#else
++		errno = EBADF;
++#endif
+ 		return NULL;
+ 	}
+ #else

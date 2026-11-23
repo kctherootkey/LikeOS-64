@@ -1,13 +1,13 @@
 DEVCTL(1)                        User Commands                       DEVCTL(1)
 
 NAME
-       devctl - ask the device manager (devd) about disks and USB drives
+       devctl - ask the device manager (devd) about disks, drives and discs
 
 SYNOPSIS
        devctl list
        devctl monitor
        devctl fstypes
-       devctl mount name
+       devctl mount [--recover] name
        devctl unmount name
        devctl eject disk
        devctl format name fs [--label label] [--full] [--cluster bytes]
@@ -15,9 +15,11 @@ SYNOPSIS
 DESCRIPTION
        devctl talks to devd(1), for testing it without a desktop.
 
-       list      the disks and volumes: size, file system, label, whether
-                 it is a USB drive, whether it belongs to the running system,
-                 and where it is mounted.
+       list      the disks and volumes: size, file system, class (usb, cd
+                 for a CD/DVD drive, int for a built-in disk), whether it is
+                 read-only, whether it belongs to the running system,
+                 whether devd can mount it, its label and where it is
+                 mounted.
 
        monitor   print every device event (ADDED, REMOVED, CHANGED) until
                  interrupted.
@@ -28,17 +30,28 @@ DESCRIPTION
        mount, unmount
                  mount a volume (name as in devctl list, e.g. sdb1) at
                  /media/<user>/<label> and print the path; unmount it.
+                 An ext4 or NTFS volume whose journal still holds changes
+                 (the drive was pulled out, or the computer turned off,
+                 before they were written) is not mounted: devctl says so
+                 (EUCLEAN) and names --recover, which replays the journal
+                 -- writing those changes to the drive -- and then mounts
+                 it.
 
        eject     unmount every volume of a drive (e.g. sdb) and flush it, so
-                 it can be pulled out.
+                 it can be pulled out; a CD/DVD drive (e.g. sr0) opens its
+                 tray.
 
-       format    make a new file system (vfat or ext4) on a volume.  Quick
-                 unless --full is given, which writes zeros over the whole
-                 volume first.  --cluster sets the allocation unit size.
-                 Everything on the volume is lost.
+       format    make a new file system (vfat, ext4, exfat or ntfs) on a
+                 volume.  Quick unless --full is given, which writes zeros
+                 over the whole volume first.  --cluster sets the allocation
+                 unit size, one of those devctl fstypes lists for the file
+                 system.  Everything on the volume is lost.
 
        mount, unmount, eject and format are allowed for root and for the
-       user logged in at the console, on removable USB drives only.
+       user logged in at the console: on USB drives all four (format not
+       when write-protected), on CD/DVD drives all but format, on the
+       partitions of built-in disks mount and unmount only -- never on a
+       disk the running system uses.
 
 EXIT STATUS
        0 on success, 1 when devd refused or failed (the reason is printed),

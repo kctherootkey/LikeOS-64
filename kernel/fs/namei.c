@@ -11,6 +11,8 @@
 #include <kernel/fs/namei.h>
 #include <kernel/fs/file.h>
 #include <kernel/io/tty.h>
+#include <kernel/fs/pathbuf.h>
+#include <kernel/ke/task_path.h>
 
 /*
  * Resolve a path against THIS task's working directory (and chroot), in place.
@@ -27,24 +29,65 @@
 int canon_task_path(char *path, size_t size)
 {
 	task_t *cur = sched_current();
-	char full[VFS_MAX_PATH];
+	char *full;
 	int ret;
 	size_t i;
 
 	if (!cur || !path || size < 2)
 		return -EINVAL;
 
-	ret = build_at_path(cur, AT_FDCWD, path, full, sizeof(full));
+	full = pathbuf_get();
+	if (!full)
+		return -ENOMEM;
+	ret = build_at_path(cur, AT_FDCWD, path, full, PATHBUF_SIZE);
 	if (ret != 0)
-		return ret;
+		goto out;
 
 	for (i = 0; i + 1 < size && full[i]; i++)
 		path[i] = full[i];
 	path[i] = '\0';
 	/* Truncating would name a different file; refuse instead. */
 	if (full[i] != '\0')
-		return -ENAMETOOLONG;
+		ret = -ENAMETOOLONG;
+out:
+	pathbuf_put(full);
+	return ret;
+}
+
+/* A user path copied into a new path buffer (put by the caller): 0 with *out
+ * set, or -errno (-EFAULT, -ENAMETOOLONG, -ENOMEM) with *out NULL. */
+int user_path_get(uint64_t upath, char **out)
+{
+	char *b;
+	int r;
+
+	*out = NULL;
+	b = pathbuf_get();
+	if (!b)
+		return -ENOMEM;
+	r = copy_user_path((const char *)upath, b, PATHBUF_SIZE);
+	if (r != 0) {
+		pathbuf_put(b);
+		return r;
+	}
+	*out = b;
 	return 0;
+}
+
+/* A user path made absolute against the task's working directory (and
+ * chroot), in a new path buffer: user_path_get() + canon_task_path(). */
+int user_path_get_canon(uint64_t upath, char **out)
+{
+	int r = user_path_get(upath, out);
+
+	if (r != 0)
+		return r;
+	r = canon_task_path(*out, PATHBUF_SIZE);
+	if (r != 0) {
+		pathbuf_put(*out);
+		*out = NULL;
+	}
+	return r;
 }
 
 // Convert VFS status codes to negative errno values
@@ -96,6 +139,8 @@ int vfs_status_to_errno(int st)
 		return -ENAMETOOLONG;
 	case ST_NXIO:
 		return -ENXIO;
+	case ST_UCLEAN:
+		return -EUCLEAN;
 	default:
 		return -EACCES;
 	}
@@ -269,26 +314,26 @@ static int64_t name_op_errno(int st)
 
 int64_t sys_unlink(uint64_t pathname)
 {
+	char *kpath;
+	int64_t ret;
+	int st;
+
 	if (!validate_user_ptr(pathname, 1))
 		return -EFAULT;
 
 	// Copy user path to kernel buffer first
-	char kpath[VFS_MAX_PATH];
-	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
-	cret = canon_task_path(kpath, sizeof(kpath));
+	int cret = user_path_get_canon(pathname, &kpath);
 	if (cret != 0)
 		return cret;
 
-	int pr = perm_check_remove(
-		kpath); /* parent write+search, + sticky bit */
-	if (pr < 0)
-		return pr;
-	int st = vfs_unlink(kpath);
-	if (st == ST_OK)
-		return 0;
-	return name_op_errno(st);
+	ret = perm_check_remove(kpath); /* parent write+search, + sticky bit */
+	if (ret < 0)
+		goto out;
+	st = vfs_unlink(kpath);
+	ret = (st == ST_OK) ? 0 : name_op_errno(st);
+out:
+	pathbuf_put(kpath);
+	return ret;
 }
 
 static int64_t rename_paths(const char *koldpath, const char *knewpath);
@@ -302,23 +347,19 @@ int64_t sys_rename(uint64_t oldpath, uint64_t newpath)
 		return -EFAULT;
 
 	// Copy user paths to kernel buffers first
-	char koldpath[VFS_MAX_PATH], knewpath[VFS_MAX_PATH];
-	int cret = copy_user_path((const char *)oldpath, koldpath,
-				  sizeof(koldpath));
-	if (cret != 0)
-		return cret;
-	cret = copy_user_path((const char *)newpath, knewpath,
-			      sizeof(knewpath));
-	if (cret != 0)
-		return cret;
-
-	cret = canon_task_path(koldpath, sizeof(koldpath));
-	if (cret != 0)
-		return cret;
-	cret = canon_task_path(knewpath, sizeof(knewpath));
-	if (cret != 0)
-		return cret;
-	return rename_paths(koldpath, knewpath);
+	char *koldpath = NULL, *knewpath = NULL;
+	int64_t ret = user_path_get(oldpath, &koldpath);
+	if (ret == 0)
+		ret = user_path_get(newpath, &knewpath);
+	if (ret == 0)
+		ret = canon_task_path(koldpath, PATHBUF_SIZE);
+	if (ret == 0)
+		ret = canon_task_path(knewpath, PATHBUF_SIZE);
+	if (ret == 0)
+		ret = rename_paths(koldpath, knewpath);
+	pathbuf_put(knewpath);
+	pathbuf_put(koldpath);
+	return ret;
 }
 
 static int64_t rename_paths(const char *koldpath, const char *knewpath)
@@ -346,9 +387,8 @@ int64_t sys_renameat2(uint64_t olddirfd, uint64_t oldpath, uint64_t newdirfd,
 		      uint64_t newpath, uint64_t flags)
 {
 	task_t *cur = sched_current();
-	char kold[VFS_MAX_PATH], knew[VFS_MAX_PATH];
-	char fold[VFS_MAX_PATH], fnew[VFS_MAX_PATH];
-	int c;
+	char *kold = NULL, *knew = NULL, *fold = NULL, *fnew = NULL;
+	int64_t c;
 
 	if (!cur)
 		return -EFAULT;
@@ -356,28 +396,44 @@ int64_t sys_renameat2(uint64_t olddirfd, uint64_t oldpath, uint64_t newdirfd,
 		return -EINVAL;
 	if (flags & RENAME_EXCHANGE)
 		return -EINVAL;
-	c = copy_user_path((const char *)oldpath, kold, sizeof(kold));
+	c = user_path_get(oldpath, &kold);
 	if (c)
-		return c;
-	c = copy_user_path((const char *)newpath, knew, sizeof(knew));
+		goto out;
+	c = user_path_get(newpath, &knew);
 	if (c)
-		return c;
-	if (!kold[0] || !knew[0])
-		return -ENOENT;
-	c = build_at_path(cur, (int)olddirfd, kold, fold, sizeof(fold));
+		goto out;
+	if (!kold[0] || !knew[0]) {
+		c = -ENOENT;
+		goto out;
+	}
+	fold = pathbuf_get();
+	fnew = pathbuf_get();
+	if (!fold || !fnew) {
+		c = -ENOMEM;
+		goto out;
+	}
+	c = build_at_path(cur, (int)olddirfd, kold, fold, PATHBUF_SIZE);
 	if (c)
-		return c;
-	c = build_at_path(cur, (int)newdirfd, knew, fnew, sizeof(fnew));
+		goto out;
+	c = build_at_path(cur, (int)newdirfd, knew, fnew, PATHBUF_SIZE);
 	if (c)
-		return c;
+		goto out;
 	if (flags & RENAME_NOREPLACE) {
 		struct kstat st;
 		/* Checked, not held: a name that appears between the check
 		 * and the rename is replaced. */
-		if (vfs_lstat(fnew, &st) == ST_OK)
-			return -EEXIST;
+		if (vfs_lstat(fnew, &st) == ST_OK) {
+			c = -EEXIST;
+			goto out;
+		}
 	}
-	return rename_paths(fold, fnew);
+	c = rename_paths(fold, fnew);
+out:
+	pathbuf_put(fnew);
+	pathbuf_put(fold);
+	pathbuf_put(knew);
+	pathbuf_put(kold);
+	return c;
 }
 
 int64_t sys_mkdir(uint64_t pathname, uint64_t mode)
@@ -387,14 +443,13 @@ int64_t sys_mkdir(uint64_t pathname, uint64_t mode)
 		return -EFAULT;
 
 	// Copy user path to kernel buffer first
-	char kpath[VFS_MAX_PATH];
-	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
-	cret = canon_task_path(kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
-	return mkdir_path(cur, kpath, mode);
+	char *kpath;
+	int64_t ret = user_path_get_canon(pathname, &kpath);
+	if (ret != 0)
+		return ret;
+	ret = mkdir_path(cur, kpath, mode);
+	pathbuf_put(kpath);
+	return ret;
 }
 
 static int64_t mkdir_path(task_t *cur, const char *kpath, uint64_t mode)
@@ -426,19 +481,31 @@ static int64_t mkdir_path(task_t *cur, const char *kpath, uint64_t mode)
 int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode)
 {
 	task_t *cur = sched_current();
-	char kpath[VFS_MAX_PATH], full[VFS_MAX_PATH];
+	char *kpath = NULL, *full = NULL;
+	int64_t c;
 
 	if (!cur)
 		return -EFAULT;
-	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	c = user_path_get(pathname, &kpath);
 	if (c)
 		return c;
-	if (!kpath[0])
-		return -ENOENT;
-	c = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
+	if (!kpath[0]) {
+		c = -ENOENT;
+		goto out;
+	}
+	full = pathbuf_get();
+	if (!full) {
+		c = -ENOMEM;
+		goto out;
+	}
+	c = build_at_path(cur, (int)dirfd, kpath, full, PATHBUF_SIZE);
 	if (c)
-		return c;
-	return mkdir_path(cur, full, mode);
+		goto out;
+	c = mkdir_path(cur, full, mode);
+out:
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return c;
 }
 
 /* mknodat(dirfd, path, mode, dev): a regular file, FIFO, socket, or -- for
@@ -448,8 +515,9 @@ int64_t sys_mknodat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
 		    uint64_t dev)
 {
 	task_t *cur = sched_current();
-	char kpath[VFS_MAX_PATH], full[VFS_MAX_PATH];
+	char *kpath = NULL, *full = NULL;
 	unsigned type = (unsigned)mode & S_IFMT;
+	int64_t c;
 
 	if (!cur)
 		return -EFAULT;
@@ -458,17 +526,24 @@ int64_t sys_mknodat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
 		return -EINVAL; /* directories are mkdir's; links symlink's */
 	if ((type == S_IFCHR || type == S_IFBLK) && !capable())
 		return -EPERM;
-	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	c = user_path_get(pathname, &kpath);
 	if (c)
 		return c;
-	if (!kpath[0])
-		return -ENOENT;
-	c = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
+	if (!kpath[0]) {
+		c = -ENOENT;
+		goto out;
+	}
+	full = pathbuf_get();
+	if (!full) {
+		c = -ENOMEM;
+		goto out;
+	}
+	c = build_at_path(cur, (int)dirfd, kpath, full, PATHBUF_SIZE);
 	if (c)
-		return c;
-	int pr = perm_check_create(full);
-	if (pr < 0)
-		return pr;
+		goto out;
+	c = perm_check_create(full);
+	if (c < 0)
+		goto out;
 	/* The set-id and sticky bits are kept; the umask takes the rest. */
 	unsigned perm = creat_mode(cur, mode) | ((unsigned)mode & 07000);
 	int st;
@@ -481,10 +556,15 @@ int64_t sys_mknodat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
 		st = vfs_mknod(full, type | perm, dev);
 	}
 	if (st == ST_OK)
-		return 0;
-	if (st == ST_UNSUPPORTED)
-		return -EPERM; /* the filesystem cannot hold such a node */
-	return vfs_status_to_errno(st);
+		c = 0;
+	else if (st == ST_UNSUPPORTED)
+		c = -EPERM; /* the filesystem cannot hold such a node */
+	else
+		c = vfs_status_to_errno(st);
+out:
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return c;
 }
 
 int64_t sys_rmdir(uint64_t pathname)
@@ -493,22 +573,21 @@ int64_t sys_rmdir(uint64_t pathname)
 		return -EFAULT;
 
 	// Copy user path to kernel buffer first
-	char kpath[VFS_MAX_PATH];
-	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
-	cret = canon_task_path(kpath, sizeof(kpath));
+	char *kpath;
+	int64_t ret;
+	int st;
+	int cret = user_path_get_canon(pathname, &kpath);
 	if (cret != 0)
 		return cret;
 
-	int pr = perm_check_remove(
-		kpath); /* parent write+search, + sticky bit */
-	if (pr < 0)
-		return pr;
-	int st = vfs_rmdir(kpath);
-	if (st == ST_OK)
-		return 0;
-	return name_op_errno(st);
+	ret = perm_check_remove(kpath); /* parent write+search, + sticky bit */
+	if (ret < 0)
+		goto out;
+	st = vfs_rmdir(kpath);
+	ret = (st == ST_OK) ? 0 : name_op_errno(st);
+out:
+	pathbuf_put(kpath);
+	return ret;
 }
 
 /* unlinkat(dirfd, path, flags) -- remove a name relative to a directory fd.
@@ -530,43 +609,51 @@ int64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags)
 	if (flags & ~((uint64_t)AT_REMOVEDIR))
 		return -EINVAL;
 
-	char kpath[VFS_MAX_PATH];
-	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
+	char *kpath = NULL, *full = NULL;
+	int64_t ret;
+	int st;
 
-	char full[VFS_MAX_PATH];
-	int brest = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
-	if (brest != 0)
-		return brest;
+	ret = user_path_get(pathname, &kpath);
+	if (ret != 0)
+		return ret;
 
-	int pr = perm_check_remove(full);
-	if (pr < 0)
-		return pr;
+	full = pathbuf_get();
+	if (!full) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	ret = build_at_path(cur, (int)dirfd, kpath, full, PATHBUF_SIZE);
+	if (ret != 0)
+		goto out;
 
-	int st = (flags & AT_REMOVEDIR) ? vfs_rmdir(full) : vfs_unlink(full);
-	if (st == ST_OK)
-		return 0;
-	return name_op_errno(st);
+	ret = perm_check_remove(full);
+	if (ret < 0)
+		goto out;
+
+	st = (flags & AT_REMOVEDIR) ? vfs_rmdir(full) : vfs_unlink(full);
+	ret = (st == ST_OK) ? 0 : name_op_errno(st);
+out:
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return ret;
 }
 
 int64_t sys_link(uint64_t oldpath, uint64_t newpath)
 {
-	char kold[VFS_MAX_PATH], knew[VFS_MAX_PATH];
-	int c = copy_user_path((const char *)oldpath, kold, sizeof(kold));
-	if (c)
-		return c;
-	c = copy_user_path((const char *)newpath, knew, sizeof(knew));
-	if (c)
-		return c;
-	c = canon_task_path(kold, sizeof(kold));
-	if (c)
-		return c;
-	c = canon_task_path(knew, sizeof(knew));
-	if (c)
-		return c;
+	char *kold = NULL, *knew = NULL;
+	int64_t c = user_path_get(oldpath, &kold);
+	if (c == 0)
+		c = user_path_get(newpath, &knew);
+	if (c == 0)
+		c = canon_task_path(kold, PATHBUF_SIZE);
+	if (c == 0)
+		c = canon_task_path(knew, PATHBUF_SIZE);
 	/* A final symlink is linked itself, as linkat() does by default. */
-	return link_paths(kold, knew, 0);
+	if (c == 0)
+		c = link_paths(kold, knew, 0);
+	pathbuf_put(knew);
+	pathbuf_put(kold);
+	return c;
 }
 
 static int64_t link_paths(const char *kold, const char *knew, int follow)
@@ -598,67 +685,82 @@ int64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath, uint64_t newdirfd,
 		   uint64_t newpath, uint64_t flags)
 {
 	task_t *cur = sched_current();
-	char kold[VFS_MAX_PATH], knew[VFS_MAX_PATH];
-	char fold[VFS_MAX_PATH], fnew[VFS_MAX_PATH];
-	int c;
+	char *kold = NULL, *knew = NULL, *fold = NULL, *fnew = NULL;
+	int64_t c;
 
 	if (!cur)
 		return -EFAULT;
 	if (flags & ~((uint64_t)AT_SYMLINK_FOLLOW | AT_EMPTY_PATH))
 		return -EINVAL;
-	c = copy_user_path((const char *)oldpath, kold, sizeof(kold));
+	c = user_path_get(oldpath, &kold);
 	if (c)
-		return c;
-	c = copy_user_path((const char *)newpath, knew, sizeof(knew));
+		goto out;
+	c = user_path_get(newpath, &knew);
 	if (c)
-		return c;
-	if (!knew[0])
-		return -ENOENT;
+		goto out;
+	if (!knew[0]) {
+		c = -ENOENT;
+		goto out;
+	}
+	fold = pathbuf_get();
+	fnew = pathbuf_get();
+	if (!fold || !fnew) {
+		c = -ENOMEM;
+		goto out;
+	}
 	if (!kold[0]) {
-		if (!(flags & AT_EMPTY_PATH))
-			return -ENOENT;
-		if (!capable())
-			return -ENOENT;
+		if (!(flags & AT_EMPTY_PATH) || !capable()) {
+			c = -ENOENT;
+			goto out;
+		}
 		/* The descriptor's own file, by the path it was opened as. */
 		vfs_file_t *df = fdget(cur, (int)olddirfd);
-		if (!df)
-			return -EBADF;
+		if (!df) {
+			c = -EBADF;
+			goto out;
+		}
 		c = 0;
 		if (fd_is_special(df) || !df->at_path)
 			c = -ENOENT;
 		else
-			kstrncpy(fold, df->at_path, sizeof(fold));
+			kstrncpy(fold, df->at_path, PATHBUF_SIZE);
 		fdput(df);
 		if (c)
-			return c;
-		fold[sizeof(fold) - 1] = '\0';
+			goto out;
+		fold[PATHBUF_SIZE - 1] = '\0';
 	} else {
-		c = build_at_path(cur, (int)olddirfd, kold, fold, sizeof(fold));
+		c = build_at_path(cur, (int)olddirfd, kold, fold, PATHBUF_SIZE);
 		if (c)
-			return c;
+			goto out;
 	}
-	c = build_at_path(cur, (int)newdirfd, knew, fnew, sizeof(fnew));
+	c = build_at_path(cur, (int)newdirfd, knew, fnew, PATHBUF_SIZE);
 	if (c)
-		return c;
-	return link_paths(fold, fnew, (flags & AT_SYMLINK_FOLLOW) ? 1 : 0);
+		goto out;
+	c = link_paths(fold, fnew, (flags & AT_SYMLINK_FOLLOW) ? 1 : 0);
+out:
+	pathbuf_put(fnew);
+	pathbuf_put(fold);
+	pathbuf_put(knew);
+	pathbuf_put(kold);
+	return c;
 }
 
 int64_t sys_symlink(uint64_t target, uint64_t linkpath)
 {
-	char ktarget[VFS_MAX_PATH], klink[VFS_MAX_PATH];
-	int c = copy_user_path((const char *)target, ktarget, sizeof(ktarget));
-	if (c)
-		return c;
-	c = copy_user_path((const char *)linkpath, klink, sizeof(klink));
-	if (c)
-		return c;
+	char *ktarget = NULL, *klink = NULL;
+	int64_t c = user_path_get(target, &ktarget);
+	if (c == 0)
+		c = user_path_get(linkpath, &klink);
 	/* Only the link's own name.  `target` is the link's CONTENT, stored
 	 * verbatim: resolving it would turn a relative symlink into an absolute
 	 * one naming a different file. */
-	c = canon_task_path(klink, sizeof(klink));
-	if (c)
-		return c;
-	return symlink_path(ktarget, klink);
+	if (c == 0)
+		c = canon_task_path(klink, PATHBUF_SIZE);
+	if (c == 0)
+		c = symlink_path(ktarget, klink);
+	pathbuf_put(klink);
+	pathbuf_put(ktarget);
+	return c;
 }
 
 static int64_t symlink_path(const char *ktarget, const char *klink)
@@ -681,125 +783,110 @@ static int64_t symlink_path(const char *ktarget, const char *klink)
 int64_t sys_symlinkat(uint64_t target, uint64_t newdirfd, uint64_t linkpath)
 {
 	task_t *cur = sched_current();
-	char ktarget[VFS_MAX_PATH], klink[VFS_MAX_PATH], full[VFS_MAX_PATH];
+	char *ktarget = NULL, *klink = NULL, *full = NULL;
+	int64_t c;
 
 	if (!cur)
 		return -EFAULT;
-	int c = copy_user_path((const char *)target, ktarget, sizeof(ktarget));
+	c = user_path_get(target, &ktarget);
 	if (c)
-		return c;
-	c = copy_user_path((const char *)linkpath, klink, sizeof(klink));
+		goto out;
+	c = user_path_get(linkpath, &klink);
 	if (c)
-		return c;
-	if (!klink[0])
-		return -ENOENT;
-	c = build_at_path(cur, (int)newdirfd, klink, full, sizeof(full));
+		goto out;
+	if (!klink[0]) {
+		c = -ENOENT;
+		goto out;
+	}
+	full = pathbuf_get();
+	if (!full) {
+		c = -ENOMEM;
+		goto out;
+	}
+	c = build_at_path(cur, (int)newdirfd, klink, full, PATHBUF_SIZE);
 	if (c)
-		return c;
-	return symlink_path(ktarget, full);
+		goto out;
+	c = symlink_path(ktarget, full);
+out:
+	pathbuf_put(full);
+	pathbuf_put(klink);
+	pathbuf_put(ktarget);
+	return c;
 }
 
+/* Append the components of s[0, slen) (up to a NUL) to the canonical
+ * absolute path out[0, *lenp): "." is dropped, ".." takes the last component
+ * off (never above "/"), any other name is added after a slash.
+ * -ENAMETOOLONG for a name longer than VFS_NAME_MAX or a result that would
+ * not fit in `out_size' bytes. */
+int normalize_path_append(char *out, size_t out_size, size_t *lenp,
+			  const char *s, size_t slen)
+{
+	size_t len = *lenp;
+	size_t i = 0;
+
+	while (i < slen && s[i]) {
+		size_t st, n;
+
+		while (i < slen && s[i] == '/')
+			i++;
+		if (i >= slen || !s[i])
+			break;
+		st = i;
+		while (i < slen && s[i] && s[i] != '/')
+			i++;
+		n = i - st;
+		/* One name, which POSIX allows to be NAME_MAX bytes and no
+		 * more.  A longer one is refused, never cut: the tail of a
+		 * cut name would name a different file. */
+		if (n > VFS_NAME_MAX)
+			return -ENAMETOOLONG;
+		if (n == 1 && s[st] == '.')
+			continue;
+		if (n == 2 && s[st] == '.' && s[st + 1] == '.') {
+			/* Back to the slash before the last name. */
+			while (len > 1 && out[len - 1] != '/')
+				len--;
+			if (len > 1)
+				len--;
+			out[len] = '\0';
+			continue;
+		}
+		if (len + (len > 1 ? 1 : 0) + n >= out_size)
+			return -ENAMETOOLONG;
+		if (len > 1)
+			out[len++] = '/';
+		for (size_t k = 0; k < n; k++)
+			out[len++] = s[st + k];
+		out[len] = '\0';
+	}
+	*lenp = len;
+	return 0;
+}
+
+/* `path' -- relative to the absolute directory `base' unless it is absolute
+ * itself -- as a canonical absolute path in `out' (`out_size' bytes, which
+ * must not overlap either input): no ".", "..", doubled or trailing slash.
+ * The two are taken a name at a time, never joined into one string first,
+ * so only the result has to fit.  0, -EINVAL, or -ENAMETOOLONG. */
 int normalize_path(const char *base, const char *path, char *out,
 		   size_t out_size)
 {
+	size_t len = 1;
+	int r;
+
 	if (!path || !out || out_size < 2)
 		return -EINVAL;
-	const char *base_path = (base && base[0]) ? base : "/";
-	char combined[VFS_MAX_PATH];
-	size_t ci = 0;
-
-	if (path[0] == '/') {
-		// Absolute path: copy as-is into combined
-		while (path[ci] && ci < sizeof(combined) - 1) {
-			combined[ci] = path[ci];
-			ci++;
-		}
-	} else {
-		// Relative path: base + '/' + path
-		size_t bi = 0;
-		while (base_path[bi] && ci < sizeof(combined) - 1) {
-			combined[ci++] = base_path[bi++];
-		}
-		if (ci == 0 || combined[ci - 1] != '/') {
-			if (ci < sizeof(combined) - 1)
-				combined[ci++] = '/';
-		}
-		size_t pi = 0;
-		while (path[pi] && ci < sizeof(combined) - 1) {
-			combined[ci++] = path[pi++];
-		}
+	out[0] = '/';
+	out[1] = '\0';
+	if (path[0] != '/') {
+		r = normalize_path_append(out, out_size, &len,
+					  (base && base[0]) ? base : "/",
+					  (size_t)-1);
+		if (r != 0)
+			return r;
 	}
-	combined[ci] = '\0';
-
-	// Normalize combined into out
-	size_t out_len = 0;
-	size_t seg_stack[64];
-	size_t seg_top = 0;
-
-	out[out_len++] = '/';
-	size_t i = 0;
-	while (combined[i]) {
-		while (combined[i] == '/')
-			i++;
-		if (!combined[i])
-			break;
-		/* One name, which POSIX allows to be NAME_MAX bytes.
-		 *
-		 * This buffer used to hold 64, and the loop below simply
-		 * stopped copying when it filled -- without advancing past the
-		 * rest of the name.  The remainder was then taken for the NEXT
-		 * component, so "…/averylongname.ext" quietly became
-		 * "…/averylongnam/e.ext": a different file, in a directory that
-		 * does not exist.  Every path with a component over 63
-		 * characters was affected, which is why creating one could
-		 * succeed and removing it could not. */
-		char segment[VFS_NAME_MAX + 1];
-		size_t si = 0;
-		while (combined[i] && combined[i] != '/') {
-			if (si >= sizeof(segment) - 1)
-				return -ENAMETOOLONG;
-			segment[si++] = combined[i++];
-		}
-		segment[si] = '\0';
-
-		if (segment[0] == '\0' ||
-		    (segment[0] == '.' && segment[1] == '\0')) {
-			continue;
-		}
-		if (segment[0] == '.' && segment[1] == '.' &&
-		    segment[2] == '\0') {
-			if (seg_top > 0) {
-				out_len = seg_stack[--seg_top];
-				out[out_len] = '\0';
-			} else {
-				out_len = 1;
-				out[1] = '\0';
-			}
-			continue;
-		}
-
-		if (out_len > 1 && out[out_len - 1] != '/') {
-			if (out_len < out_size - 1)
-				out[out_len++] = '/';
-		}
-		if (out_len >= out_size - 1)
-			return -EINVAL;
-		seg_stack[seg_top++] = out_len;
-		for (size_t j = 0; j < si && out_len < out_size - 1; ++j) {
-			out[out_len++] = segment[j];
-		}
-		out[out_len] = '\0';
-		if (seg_top >= (sizeof(seg_stack) / sizeof(seg_stack[0]))) {
-			return -EINVAL;
-		}
-	}
-
-	if (out_len > 1 && out[out_len - 1] == '/') {
-		out[out_len - 1] = '\0';
-	} else {
-		out[out_len] = '\0';
-	}
-	return 0;
+	return normalize_path_append(out, out_size, &len, path, (size_t)-1);
 }
 
 /* Prepend the task's chroot root to an already-canonical absolute path.
@@ -807,10 +894,12 @@ int normalize_path(const char *base, const char *path, char *out,
  * result stays inside the jail.  A no-op when the task is not chrooted. */
 static int apply_chroot(task_t *cur, char *abs, size_t out_size)
 {
-	if (!cur || cur->root[0] == '\0')
+	const char *root = task_root(cur); /* (the caller's own) */
+
+	if (!cur || root[0] == '\0')
 		return 0;
 	size_t rlen = 0;
-	while (cur->root[rlen])
+	while (root[rlen])
 		rlen++;
 	/* "/" inside the jail is just the jail root itself. */
 	size_t alen = 0;
@@ -823,14 +912,37 @@ static int apply_chroot(task_t *cur, char *abs, size_t out_size)
 	/* Shift abs right by rlen (unless it is bare "/"), then copy root in. */
 	if (only_slash) {
 		for (size_t i = 0; i <= rlen; i++)
-			abs[i] = cur->root[i];
+			abs[i] = root[i];
 	} else {
 		for (size_t i = alen + 1; i-- > 0;)
 			abs[i + rlen] = abs[i];
 		for (size_t i = 0; i < rlen; i++)
-			abs[i] = cur->root[i];
+			abs[i] = root[i];
 	}
 	return 0;
+}
+
+/* A real path (a descriptor's at_path) as the task in its chroot sees it: in
+ * a chroot the real path starts with the root, and the part below it is the
+ * path within the jail (where ".." stops at the jail's top; the root goes in
+ * front again afterwards).  A path outside the jail (a descriptor opened
+ * before the chroot) leads where it leads: itself, *inside 0, no root to be
+ * put in front.  Without a root: `real' itself, *inside 1. */
+const char *jail_relative(task_t *cur, const char *real, int *inside)
+{
+	const char *root = task_root(cur);
+	size_t rlen = 0;
+
+	*inside = 1;
+	while (root[rlen])
+		rlen++;
+	if (!rlen)
+		return real;
+	if (kstrncmp(real, root, rlen) == 0 &&
+	    (real[rlen] == '/' || real[rlen] == '\0'))
+		return real[rlen] ? real + rlen : "/";
+	*inside = 0;
+	return real;
 }
 
 /* NOTE: `base' can point INTO the directory descriptor's file (its at_path),
@@ -842,15 +954,21 @@ int build_at_path(task_t *cur, int dirfd, const char *path, char *out,
 {
 	const char *base;
 	vfs_file_t *held = NULL;
+	int jail = 1; /* the result is inside the task's root */
 	int ret;
 
 	if (!cur || !path || !out || out_size < 2)
 		return -EINVAL;
+	/* An empty path names nothing (POSIX: ENOENT) -- not the directory it
+	 * would be relative to.  The *at() calls that take AT_EMPTY_PATH deal
+	 * with "" themselves before they get here. */
+	if (!path[0])
+		return -ENOENT;
 
 	/* An ABSOLUTE path ignores dirfd entirely, as POSIX requires -- the
 	 * descriptor is not even required to be valid in that case. */
 	if (path[0] == '/' || dirfd == AT_FDCWD) {
-		base = (cur->cwd[0] != 0) ? cur->cwd : "/";
+		base = task_cwd(cur); /* (the caller's own) */
 	} else {
 		/* Relative to the directory the descriptor refers to.
 		 *
@@ -893,11 +1011,11 @@ int build_at_path(task_t *cur, int dirfd, const char *path, char *out,
 				goto out;
 			}
 		}
-		base = df->at_path;
+		base = jail_relative(cur, df->at_path, &jail);
 	}
 
 	ret = normalize_path(base, path, out, out_size);
-	if (ret == 0)
+	if (ret == 0 && jail)
 		ret = apply_chroot(cur, out, out_size);
 out:
 	if (held)

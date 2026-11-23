@@ -10,6 +10,7 @@
 #include <kernel/net/net.h>
 #include <kernel/ke/uaccess.h>
 #include <kernel/ke/hrtimer.h>
+#include <kernel/ke/task_path.h>
 
 /* The rule that used to live here — may the caller read another process's
  * private state — is now task_may_access(target, ACCESS_READ) in cred.c, so
@@ -1579,28 +1580,29 @@ int64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
 	 * per-process filesystem publish the same string as /proc/PID/exe.
 	 */
 	case PT_GETEXECPATH: {
-		char path[256];
-		size_t len = 0;
-
-		while (len < sizeof(path) - 1 && t->exe_path[len]) {
-			path[len] = t->exe_path[len];
-			len++;
-		}
-		path[len] = '\0';
+		/* A counted reference, taken under the task-list lock: the
+		 * string stays whatever the tracee does after it is dropped. */
+		struct task_path *ep = task_path_ref(t, TASK_PATH_EXE);
+		const char *path = ep ? ep->s : "";
+		size_t len = ep ? ep->len : 0;
+		int64_t ret;
 
 		spin_unlock_irqrestore(&g_task_list_lock, flags);
 
-		if (len == 0)
-			return 0;
 		/* The terminator has to fit too: a caller given a truncated
 		 * path with no NUL would read past its own buffer. */
-		if (data < (uint64_t)len + 1)
-			return -ERANGE;
-		if (!validate_user_ptr(addr, len + 1))
-			return -EFAULT;
-		if (copy_to_user((void *)addr, path, len + 1) < 0)
-			return -EFAULT;
-		return (int64_t)len;
+		if (len == 0)
+			ret = 0;
+		else if (data < (uint64_t)len + 1)
+			ret = -ERANGE;
+		else if (!validate_user_ptr(addr, len + 1))
+			ret = -EFAULT;
+		else if (copy_to_user((void *)addr, path, len + 1) < 0)
+			ret = -EFAULT;
+		else
+			ret = (int64_t)len;
+		task_path_put(ep);
+		return ret;
 	}
 
 	case PT_GETSIGINFO: {

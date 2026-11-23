@@ -9,7 +9,8 @@
 // device is opened with O_EXCL, so a volume that is mounted or in use by
 // anyone fails instead of being overwritten under them.
 //
-// The client that asked gets PROGRESS lines and then OK FORMAT or
+// The client that asked gets PROGRESS lines (the last one with the word
+// `busy' once mkfs runs, which reports no progress) and then OK FORMAT or
 // ERR FORMAT; it sends nothing else meanwhile (devd reads its next request
 // only after that reply), so replies stay in order.
 //
@@ -191,13 +192,33 @@ static void send_progress(struct job *j, int pct)
 		client_send_line(c, &l);
 }
 
+/* mkfs is running and reports no progress of its own: the percentage
+ * stays where it is, and `busy' says the step takes time of its own. */
+static void send_busy(struct job *j)
+{
+	struct client *c = client_by_id(j->client_id);
+	struct devp_line l;
+	char num[8];
+
+	if (!c)
+		return;
+	snprintf(num, sizeof(num), "%d", j->last_pct > 0 ? j->last_pct : 0);
+	devp_line_begin(&l, "PROGRESS");
+	devp_line_enc(&l, j->name);
+	devp_line_word(&l, num);
+	devp_line_word(&l, "busy");
+	if (devp_line_end(&l) > 0)
+		client_send_line(c, &l);
+}
+
 int format_start(struct client *c, struct dev *d, char *const *tok, int ntok,
 		 const char **msg)
 {
 	static const char *const keys[] = { "fs", "label", "quick", "cluster" };
 	const char *fs = NULL, *lab = NULL, *q = NULL, *cl = NULL;
 	const struct fs_type *t;
-	char raw[256], label[64], dev[DEVD_PATH_MAX];
+	/* an NTFS label is up to 128 UTF-16 units: 384 bytes of UTF-8 */
+	char raw[512], label[400], dev[DEVD_PATH_MAX];
 	char store[1024];
 	char *argv[24];
 	int quick = 1, dup = 0, slot = -1, prog[2], out[2], sector = 512;
@@ -260,7 +281,18 @@ int format_start(struct client *c, struct dev *d, char *const *tok, int ntok,
 		return -EINVAL;
 	}
 
-	/* the volume */
+	/* the volume (the caller checked the rules; once more here, so that
+	 * nothing reaches mkfs past them) */
+	{
+		const char *why = "";
+
+		r = dev_policy_check(d, OP_FORMAT, &why);
+		if (r < 0 || d->readonly || d->optical || d->internal ||
+		    !d->usb) {
+			*msg = r < 0 ? why : "this drive is not formatted here";
+			return -EPERM;
+		}
+	}
 	if (!dev_is_volume(d)) {
 		*msg = "the drive has partitions; format one of them";
 		return -EINVAL;
@@ -406,7 +438,9 @@ int format_pollfds(struct pollfd *pfd, int max)
 	return n;
 }
 
-static void read_progress(struct job *j)
+/* Returns 1 when the progress pipe closed: mkfs started (or the child
+ * ended). */
+static int read_progress(struct job *j)
 {
 	char buf[128];
 
@@ -416,11 +450,11 @@ static void read_progress(struct job *j)
 		if (n < 0 && errno == EINTR)
 			continue;
 		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-			return;
+			return 0;
 		if (n <= 0) {
 			close(j->prog_fd);
 			j->prog_fd = -1;
-			return;
+			return 1;
 		}
 		for (ssize_t i = 0; i < n; i++) {
 			char ch = buf[i];
@@ -488,8 +522,10 @@ void format_handle(struct pollfd *pfd, int n)
 
 			if (!j->used)
 				continue;
-			if (pfd[k].fd == j->prog_fd)
-				read_progress(j);
+			if (pfd[k].fd == j->prog_fd) {
+				if (read_progress(j))
+					send_busy(j);
+			}
 			else if (pfd[k].fd == j->out_fd)
 				read_output(j);
 		}

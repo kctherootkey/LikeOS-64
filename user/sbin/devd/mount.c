@@ -7,8 +7,10 @@
 // the path between devd's checks and the mount: there is no race to win.
 // Each component is checked with lstat() before every mount anyway.
 //
-// Every mount is nosuid and nodev: a stick can carry neither a set-id
-// program nor a device node that works.
+// Every mount is nosuid and nodev: a stick, a disc or a partition of
+// another system can carry neither a set-id program nor a device node that
+// works.  Write-protected media, CDs and DVDs, and ISO 9660 anywhere are
+// mounted read-only.  Ejecting a CD/DVD drive opens its tray.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -20,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -27,6 +30,9 @@
 #include <unistd.h>
 
 #include "devd.h"
+
+/* The CD-ROM request that opens the tray (the drive unlocks it first). */
+#define DEVD_CDROMEJECT 0x5309
 
 /* ---- paths --------------------------------------------------------------------- */
 
@@ -285,13 +291,14 @@ int dev_node_ok(const struct dev *d)
 	return 1;
 }
 
-int do_mount(struct dev *d, uid_t uid, gid_t gid, char *out, size_t cap,
-	     const char **msg)
+int do_mount(struct dev *d, uid_t uid, gid_t gid, int recover, char *out,
+	     size_t cap, const char **msg)
 {
 	char user[DEVD_USERDIR_MAX], udir[DEVD_PATH_MAX], base[DEVD_LABEL_MAX];
 	char cand[DEVD_LABEL_MAX], path[DEVD_PATH_MAX], dev[DEVD_PATH_MAX];
-	char opts[128];
+	char opts[160];
 	const struct fs_type *t;
+	unsigned long flags;
 	struct passwd *pw;
 	struct stat st;
 	int r, made = 0;
@@ -321,7 +328,7 @@ int do_mount(struct dev *d, uid_t uid, gid_t gid, char *out, size_t cap,
 		return -EBUSY;
 	}
 	t = fs_by_id(d->pr.fstype);
-	if (!d->supported || !t || !t->kernel_type) {
+	if (!d->supported || !t || !t->kernel_type || !t->mount_opts) {
 		*msg = "unsupported file system";
 		return -ENOTSUP;
 	}
@@ -379,18 +386,36 @@ int do_mount(struct dev *d, uid_t uid, gid_t gid, char *out, size_t cap,
 		*msg = "mount path is not safe";
 		return -EPERM;
 	}
-	t->mount_opts(opts, sizeof(opts), uid, gid);
+	/* A journal that must be replayed is not replayed behind the user's
+	 * back: the kernel refuses with EUCLEAN, the desktop asks, and the
+	 * request comes again with `recover' when the user agreed. */
+	r = fs_mount_data(t, recover, uid, gid, opts, sizeof(opts));
+	if (r < 0) {
+		rmdir(path);
+		*msg = "mount options too long";
+		return r;
+	}
 	snprintf(dev, sizeof(dev), "/dev/%s", d->name);
-	if (mount(dev, path, t->kernel_type, MS_NOSUID | MS_NODEV,
-		  opts[0] ? opts : NULL) < 0) {
+	flags = dev_mount_flags(d, t);
+	if (mount(dev, path, t->kernel_type, flags, opts[0] ? opts : NULL) <
+	    0) {
 		int e = errno;
 
 		rmdir(path);
+		if (e == EUCLEAN) {
+			log_info("%s: the file system journal must be replayed; "
+				 "not mounted until the user agrees",
+				 dev);
+			*msg = "the file system journal must be replayed first";
+			return -EUCLEAN;
+		}
 		log_warn("mount %s on %s failed: %s", dev, path, strerror(e));
 		*msg = "the kernel refused to mount it";
 		return -(e ? e : EIO);
 	}
-	log_info("mounted %s on %s for uid %u", dev, path, (unsigned)uid);
+	log_info("mounted %s on %s for uid %u%s%s", dev, path, (unsigned)uid,
+		 (flags & MS_RDONLY) ? " (read-only)" : "",
+		 recover ? " (journal replayed)" : "");
 	strlcpy_d(out, path, cap);
 	return 0;
 }
@@ -439,11 +464,29 @@ int do_unmount(struct dev *d, uid_t uid, const char **msg)
 	return unmount_path(path, msg);
 }
 
+int eject_tray(const char *disk)
+{
+	char dev[DEVD_PATH_MAX];
+	int fd, r = 0;
+
+	if (!devname_ok(disk))
+		return -EINVAL;
+	snprintf(dev, sizeof(dev), "/dev/%s", disk);
+	/* O_NONBLOCK: an empty drive opens too */
+	fd = open(dev, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return -errno;
+	if (ioctl(fd, DEVD_CDROMEJECT, 0) < 0)
+		r = -errno;
+	close(fd);
+	return r;
+}
+
 int do_eject(const char *disk, uid_t uid, const char **msg)
 {
 	char paths[DEVD_MAX_DEVS][DEVD_PATH_MAX];
 	char dev[DEVD_PATH_MAX];
-	int np = 0, r = 0, fd;
+	int np = 0, r = 0, fd, optical = 0;
 
 	for (int i = 0; i < g_tab.n; i++) {
 		struct dev *d = &g_tab.d[i];
@@ -454,6 +497,8 @@ int do_eject(const char *disk, uid_t uid, const char **msg)
 			*msg = "the drive is being formatted";
 			return -EBUSY;
 		}
+		if (d->kind == DEV_DISK && d->optical)
+			optical = 1;
 		if (!d->devd_mount)
 			continue;
 		if (uid != 0 && (long)uid != d->mountuid) {
@@ -466,6 +511,21 @@ int do_eject(const char *disk, uid_t uid, const char **msg)
 		r = unmount_path(paths[i], msg);
 		if (r < 0)
 			return r;
+	}
+	if (optical) {
+		/* nothing was written to a disc: the tray opens.  A drive
+		 * that cannot open it (one behind USB) is safe to unplug
+		 * like any other. */
+		r = eject_tray(disk);
+		if (r < 0 && r != -ENOTTY && r != -EINVAL) {
+			log_warn("%s: the tray did not open: %s", disk,
+				 strerror(-r));
+			*msg = "the disc was unmounted, but the drive did not "
+			       "open";
+			return r;
+		}
+		log_info("%s ejected", disk);
+		return 0;
 	}
 	/* the drive's own write cache */
 	snprintf(dev, sizeof(dev), "/dev/%s", disk);

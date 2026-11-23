@@ -45,8 +45,32 @@ void pfs_node_put(struct pfs_node *n)
 	if (n && n->transient) {
 		if (n->release)
 			n->release(n);
+		if (n->link_long)
+			kfree(n->link_long);
 		kfree(n);
 	}
+}
+
+int pfs_set_link(struct pfs_node *n, const char *target)
+{
+	size_t len = 0;
+
+	while (target[len])
+		len++;
+	if (n->link_long) {
+		kfree(n->link_long);
+		n->link_long = NULL;
+	}
+	if (len < sizeof(n->link)) {
+		mm_memcpy(n->link, target, len + 1);
+		return ST_OK;
+	}
+	n->link[0] = 0;
+	n->link_long = kalloc(len + 1);
+	if (!n->link_long)
+		return ST_NOMEM;
+	mm_memcpy(n->link_long, target, len + 1);
+	return ST_OK;
 }
 
 static struct pfs_node *pfs_child(struct pfs_node *dir, const char *name,
@@ -182,7 +206,7 @@ restart: {
 		 * after the first is reached through a link. */
 		if (cur->type == PFS_LINK && *rest) {
 			char next_path[PFS_WALK_MAX];
-			const char *target = cur->link;
+			const char *target = pfs_link(cur);
 			size_t k;
 
 			if (++hops > PFS_LINK_HOPS) {
@@ -262,7 +286,7 @@ static struct pfs_node *pfs_lookup_follow(struct pfs *fs, const char *relpath)
 	for (unsigned hops = 0; n && n->type == PFS_LINK; hops++) {
 		char next[PFS_WALK_MAX];
 		struct pfs_node *m;
-		const char *target = n->link;
+		const char *target = pfs_link(n);
 		size_t k = 0;
 
 		if (hops >= PFS_LINK_HOPS)
@@ -474,6 +498,10 @@ struct pfs_node *pfs_add_link(struct pfs *fs, const char *path,
 		t.link[k] = target[k];
 		k++;
 	}
+	/* The static tree's links are short; a cut one would lead
+	 * somewhere else, so it is not made. */
+	if (WARN_ON(target[k]))
+		return NULL;
 	t.link[k] = 0;
 	return pfs_add(fs, path, PFS_LINK, &t);
 }
@@ -584,7 +612,7 @@ static int pfs_fill_stat(struct pfs_node *n, struct kstat *st)
 	case PFS_LINK:
 		st->st_mode = S_IFLNK | 0777;
 		st->st_size = 0;
-		for (const char *q = n->link; *q; q++)
+		for (const char *q = pfs_link(n); *q; q++)
 			st->st_size++;
 		break;
 	default:
@@ -718,9 +746,10 @@ static int pfs_readlink_common(struct pfs *fs, const char *path, char *buf,
 		pfs_node_put(n);
 		return ST_INVALID;
 	}
+	const char *target = pfs_link(n);
 	unsigned long k = 0;
-	while (n->link[k] && k < bufsz) {
-		buf[k] = n->link[k];
+	while (target[k] && k < bufsz) {
+		buf[k] = target[k];
 		k++;
 	}
 	pfs_node_put(n);

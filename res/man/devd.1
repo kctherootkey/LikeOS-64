@@ -1,7 +1,7 @@
 DEVD(1)                          User Commands                         DEVD(1)
 
 NAME
-       devd - the LikeOS device manager: lists disks and mounts USB drives
+       devd - the LikeOS device manager: lists disks, mounts drives and discs
 
 SYNOPSIS
        devd [-f] [-v]
@@ -17,21 +17,57 @@ DESCRIPTION
        desktop's volume agent (likeos-volume-agent), the file manager, and
        devctl(1).  Any local user may list the devices and follow their
        changes.  Mounting, unmounting, ejecting and formatting are done for
-       root and for the user logged in at the console, and only on removable
-       USB drives that hold nothing the running system uses -- never on an
-       internal disk and never on the drive LikeOS was started from.  devd
-       never mounts anything on its own.
+       root and for the user logged in at the console, and only as follows:
+
+       USB drive       mount, unmount, eject, format (not when it is
+                       write-protected)
+       CD/DVD drive    mount (always read-only), unmount, eject (the tray
+                       opens); never format
+       built-in disk   mount and unmount its partitions; never eject, never
+                       format.  The volume agent never mounts one by itself:
+                       only when someone opens it in the file manager.
+
+       A disk the running system uses -- anything on it mounted other than
+       by devd, such as / or /boot/efi -- is a system disk: nothing is done
+       with it at all, for root neither.  Neither are the EFI system,
+       reserved, recovery and BIOS boot partitions of a built-in disk (read
+       from its partition table).  When the mount table cannot be read,
+       every built-in disk counts as a system disk.  devd never mounts
+       anything on its own.
 
        A volume is mounted at /media/<user>/<label> (the UUID or the device
-       name when it has no label), always nosuid and nodev.  FAT volumes
-       belong to the user they are mounted for.  /media and /media/<user>
-       belong to root and only root can write to them; the user may enter
-       their own directory through an access ACL (or the directory is
-       readable by everyone where no ACL can be set).  When a drive is
-       pulled out, its mounts are detached and their directories removed.
+       name when it has no label), always nosuid and nodev; write-protected
+       media, discs and ISO 9660 read-only.  FAT, exFAT and NTFS volumes
+       belong to the user they are mounted for (files 0600, directories
+       0700); an NTFS volume is never mounted with "force", so a volume
+       Windows left hibernated is mounted read-only by the kernel.
+       /media and /media/<user> belong to root and only root can write to
+       them; the user may enter their own directory through an access ACL
+       (or the directory is readable by everyone where no ACL can be set).
+       When a drive is pulled out, or the disc or card in it is taken out
+       or changed, its mounts are detached and their directories removed.
 
-       Formatting runs mkfs.fat(1) or mke2fs(1); a full format writes zeros
-       over the whole volume first.
+       A journal is never replayed without the user's consent.  When the
+       journal of an ext4 volume, or the log of an NTFS volume, still holds
+       changes that replaying it would write to the drive, the mount is
+       refused with EUCLEAN ("ERR MOUNT EUCLEAN ...") and nothing is
+       written.  The desktop then asks the user (likeos-journal-prompt);
+       when the user agrees it sends "MOUNT <name> recover", and devd
+       mounts the volume with the journal replayed.  devctl mount --recover
+       does the same from a shell.  "recover" changes nothing for the other
+       file systems.
+
+       Labels are read from the volume: the root directory for FAT and
+       exFAT, the $Volume record of the MFT for NTFS, the Joliet descriptor
+       (else the primary one) for ISO 9660.
+
+       Formatting runs mkfs.fat(1) for FAT32, mke2fs(1) for ext4,
+       mkfs.exfat(1) for exFAT (no partition table, also on a whole drive)
+       or mkntfs(1) for NTFS; a full format writes zeros over the whole
+       volume first, then makes the file system.  A label is checked
+       first: FAT32 11 characters, ext4 16 bytes, exFAT 11 and NTFS 128
+       UTF-16 code units, without control characters or the characters
+       the file system reserves.
 
 OPTIONS
        -f     Stay in the foreground and log to standard error.  This is how
@@ -42,9 +78,10 @@ OPTIONS
 FILES
        /var/run/devd/socket   the socket clients connect to
        /dev/devevents         the kernel's device events
-       /media                 where USB drives are mounted
+       /media                 where drives and discs are mounted
 
 SEE ALSO
-       devctl(1), mount(1), mkfs.fat(1), mke2fs(1), init(1)
+       devctl(1), mount(1), mkfs.fat(1), mke2fs(1), mkfs.exfat(1),
+       mkntfs(1), init(1)
 
 LikeOS                          November 2026                          DEVD(1)

@@ -14,7 +14,9 @@ typedef unsigned long size_t;
 typedef long ssize_t; // signed size for read return
 typedef unsigned long uintptr_t;
 
-#define VFS_MAX_PATH 256
+/* Longest whole path, the terminating NUL included: PATH_MAX.  Never kept
+ * on the stack -- a path lives in a path buffer (kernel/fs/pathbuf.h). */
+#define VFS_MAX_PATH 4096
 /* Longest single name between two slashes, as POSIX NAME_MAX.  Anything that
  * takes a path apart must allow for this: a buffer that holds less does not
  * merely truncate, it turns the tail of one name into another component and
@@ -364,9 +366,12 @@ struct vfs_mount {
 	/* --- identity --- */
 	int id; /* mount id (/proc/self/mountinfo)                       */
 	int parent_id;
-	char path[VFS_MAX_PATH]; /* canonical mount point, "/" for the root */
+	/* Both VFS_MAX_PATH bytes, given to the slot the first time it is
+	 * used and kept by it for good (slots are reused, never freed), so a
+	 * lock-free reader of a stale slot still reads valid memory. */
+	char *path; /* canonical mount point, "/" for the root */
 	unsigned path_len;
-	char source[VFS_MAX_PATH]; /* "/dev/sda2", "tmpfs", "proc"      */
+	char *source; /* "/dev/sda2", "tmpfs", "proc"      */
 	char fstype[VFS_FSTYPE_MAX];
 	unsigned long flags; /* VFS_MS_* (VFS_MS_PERMANENT bits only)     */
 	char options[VFS_MOUNT_OPTS_MAX]; /* filesystem option string   */

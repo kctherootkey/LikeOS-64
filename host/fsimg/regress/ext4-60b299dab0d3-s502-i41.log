@@ -1,0 +1,17 @@
+[k] pagecache: initialized (4096 hash buckets)
+[k] ext4: locate -> whole-device (ext4 magic at LBA0+1024)
+[k] ext4: journal state s_start=0 seq=1 recover_flag=0
+[k] ext4: journaled writes ON (ordered; journal 1024 blocks, next seq 1)
+readall 0 files 0 bytes
+readall 0 files 0 bytes
+test-fs: write beyond the end of the device: lba 4200576 count 8 (device 196608 sectors)
+[k] WARNING (ratelimit 1/10): at kernel/fs/ext4/journal.c:1338 ext4_journal_flush(): ext4: journal commit failed - keeping the batch
+test-fs: write beyond the end of the device: lba 4200576 count 8 (device 196608 sectors)
+[k] WARNING (ratelimit 2/10): at kernel/fs/ext4/journal.c:1338 ext4_journal_flush(): ext4: journal commit failed - keeping the batch
+FAIL write beyond device end lba=4200576 count=8
+FAIL write beyond device end lba=4200576 count=8
+[k] ext4: locate -> whole-device (ext4 magic at LBA0+1024)
+[k] ext4: journal state s_start=0 seq=1 recover_flag=0
+[k] ext4: journaled writes ON (ordered; journal 1024 blocks, next seq 1)
+readall 0 files 0 bytes
+test-fs: FAILED reads=22 writes=20 discards=0 flushes=12 warnings=2 io_errors=2 heap_peak=1520265 pages_peak=19 failures=2

@@ -22,6 +22,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <limits.h>
 #include <sys/stat.h>
 
 static int find_in_path(const char *name, int show_all, int silent)
@@ -52,10 +53,12 @@ static int find_in_path(const char *name, int show_all, int silent)
 		if (*cur == ':' || *cur == '\0') {
 			size_t dirlen = (size_t)(cur - start);
 			size_t namelen = strlen(name);
-			char full[1024];
+			char full[PATH_MAX];
 
 			if (dirlen == 0) {
 				/* Empty component means current directory */
+				if (2 + namelen + 1 > sizeof(full))
+					goto next;
 				full[0] = '.';
 				full[1] = '/';
 				strcpy(full + 2, name);

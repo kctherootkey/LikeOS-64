@@ -1,0 +1,36 @@
+# Write test for drivers with POSIX objects: symbolic and hard links,
+# xattrs, modes, times, rename over an existing file, open-unlinked files.
+# Copyright (C) 2026 The LikeOS Project
+mount
+mkdir /pt
+write /pt/target pat:1:5000
+symlink target /pt/rel
+symlink /pt/target /pt/abs
+symlink no/such /pt/dangling
+readlink /pt/rel
+sha /pt/rel
+sha /pt/abs
+=NOT_FOUND sha /pt/dangling
+link /pt/target /pt/hard
+stat /pt/hard
+setxattr /pt/target user.one hello
+setxattr /pt/target user.two pat:3:200
+=EXISTS setxattr /pt/target user.one again create
+=NODATA setxattr /pt/target user.none x replace
+getxattr /pt/target user.one
+listxattr /pt/target
+chmod /pt/target 0640
+chown /pt/target 1000 1000
+utimens /pt/target 1700000000 1700000001
+write /pt/victim pat:4:100
+rename /pt/target /pt/victim
+=NOT_FOUND stat /pt/target
+check /pt/victim pat:1:5000
+fopen 1 /pt/victim r
+unlink /pt/victim
+fread 1 5000
+fclose 1
+check /pt/hard pat:1:5000
+rmxattr /pt/hard user.two
+cycle
+manifest /pt +mode +owner +nlink +xattr

@@ -17,6 +17,7 @@
 #ifndef LIKEOS_FSTAB_UTIL_H
 #define LIKEOS_FSTAB_UTIL_H
 
+#include <limits.h>
 #include <stddef.h>
 #include <sys/types.h>
 #include <sys/mount.h>
@@ -24,8 +25,8 @@
 #define FSU_FSTAB  "/etc/fstab"
 #define FSU_MOUNTS "/proc/mounts"
 
-/* Longest path handled (the kernel's VFS_MAX_PATH is 512). */
-#define FSU_PATH_MAX 512
+/* Longest path handled, with its NUL: PATH_MAX, the kernel's limit too. */
+#define FSU_PATH_MAX PATH_MAX
 /* Longest filesystem-specific option string mount(2) takes. */
 #define FSU_DATA_MAX 1024
 

@@ -383,15 +383,22 @@ GMenuModel *ex_context_menu_location(ExLocation *loc)
 		     "likeos-empty-trash", "user-trash");
 		return G_MENU_MODEL(m);
 	}
-	/* A USB drive: Eject and Format…, then Properties. */
+	/* A drive of the device service: Eject (USB, CD/DVD), Format… (USB,
+	 * not write-protected), Unmount (a built-in disk's partition), then
+	 * Properties. */
 	const ExVolume *drive = ex_volumes_for_location(ex_volumes_get_default(),
 							loc);
-	if (drive && drive->kind == EX_VOLUME_USB) {
+	if (drive && drive->kind == EX_VOLUME_DRIVE) {
 		s = section(m);
-		target_item(s, "_Eject", "win.eject", id, "likeos-eject",
-			    "media-eject");
-		target_item(s, "_Format…", "win.format-drive", id, "likeos-drive",
-			    "drive-harddisk");
+		if (ex_volume_can_eject(drive))
+			target_item(s, "_Eject", "win.eject", id, "likeos-eject",
+				    "media-eject");
+		if (ex_volume_can_unmount(drive))
+			target_item(s, "_Unmount", "win.unmount-drive", id,
+				    "likeos-eject", "media-eject");
+		if (ex_volume_can_format(drive))
+			target_item(s, "_Format…", "win.format-drive", id,
+				    "likeos-drive", "drive-harddisk");
 		target_item(section(m), "Pr_operties", "win.location-properties",
 			    id, "likeos-properties", "document-properties");
 		return G_MENU_MODEL(m);

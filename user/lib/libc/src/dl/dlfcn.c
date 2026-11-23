@@ -15,6 +15,8 @@
 #include <dlfcn.h>
 #include <link.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 /* Declarations of the runtime linker functions */
 extern void *_rtld_dlopen(const char *filename, int flags);
@@ -38,24 +40,42 @@ extern void _rtld_unlock(void);
  * in between -- and GLib's g_module_symbol() reads "NULL symbol, no error"
  * as success, which is how GStreamer's start-up came to call a null
  * function pointer in the web process. */
+/* The usual message fits the buffer inline; one naming a library by a long
+ * path goes to a per-thread heap copy instead of being cut short. */
 #define DL_ERROR_MAX 256
-static __thread char dl_error_buf[DL_ERROR_MAX];
+static __thread char dl_error_inline[DL_ERROR_MAX];
+static __thread char *dl_error_heap;
+static __thread size_t dl_error_heap_cap;
+static __thread char *dl_error_buf;
 static __thread int dl_error_set;
 
 static void dl_capture_error(void)
 {
 	const char *m = _rtld_dlerror();
-	size_t i = 0;
+	size_t n = 0;
 
 	if (!m) {
 		dl_error_set = 0;
 		return;
 	}
-	while (m[i] && i < DL_ERROR_MAX - 1) {
-		dl_error_buf[i] = m[i];
-		i++;
+	while (m[n])
+		n++;
+	dl_error_buf = dl_error_inline;
+	if (n >= DL_ERROR_MAX) {
+		if (n + 1 > dl_error_heap_cap) {
+			char *b = realloc(dl_error_heap, n + 1);
+			if (b) {
+				dl_error_heap = b;
+				dl_error_heap_cap = n + 1;
+			}
+		}
+		if (n + 1 <= dl_error_heap_cap)
+			dl_error_buf = dl_error_heap;
+		else
+			n = DL_ERROR_MAX - 1; /* no memory: the start of it */
 	}
-	dl_error_buf[i] = '\0';
+	memcpy(dl_error_buf, m, n);
+	dl_error_buf[n] = '\0';
 	dl_error_set = 1;
 }
 

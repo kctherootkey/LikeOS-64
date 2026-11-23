@@ -460,6 +460,12 @@ extern void __pthread_fork_prepare(void);
 extern void __pthread_fork_parent(void);
 extern void __pthread_fork_child(void);
 
+/* Environment fork hooks (src/stdlib/env.c): its lock is taken outermost of
+ * the libc's own, since setenv allocates while holding it. */
+extern void __env_fork_prepare(void);
+extern void __env_fork_parent(void);
+extern void __env_fork_child(void);
+
 extern void __atfork_run_prepare(void);
 extern void __atfork_run_parent(void);
 extern void __atfork_run_child(void);
@@ -467,19 +473,23 @@ extern void __atfork_run_child(void);
 pid_t fork(void)
 {
 	/* Application atfork handlers outermost, then the libc's own.
-	 * Lock order: pthread outside, malloc inside (pthread code allocates;
-	 * the allocator never calls into pthread).  Released in reverse. */
+	 * Lock order: environment, then pthread, then malloc inside (setenv
+	 * and pthread code allocate; the allocator never calls into either).
+	 * Released in reverse. */
 	__atfork_run_prepare();
+	__env_fork_prepare();
 	__pthread_fork_prepare();
 	__malloc_fork_prepare();
 	long ret = syscall0(SYS_FORK);
 	if (ret == 0) {
 		__malloc_fork_child();
 		__pthread_fork_child();
+		__env_fork_child();
 		__atfork_run_child();
 	} else {
 		__malloc_fork_parent();
 		__pthread_fork_parent();
+		__env_fork_parent();
 		__atfork_run_parent();
 	}
 	if (ret < 0) {
@@ -501,36 +511,10 @@ int execve(const char *pathname, char *const argv[], char *const envp[])
 
 int execv(const char *pathname, char *const argv[])
 {
-	/*
-     * Build envp from the libc static environment storage so that
-     * child processes inherit the current environment.
-     */
-	int n = env_count();
-	if (n <= 0)
-		return execve(pathname, argv, NULL);
-
-	/* Static buffers are fine: execve replaces the process on success */
-	static char bufs[MAX_ENV_VARS][MAX_ENV_SIZE * 2 + 2];
-	char *envp[MAX_ENV_VARS + 1];
-
-	int cookie = 0;
-	const char *name, *value;
-	int i = 0;
-	while (env_iter(&cookie, &name, &value) && i < MAX_ENV_VARS) {
-		size_t nlen = strlen(name);
-		size_t vlen = strlen(value);
-		if (nlen + 1 + vlen + 1 > sizeof(bufs[i])) {
-			/* skip oversized entry */
-			continue;
-		}
-		memcpy(bufs[i], name, nlen);
-		bufs[i][nlen] = '=';
-		memcpy(bufs[i] + nlen + 1, value, vlen + 1);
-		envp[i] = bufs[i];
-		i++;
-	}
-	envp[i] = NULL;
-	return execve(pathname, argv, envp);
+	/* The child inherits the environment: environ is the whole of it (see
+	 * stdlib/env.c), handed to the kernel as it stands. */
+	extern char **environ;
+	return execve(pathname, argv, environ);
 }
 
 int execvp(const char *file, char *const argv[])
@@ -549,7 +533,7 @@ int execvp(const char *file, char *const argv[])
 	if (!path) {
 		path = "/bin:/usr/local/bin";
 	}
-	char full[256];
+	char full[PATH_MAX];
 	const char *start = path;
 	const char *cur = path;
 	while (1) {

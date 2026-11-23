@@ -13,10 +13,11 @@
 #include <kernel/fs/vfs.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
+#include <kernel/ke/elf.h> /* EXEC_ARG_MAX, EXEC_STACK_BLOCK_MAX */
 
-// Exec argv ceiling shared with sys_execve's copy_user_string_array(128)
-// and elf_setup_stack's av[128] table.
-#define SCRIPT_MAX_ARGC 127
+// Exec argv ceiling: the entries execve takes at most (EXEC_ARG_COUNT_MAX,
+// elf.h), plus the interpreter and its argument the rewrite adds.
+#define SCRIPT_MAX_ARGC (EXEC_ARG_COUNT_MAX + 2)
 
 // Local ST_* -> errno map for open/read failures; the canonical converter
 // is static in syscall.c.  An unresolvable exec target reads as ENOENT.
@@ -123,7 +124,9 @@ static int script_read_head(const char *path, char *buf, long *out_len)
 int script_load_rewrite(char **kpath_io, char ***kargv_io, int depth)
 {
 	char head[SCRIPT_BUF_SIZE];
-	char interp[VFS_MAX_PATH];
+	/* The interpreter's name lies inside the #! line, which lies inside
+	 * the first SCRIPT_BUF_SIZE bytes: it never needs a whole path. */
+	char interp[SCRIPT_BUF_SIZE];
 	char sarg[SCRIPT_BUF_SIZE];
 	int has_arg = 0;
 	long n = 0;
@@ -197,10 +200,13 @@ int script_check_stack_fit(char *const argv[], char *const envp[])
 {
 	// Mirror elf_setup_stack's layout arithmetic conservatively: argc
 	// slot + argv/envp pointer arrays (incl. NULLs) + worst-case auxv,
-	// plus all string bytes, each region 16-byte aligned.
+	// plus all string bytes, each region 16-byte aligned.  The strings
+	// may exceed what execve took (EXEC_ARG_MAX) by what a #! rewrite
+	// added: an interpreter, its argument and the script's path at each
+	// of SCRIPT_MAX_DEPTH levels.
 	uint64_t ptrs = 8;
 	uint64_t strs = 0;
-	int argc = 0, envc = 0;
+	uint64_t argc = 0, envc = 0;
 
 	if (argv)
 		for (; argv[argc]; argc++)
@@ -212,7 +218,11 @@ int script_check_stack_fit(char *const argv[], char *const envp[])
 	ptrs += 16 * 16; // auxv entries (16 bytes each, worst case)
 
 	uint64_t total = ((ptrs + 15) & ~15ULL) + ((strs + 15) & ~15ULL);
-	if (total > PAGE_SIZE)
+	/* (+ AT_PLATFORM, AT_RANDOM and AT_EXECFN, a copy of argv[0]) */
+	total += 64 + ((argv && argv[0]) ? kstrlen(argv[0]) + 1 : 1);
+	if (strs > EXEC_ARG_MAX + SCRIPT_MAX_DEPTH * (2 * SCRIPT_BUF_SIZE +
+						     VFS_MAX_PATH) ||
+	    total > EXEC_STACK_BLOCK_MAX)
 		return -E2BIG;
 	return 0;
 }

@@ -1,0 +1,201 @@
+Filesystem driver harness (host/test-fs.sh) and test images (host/fsimg)
+=========================================================================
+
+Copyright (C) 2026 The LikeOS Project
+
+What it is
+----------
+host/test-fs.sh compiles one kernel filesystem driver (kernel/fs/<driver>.c,
+or the .c files of the directory kernel/fs/<driver>/)
+on the build host together with the REAL kernel/fs/pagecache.c, icache.c,
+dcache.c and the kernel's own mutex.c, waitq.c, completion.c, mm/rwsem.c,
+ke/cred.c and string formatter (extracted from kernel/io/console.c by
+fsimg/kfmt.awk), with AddressSanitizer and UndefinedBehaviorSanitizer and
+-DDEBUG=1, against a file-backed block device.  The runner
+(host/test-fs-main.c) mounts the image through the driver's vfs_fstype_t
+and drives it through its vfs_ops_t the way the VFS does (canonical paths,
+the read-only mount gate, symbolic links followed through vfs_link_hop,
+handles set up like vfs_open_common(), syncfs/unmount like mnt_flush()).
+
+Files:
+  host/test-fs.sh           build + run + suites, bounded (timeout, systemd-run
+                            --user --scope -p MemoryMax=2G)
+  host/test-fs-prelude.h    force-included into every kernel-side unit
+  host/test-fs-stubs.c      kernel services under the real code
+  host/test-fs-bdev.c       the block device and C-library glue (host side)
+  host/test-fs-main.c       the runner
+  host/fsimg/mkimg.sh       image generators (host tools)
+  host/fsimg/mktree.py      deterministic source trees, manifests, compare
+  host/fsimg/ntfs-populate.c  populates NTFS images through libntfs-3g
+  host/fsimg/exfat-populate.py populates exFAT images (writes the on-disk
+                            structures; fsck.exfat checks them)
+  host/fsimg/fsparse.py     metadata regions (fuzzer), NTFS/exFAT image tweaks
+  host/fsimg/oracle.py      fsck and manifest through the host's own tools
+  host/fsimg/fuzz.py        deterministic metadata fuzzer
+  host/fsimg/regress/       saved fuzzer findings + replay.sh
+  host/fsimg/suite-*.sh     test lists per driver (common.sh = helpers)
+  host/fsimg/script-*.txt   runner scripts shared by the suites
+
+Commands
+--------
+  host/test-fs.sh ntfs                       the driver's suite
+  host/test-fs.sh ntfs IMAGE [ARGS]          one runner invocation
+  host/test-fs.sh ntfs --build               build, print the binary path
+  host/test-fs.sh ntfs --fuzz ntfs IMAGE --iters 500 --seed 7 [--rw]
+  host/test-fs.sh ntfs --replay [FSTYPE]     rerun host/fsimg/regress
+  host/fsimg/mkimg.sh --list                 image variants
+  host/fsimg/mkimg.sh ntfs-4k-full /tmp/x.img
+  python3 host/fsimg/oracle.py fsck ntfs /tmp/x.img
+  python3 host/fsimg/oracle.py manifest ntfs /tmp/x.img
+
+Environment: TESTFS_DIR (build/temp dir, default $TMPDIR/likeos-test-fs),
+TESTFS_TIMEOUT (600 s per run), TESTFS_MEM (2G), TESTFS_NODEBUG=1,
+TESTFS_EXTRA (more kernel .c files), FSTYPE (symbol override; default
+<driver>_fstype), TF_FUZZ_ITERS (suite fuzz length), TF_REGRESS (where
+suite fuzzing saves findings), TF_BIG=1 (isofs: the > 4 GB image).
+Exit status of a run: 0 ok, 1 a FAIL line, 2 usage, 3 write trap,
+4 AddressSanitizer, 5 UndefinedBehaviorSanitizer, 124 timeout.
+
+Runner options
+--------------
+  -c 'CMD; CMD'  -s FILE ('-' stdin)   commands, in order
+  --sector 512|1024|2048|4096          logical sector size of the device
+  --ro-dev                             write-protected device
+  --cow                                writes stay in memory, image untouched
+  --patch FILE                         byte patches over reads ("OFF HEX")
+  --trap                               any write/discard = failure + stack
+  --log                                log writes/discards/flushes
+  --allow-warn                         kernel WARNINGs do not fail the run
+  --quiet                              no kernel log on stderr
+  --uid U --gid G --epoch SECS         credentials, wall clock (simulated)
+  --pages N --kalloc-max BYTES         page limit, largest single kalloc
+  --no-discard --no-leakcheck --no-linkhop --chunk N --save FILE -v
+
+Runner commands (one per line; '#' comments)
+--------------------------------------------
+Every command must return OK unless prefixed: "=STATUS cmd ..." expects that
+status (EXISTS, NOT_FOUND, ROFS, NOTEMPTY, NODATA, ... = the ST_ names),
+"?cmd" accepts any.  Quote with "..." and escape with \xHH, \n, \t.
+Paths are absolute inside the filesystem.
+
+  mount [ro|rw] [OPTS]   umount   cycle (umount + mount as before)
+  remount ro|rw [OPTS]   sync   options (show_options)   probe   statfs
+  stat P   lstat P   ls P   tree P   manifest [P] [+mode +owner +time +atime
+                  +ino +nlink +xattr +blocks +all -sha]   readall [P]
+  cat P   sha P   hexdump P   pread P OFF LEN   check P SRC   zeros P OFF LEN
+  write P SRC   append P SRC   pwrite P OFF SRC   create P [MODE]
+  mkdir P [MODE]   mkdirp P   rmdir P   unlink P   rename A B   truncate P N
+  symlink TARGET P   readlink P   link A B [follow]   mknod P fifo|sock|chr|blk
+  chmod P MODE   chown P U G   lchown P U G   utimens P ATIME MTIME [NSEC]
+                  (now/omit allowed)   lutimens ...
+  setxattr P NAME VALUE|SRC [create|replace]   getxattr P N   listxattr P
+  rmxattr P N   fsync P
+  fopen H P FLAGS(r w + c x t a d D n) [MODE]   fclose H   fwrite H SRC
+  fpwrite H OFF SRC   fread H LEN   fpread H OFF LEN   fseek H OFF WHENCE
+  ftruncate H N   ffsync H   fstat H                (handles H = 0..15)
+  trap on|off   log on|off|clear|dump [FILE]   logcount W|D|F|X LBA COUNT
+  logorder A_LBA A_CNT B_LBA B_CNT (first write to A before first to B)
+  fault read|write N (fail the Nth from now)   fault cut N (drop every write
+         after the Nth from now: power cut)   fault readall 1|0   kfault N
+         (fail the Nth kalloc from now)   kcount (kallocs so far)
+  mark   nowrites (no write/discard since mark)   counts   save FILE
+  tick MS (time passes, page-cache timer)   wb (flush thread pass)
+  flushall   shrink N [dirty]   dropcaches   freepages N   cachestats
+  uid U G   umask M   task ID   release ID (release_locks_for_task)
+  rawro on|off (call the driver on a ro mount too)   linkhop on|off
+  chunk N   warnings ok|fail   leakcheck on|off   echo ...
+  stress SEED OPS [REMOUNT_EVERY]   stressopt KEY VAL (budget, maxfile,
+         names posix|dos|ci, utf8, symlink, link, xattr, replace,
+         dirrename, xdirrename, holes, truncate: 0/1 switches)
+Data sources (SRC): text:STRING  pat:SEED:LEN  zero:LEN  fill:BYTE:LEN
+  file:HOSTPATH   (LEN accepts k/m/g)
+
+Checks made on every command: unexpected status, kernel WARNING/BUG lines
+(unless allowed), spinlocks left held, writes beyond the device end.  On
+every unmount: page-cache pages, icache inodes, heap blocks and pages
+the instance kept (the first unmount may keep one-time global allocations,
+e.g. the page cache's writeback bounce buffer; later cycles may not).
+Output: data lines on stdout ("FAIL line N: ..." for failures), kernel log
+on stderr prefixed "[k] ", a summary line "test-fs: ok|FAILED ..." last.
+
+stress keeps a model of the tree in memory (loaded from the mounted
+filesystem first, hard links included), applies random create / mkdir /
+pwrite (with holes) / O_APPEND / truncate / unlink / rmdir / rename (also
+over an existing file and across directories) / symlink / link / xattr /
+fsync / writeback / cache pressure / sync operations, and compares every
+name, type, size, content, link count, link target and xattr after each
+remount.  Features the driver reports as unsupported are switched off.
+
+Stubs: what they cover and miss
+-------------------------------
+Covered: kalloc/kcalloc/krealloc/kfree (host heap, pattern-filled, double
+free and foreign pointers fatal, kalloc(0) is a BUG like the slab's, size
+and total limits, fault injection), physical pages (aligned host memory;
+phys_to_virt() of the kernel maps back to it), mm_memcpy/mm_memset/kmem*
+(the C library's, so ASan sees them), smap_enable/disable, copy_to/from_user
+(host buffers), the one task (task_t of the kernel, cred, umask, id) and a
+single-threaded scheduler: sched_schedule() of a BLOCKED task with an
+hrtimer deadline jumps the simulated clock, without one it is a reported
+deadlock; sched_yield_in_kernel() advances 1 ms and reports a livelock after
+a million in one command; spinlocks are real structures whose contention is
+fatal (single thread = recursion), sleeping with a spinlock held or
+"interrupts" off is fatal, might_sleep() is always armed; BUG()/BUG_ON()
+print a stack and abort instead of ud2; the clock (200 Hz ticks, epoch
+2026-01-01 + simulated time); the block device (extended device record,
+sector size, read-only flag, discard limits) with blk_read/write/flush/
+discard/zeroout_sync, blk_bdev_read_only/claim/get/put, blk_crc32,
+block_sync; vfs_register_root, vfs_mnt_root, vfs_sb_release_caches and
+vfs_next_option as kernel/fs/mount.c has them; vfs_link_hop as the VFS
+walk (restart on the joined path, 40 hops, ELOOP).
+Missing / simplified: no concurrency (one thread: races and lock ordering
+between tasks are not exercised -- lock misuse within one task is);
+kernel threads given to sched_add_task are recorded, never run (the runner
+drives writeback with tick/wb/sync); no signals (signal_pending is 0); no
+DAC permission checks of the VFS (the runner is root unless "uid"); no
+inotify/fsnotify; no block-layer request queue (I/O is synchronous, so
+completion ordering issues do not show); page reclaim only when the runner
+asks (shrink, freepages) or the page limit is reached.
+
+Images (mkimg.sh)
+-----------------
+fat-{basic,many,deep}; ext4-{basic,1k,many,deep};
+ntfs-{512,4k,64k}-{basic,full,many,deep,big,empty} and the gate cases
+ntfs-4k-{dirty,hiber,logdirty,mirrbad};
+exfat-{4k,128k,32m}-{basic,many,deep,big,frag,empty} and exfat-4k-{dirty,badboot};
+iso-{rrj,rr,zisofs,deep,deeprel,hybrid,many} (xorriso, Rock Ridge always on),
+iso-{joliet,plain} (genisoimage), iso-big (> 4 GB multi-extent file, sparse).
+A variant whose tool is missing exits 77 with the reason (the suites skip).
+Tools: mkfs.fat+mtools, mkfs.ext4, mkntfs + libntfs-3g (ntfs-3g cannot
+mount without root here, so ntfs-populate.c calls the library directly:
+directories, files, native symlink reparse points, junctions, Interix
+links, hard links, ADS, sparse files, LZNT1-compressed files via a
+compressed parent directory, EAs, attributes), mkfs.exfat + fsck.exfat
+(exfat-populate.py writes the files), xorriso, genisoimage, mkzftree.
+Every image except the empty ones gets IMAGE.manifest (the source tree in
+the runner's manifest format) where its content is exactly known.
+
+Oracles (oracle.py): ntfsfix -n (+ "dirty" check), fsck.exfat -n,
+isoinfo, fsck.fat -n, e2fsck -fn; manifests through ntfsls/ntfscat/
+ntfsinfo (reparse points as "l P -> ?"), isoinfo -R, a direct Joliet/plain
+ISO reader (isoinfo cannot print Joliet names as UTF-8), mtools, debugfs.
+There is no host tool that reads exFAT content: exFAT reads are checked
+against the source tree, writes with fsck.exfat -n and the stress model.
+
+Fuzzer (fuzz.py)
+----------------
+Regions from fsparse.py: NTFS boot + backup boot, every in-use MFT record,
+$MFTMirr, INDX blocks, $LogFile restart and first log pages, $Secure:$SDS,
+$UpCase, compressed data; exFAT boot regions, FAT, bitmap, up-case table,
+every directory cluster (entry sets); ISO volume descriptors, path table,
+every directory extent, SUSP continuation areas, zisofs headers; FAT boot/
+FSInfo/FAT/root; ext4 superblock/GDT/bitmaps/inode table.  Mutations:
+bit flips, edge bytes, 16/32/64-bit edge values, zeroed and duplicated
+stretches, 1..4 per run, from (seed, iteration, image hash).  Each run:
+--cow --patch (no image copy), mount ro + full walk + read all + unmount;
+with --rw also create/write/append/rename/unlink/rmdir, walk, unmount and a
+read-only remount.  Findings: crashes (ASan, UBSan, BUG, abort), deadlock/
+livelock reports, write traps, timeouts, leaks/locks after unmount, writes
+past the device end, malformed readdir records, allocations above the
+harness limit.  Reads past the device end are counted, not findings.
+Findings go to host/fsimg/regress (base image xz-compressed once, patch,
+command, log); host/test-fs.sh <driver> --replay reruns them.

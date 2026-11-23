@@ -113,6 +113,7 @@ int *__errno_location(void);
 #define EALREADY       114 /* Operation already in progress */
 #define EINPROGRESS    115 /* Operation now in progress */
 #define ESTALE         116 /* Stale file handle */
+#define EUCLEAN        117 /* Structure needs cleaning */
 #define ESHUTDOWN      108 /* Cannot send after transport endpoint shutdown */
 #define ETOOMANYREFS   109 /* Too many references: cannot splice */
 #define EHOSTDOWN      112 /* Host is down */

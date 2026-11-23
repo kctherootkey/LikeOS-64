@@ -13,6 +13,8 @@
 #include <kernel/ke/syscalls.h>
 #include <kernel/fs/file.h>
 #include <kernel/fs/namei.h>
+#include <kernel/fs/pathbuf.h>
+#include <kernel/ke/task_path.h>
 
 /* The text a /dev/fd/N symlink resolves to.  A descriptor carries no pathname
  * here, so anything that is not a named file gets the conventional
@@ -124,19 +126,27 @@ int64_t sys_stat(uint64_t pathname, uint64_t stat_buf)
 		return -EFAULT;
 
 	// Copy user path to kernel buffer first
-	char kpath[VFS_MAX_PATH];
-	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
-
-	if (kpath[0] == '/' && cur->root[0] == '\0') {
-		return sys_stat_common(kpath, stat_buf, 0);
-	}
-	char full[VFS_MAX_PATH];
-	int ret = build_at_path(cur, AT_FDCWD, kpath, full, sizeof(full));
+	char *kpath, *full = NULL;
+	int64_t ret = user_path_get(pathname, &kpath);
 	if (ret != 0)
 		return ret;
-	return sys_stat_common(full, stat_buf, 0);
+
+	if (kpath[0] == '/' && task_root(cur)[0] == '\0') {
+		ret = sys_stat_common(kpath, stat_buf, 0);
+		goto out;
+	}
+	full = pathbuf_get();
+	if (!full) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	ret = build_at_path(cur, AT_FDCWD, kpath, full, PATHBUF_SIZE);
+	if (ret == 0)
+		ret = sys_stat_common(full, stat_buf, 0);
+out:
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return ret;
 }
 
 static int64_t lstat_kpath(task_t *cur, const char *p, uint64_t stat_buf);
@@ -150,21 +160,28 @@ int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf)
 		return -EFAULT;
 
 	// Copy user path to kernel buffer first
-	char kpath[VFS_MAX_PATH];
-	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
+	char *kpath, *full = NULL;
+	int64_t ret = user_path_get(pathname, &kpath);
+	if (ret != 0)
+		return ret;
 
 	const char *p = kpath;
-	char full[VFS_MAX_PATH];
-	if (kpath[0] != '/' || cur->root[0]) {
-		int ret =
-			build_at_path(cur, AT_FDCWD, kpath, full, sizeof(full));
+	if (kpath[0] != '/' || task_root(cur)[0]) {
+		full = pathbuf_get();
+		if (!full) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		ret = build_at_path(cur, AT_FDCWD, kpath, full, PATHBUF_SIZE);
 		if (ret != 0)
-			return ret;
+			goto out;
 		p = full;
 	}
-	return lstat_kpath(cur, p, stat_buf);
+	ret = lstat_kpath(cur, p, stat_buf);
+out:
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return ret;
 }
 
 /* lstat() of a resolved path. */
@@ -353,44 +370,48 @@ int64_t sys_fstatat(uint64_t dirfd, uint64_t pathname, uint64_t stat_buf,
 	}
 
 	// Copy user path to kernel buffer first
-	char kpath[VFS_MAX_PATH];
-	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
+	char *kpath, *full = NULL;
+	int64_t ret = user_path_get(pathname, &kpath);
+	if (ret != 0)
+		return ret;
 	if (kpath[0] == '\0') {
 		/* The file the descriptor itself is open on. */
-		if (!(flags & AT_EMPTY_PATH))
-			return -ENOENT;
-		if ((int)dirfd != AT_FDCWD)
-			return sys_fstat(dirfd, stat_buf);
+		if (!(flags & AT_EMPTY_PATH)) {
+			ret = -ENOENT;
+			goto out;
+		}
+		if ((int)dirfd != AT_FDCWD) {
+			ret = sys_fstat(dirfd, stat_buf);
+			goto out;
+		}
 		kpath[0] = '.';
 		kpath[1] = '\0';
 	}
 
-	char full[VFS_MAX_PATH];
-	if (kpath[0] == '/') {
-		size_t i = 0;
-		for (; kpath[i] && i < sizeof(full) - 1; ++i)
-			full[i] = kpath[i];
-		full[i] = '\0';
+	const char *p = kpath;
+	if (kpath[0] != '/' || task_root(cur)[0]) {
 		/* A jailed task's absolute paths must be canonicalised and
-		 * prefixed with the jail root; build_at_path does both.  No-op
-		 * (verbatim copy stands) when the task is not chrooted. */
-		if (cur->root[0]) {
-			int _cr = build_at_path(cur, AT_FDCWD, kpath, full,
-						sizeof(full));
-			if (_cr != 0)
-				return _cr;
+		 * prefixed with the jail root; build_at_path does both.  An
+		 * absolute path otherwise stands as given. */
+		full = pathbuf_get();
+		if (!full) {
+			ret = -ENOMEM;
+			goto out;
 		}
-	} else {
-		int ret = build_at_path(cur, (int)dirfd, kpath, full,
-					sizeof(full));
+		ret = build_at_path(cur, (int)dirfd, kpath, full,
+				    PATHBUF_SIZE);
 		if (ret != 0)
-			return ret;
+			goto out;
+		p = full;
 	}
 	if (flags & AT_SYMLINK_NOFOLLOW)
-		return lstat_kpath(cur, full, stat_buf);
-	return sys_stat_common(full, stat_buf, 0);
+		ret = lstat_kpath(cur, p, stat_buf);
+	else
+		ret = sys_stat_common(p, stat_buf, 0);
+out:
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return ret;
 }
 
 static int64_t readlink_kpath(const char *kpath, uint64_t buf,
@@ -398,14 +419,13 @@ static int64_t readlink_kpath(const char *kpath, uint64_t buf,
 
 int64_t sys_readlink(uint64_t pathname, uint64_t buf, uint64_t bufsiz)
 {
-	char kpath[VFS_MAX_PATH];
-	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	char *kpath;
+	int64_t c = user_path_get_canon(pathname, &kpath);
 	if (c)
 		return c;
-	c = canon_task_path(kpath, sizeof(kpath));
-	if (c)
-		return c;
-	return readlink_kpath(kpath, buf, bufsiz);
+	c = readlink_kpath(kpath, buf, bufsiz);
+	pathbuf_put(kpath);
+	return c;
 }
 
 /* readlinkat(dirfd, path, buf, bufsiz): readlink() of a name relative to a
@@ -416,19 +436,30 @@ int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathname, uint64_t buf,
 		       uint64_t bufsiz)
 {
 	task_t *cur = sched_current();
-	char kpath[VFS_MAX_PATH], full[VFS_MAX_PATH];
+	char *kpath = NULL, *full = NULL;
+	int64_t c;
 
 	if (!cur)
 		return -EFAULT;
-	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	c = user_path_get(pathname, &kpath);
 	if (c)
 		return c;
-	if (kpath[0] == '\0')
-		return -ENOENT;
-	c = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
-	if (c)
-		return c;
-	return readlink_kpath(full, buf, bufsiz);
+	if (kpath[0] == '\0') {
+		c = -ENOENT;
+		goto out;
+	}
+	full = pathbuf_get();
+	if (!full) {
+		c = -ENOMEM;
+		goto out;
+	}
+	c = build_at_path(cur, (int)dirfd, kpath, full, PATHBUF_SIZE);
+	if (c == 0)
+		c = readlink_kpath(full, buf, bufsiz);
+out:
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return c;
 }
 
 static int64_t readlink_kpath(const char *kpath, uint64_t buf,
@@ -459,17 +490,27 @@ static int64_t readlink_kpath(const char *kpath, uint64_t buf,
 			return -EFAULT;
 		return tlen;
 	}
-	char kbuf[256];
+	/* A link's target is at most a path long (PATH_MAX, the NUL a
+	 * C string would need included): the whole of it fits. */
+	char *kbuf = pathbuf_get();
+	if (!kbuf)
+		return -ENOMEM;
 	unsigned long n = bufsiz;
-	if (n > sizeof(kbuf))
-		n = sizeof(kbuf);
+	if (n > PATHBUF_SIZE)
+		n = PATHBUF_SIZE;
+	int64_t ret;
 	int r = vfs_readlink(kpath, kbuf,
 			     n); /* <0 on error / not-a-symlink   */
 	if (r < 0)
-		return vfs_status_to_errno(r);
-	if (copy_to_user((void *)buf, kbuf, (size_t)r) != 0)
-		return -EFAULT;
-	return r; /* byte count (no NUL)           */
+		ret = vfs_status_to_errno(r);
+	else if ((unsigned long)r > n)
+		ret = -EIO; /* a driver wrote past what it was given */
+	else if (copy_to_user((void *)buf, kbuf, (size_t)r) != 0)
+		ret = -EFAULT;
+	else
+		ret = r; /* byte count (no NUL)           */
+	pathbuf_put(kbuf);
+	return ret;
 }
 
 /* utimensat(dirfd, path, times, flags): set a file's access and
@@ -509,30 +550,38 @@ int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
 		t.mtime_nsec = (long)ts[1].tv_nsec;
 	}
 
-	char kpath[VFS_MAX_PATH];
-	kpath[0] = '\0';
-	if (pathname) {
-		int err = copy_user_path((const char *)pathname, kpath,
-					 sizeof(kpath));
-		if (err)
-			return err;
-		if (kpath[0] == '\0' && !(flags & AT_EMPTY_PATH))
-			return -ENOENT;
-	}
+	char *kpath = NULL, *full = NULL;
+	int64_t ret;
 	int r;
-	if (kpath[0] == '\0') {
+
+	if (pathname) {
+		ret = user_path_get(pathname, &kpath);
+		if (ret)
+			return ret;
+		if (kpath[0] == '\0' && !(flags & AT_EMPTY_PATH)) {
+			ret = -ENOENT;
+			goto out;
+		}
+	}
+	if (!kpath || kpath[0] == '\0') {
 		/* The descriptor's own file. */
 		if ((int)dirfd == AT_FDCWD) {
-			char full[VFS_MAX_PATH];
-			int bret = build_at_path(cur, AT_FDCWD, ".", full,
-						 sizeof(full));
-			if (bret != 0)
-				return bret;
+			full = pathbuf_get();
+			if (!full) {
+				ret = -ENOMEM;
+				goto out;
+			}
+			ret = build_at_path(cur, AT_FDCWD, ".", full,
+					    PATHBUF_SIZE);
+			if (ret != 0)
+				goto out;
 			r = vfs_utimens(full, 0, &t);
 		} else {
 			vfs_file_t *file = fdget(cur, (int)dirfd);
-			if (!file)
-				return -EBADF;
+			if (!file) {
+				ret = -EBADF;
+				goto out;
+			}
 			if (fd_is_special(file) || devfs_is_devfile(file))
 				r = ST_OK; /* nothing with times to set */
 			else
@@ -542,20 +591,29 @@ int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
 	} else {
 		/* Canonicalise against the task cwd / dirfd (and the jail) so
 		 * the VFS gets an absolute path. */
-		char full[VFS_MAX_PATH];
-		int bret = build_at_path(cur, (int)dirfd, kpath, full,
-					 sizeof(full));
-		if (bret != 0)
-			return bret;
+		full = pathbuf_get();
+		if (!full) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		ret = build_at_path(cur, (int)dirfd, kpath, full,
+				    PATHBUF_SIZE);
+		if (ret != 0)
+			goto out;
 		/* vfs_utimens routes to the owning filesystem (devfs has no
 		 * timestamps, so it succeeds silently). */
 		r = vfs_utimens(full, (flags & AT_SYMLINK_NOFOLLOW) ? 1 : 0, &t);
 	}
 	if (r == ST_OK)
-		return 0;
-	if (r == ST_INVALID)
-		return -ENOENT;
-	return vfs_status_to_errno(r);
+		ret = 0;
+	else if (r == ST_INVALID)
+		ret = -ENOENT;
+	else
+		ret = vfs_status_to_errno(r);
+out:
+	pathbuf_put(full);
+	pathbuf_put(kpath);
+	return ret;
 }
 
 // Userspace struct statfs layout (must match user/lib/libc/include/sys/vfs.h)
@@ -580,15 +638,8 @@ int64_t sys_statfs(uint64_t u_path, uint64_t u_buf)
 	if (!validate_user_ptr(u_buf, sizeof(user_statfs_t)))
 		return -EFAULT;
 
-	char kpath[VFS_MAX_PATH];
-	size_t plen;
-	int err = user_strnlen((const char *)u_path, VFS_MAX_PATH, &plen);
-	if (err)
-		return err;
-	err = copy_from_user(kpath, (const void *)u_path, plen + 1);
-	if (err)
-		return err;
-	err = canon_task_path(kpath, sizeof(kpath));
+	char *kpath;
+	int err = user_path_get_canon(u_path, &kpath);
 	if (err)
 		return err;
 
@@ -596,8 +647,12 @@ int64_t sys_statfs(uint64_t u_path, uint64_t u_buf)
 	struct vfs_statfs vsf;
 	mm_memset(&vsf, 0, sizeof(vsf));
 	int r = vfs_statfs(kpath, &vsf);
+	pathbuf_put(kpath);
 	if (r == ST_UNSUPPORTED)
 		return -ENOSYS;
+	if (r == ST_NOT_FOUND || r == ST_NAMETOOLONG || r == ST_LOOP ||
+	    r == ST_ACCESS || r == ST_NOMEM)
+		return vfs_status_to_errno(r);
 	if (r != ST_OK)
 		return -EIO;
 

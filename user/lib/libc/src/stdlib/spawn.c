@@ -30,6 +30,7 @@
 #include <spawn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>     /* PATH_MAX */
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -344,9 +345,9 @@ struct spawn_args {
  *
  * This runs in the PARENT'S address space with the parent thread parked (see
  * the file comment): every call below is a plain system call wrapper, the
- * only memory written is the caller's `err', and execvp()'s PATH search works
- * in a buffer on this stack.  Reading environ is fine -- it is the parent's,
- * and it is what the child is meant to read. */
+ * only memory written is the caller's `err', and the PATH search
+ * (spawn_execvpe) works in a buffer on this stack.  Reading environ is fine --
+ * it is the parent's, and it is what the child is meant to read. */
 static int spawn_child_setup(const struct spawn_args *a)
 {
 	const posix_spawnattr_t *attrp = a->attrp;
@@ -473,6 +474,53 @@ static int spawn_child_setup(const struct spawn_args *a)
 	return 0;
 }
 
+/* posix_spawnp's exec: find `file' the way execvp() does -- the same PATH
+ * (the caller's, with the same default when it has none), the same handling
+ * of each entry, the same outcome when nothing runs (ENOENT) -- but start the
+ * program with `envp' rather than with environ, which is what execvp()
+ * passes.  Returns only on failure, with errno set.  Allocation-free, as the
+ * child must be. */
+static void spawn_execvpe(const char *file, char *const argv[],
+			  char *const envp[])
+{
+	const char *path, *start, *cur;
+	char full[PATH_MAX];
+	size_t flen;
+
+	if (!*file) {
+		errno = ENOENT;
+		return;
+	}
+	if (strchr(file, '/')) {
+		execve(file, argv, envp);
+		return;
+	}
+	path = getenv("PATH");
+	if (!path)
+		path = "/bin:/usr/local/bin";
+	flen = strlen(file);
+	for (start = cur = path;; cur++) {
+		if (*cur != ':' && *cur != '\0')
+			continue;
+		size_t len = (size_t)(cur - start);
+
+		if (len + 1 + flen + 1 < sizeof(full)) {
+			memcpy(full, start, len);
+			if (len > 0 && full[len - 1] == '/') {
+				memcpy(full + len, file, flen + 1);
+			} else {
+				full[len] = '/';
+				memcpy(full + len + 1, file, flen + 1);
+			}
+			execve(full, argv, envp);
+		}
+		if (*cur == '\0')
+			break;
+		start = cur + 1;
+	}
+	errno = ENOENT;
+}
+
 /* The child, from its first instruction on its own stack to exec or _exit.
  * Never returns: clone() would exit the process with its value, but the
  * parent must find `err' set either way. */
@@ -480,12 +528,13 @@ static int spawn_child(void *arg)
 {
 	struct spawn_args *a = arg;
 	int err = spawn_child_setup(a);
+	char *const *envp = a->envp ? a->envp : environ;
 
 	if (err == 0) {
 		if (a->use_path)
-			execvp(a->file, a->argv);
+			spawn_execvpe(a->file, a->argv, envp);
 		else
-			execve(a->file, a->argv, a->envp ? a->envp : environ);
+			execve(a->file, a->argv, envp);
 		err = errno;
 	}
 	a->err = err;
@@ -495,7 +544,7 @@ static int spawn_child(void *arg)
 /* The child's stack.  It runs in the parent's address space and cannot use
  * the parent's stack -- the parent is parked in the middle of it -- so it
  * gets a mapping of its own, released once it is done.  The deepest path is
- * execvp()'s PATH search with its on-stack buffers, well under this. */
+ * the PATH search (spawn_execvpe) with its PATH_MAX buffer, well under this. */
 #define SPAWN_STACK_SIZE (64 * 1024)
 
 static int spawn_common(pid_t *pid, const char *file,

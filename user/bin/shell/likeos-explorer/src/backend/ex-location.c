@@ -260,15 +260,16 @@ guint ex_location_hash(const ExLocation *loc)
 	return g_str_hash(loc->id);
 }
 
-/* The USB drive `f' (at `path') is the root folder of, or NULL. */
-static const ExVolume *usb_root(GFile *f, const char *path)
+/* The drive of the device service `f' (at `path') is the root folder of,
+ * or NULL. */
+static const ExVolume *drive_root(GFile *f, const char *path)
 {
 	const ExVolume *v;
 
 	if (!g_str_has_prefix(path, "/media/"))
 		return NULL;
 	v = ex_volumes_find(ex_volumes_get_default(), f);
-	return v && v->kind == EX_VOLUME_USB && v->root &&
+	return v && v->kind == EX_VOLUME_DRIVE && v->root &&
 			       g_file_equal(v->root, f) ?
 		       v :
 		       NULL;
@@ -284,9 +285,9 @@ static char *folder_name(GFile *f)
 		g_free(path);
 		return g_strdup(EX_SYSTEM_DISK_NAME);
 	}
-	/* A USB drive's folder is called what the drive is. */
+	/* A drive's folder is called what the drive is. */
 	if (path) {
-		const ExVolume *v = usb_root(f, path);
+		const ExVolume *v = drive_root(f, path);
 
 		if (v) {
 			g_free(path);
@@ -366,8 +367,12 @@ const char *ex_location_icon_name(const ExLocation *loc)
 		return "user-trash";
 	case EX_LOC_SEARCH:
 		return "system-search";
-	case EX_LOC_DEVICE:
-		return "drive-removable-media-usb";
+	case EX_LOC_DEVICE: {
+		const ExVolume *v = ex_volumes_find_device(ex_volumes_get_default(),
+							   loc->device);
+
+		return v ? ex_volume_drive_icon(v) : "drive-removable-media-usb";
+	}
 	case EX_LOC_FOLDER:
 	default:
 		break;
@@ -377,10 +382,13 @@ const char *ex_location_icon_name(const ExLocation *loc)
 
 	if (!path)
 		return "folder-remote";
+	const ExVolume *drive = strcmp(path, "/") ? drive_root(loc->file, path) :
+						    NULL;
+
 	if (strcmp(path, "/") == 0)
 		icon = "drive-harddisk";
-	else if (usb_root(loc->file, path))
-		icon = "drive-removable-media-usb";
+	else if (drive)
+		icon = ex_volume_drive_icon(drive);
 	else if (strcmp(path, g_get_home_dir()) == 0)
 		icon = "user-home";
 	else {
@@ -438,11 +446,11 @@ ExLocation *ex_location_parent(const ExLocation *loc)
 	case EX_LOC_FOLDER: {
 		GFile *p = g_file_get_parent(loc->file);
 		char *path = g_file_get_path(loc->file);
-		gboolean drive = path && usb_root(loc->file, path);
+		gboolean drive = path && drive_root(loc->file, path);
 		ExLocation *l;
 
 		g_free(path);
-		/* Above the root, and above a USB drive: Computer. */
+		/* Above the root, and above a drive: Computer. */
 		if (!p || drive) {
 			g_clear_object(&p);
 			return ex_location_new_special(EX_LOC_COMPUTER);

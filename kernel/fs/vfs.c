@@ -5,9 +5,14 @@
 #include <kernel/fs/vfs.h>
 #include <kernel/fs/mount.h>
 #include <kernel/fs/devfs.h>
-#include <kernel/fs/ext4.h>
-#include <kernel/fs/fat32.h>
+#include <kernel/fs/ext4/ext4.h>
+#include <kernel/fs/fat32/fat32.h>
+#include <kernel/fs/ntfs/ntfs.h>
+#include <kernel/fs/exfat/exfat.h>
+#include <kernel/fs/isofs.h>
 #include <kernel/fs/namei.h>
+#include <kernel/fs/pathbuf.h>
+#include <kernel/ke/task_path.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 #include <kernel/uapi/dirent.h>
@@ -82,25 +87,30 @@ static void vfs_notify_open(const char *path, int flags, int existed,
  * component and no doubled slash -- nearly every path -- is used as it is;
  * anything else is resolved lexically into `buf'.  A trailing slash is kept,
  * since it means "a directory" to the filesystem that sees it. */
-const char *vfs_canon(const char *path, char *buf)
+/* Is absolute `path' one vfs_canon() has to rewrite? */
+static int vfs_path_odd(const char *path)
 {
 	if (!path || path[0] != '/')
-		return path;
-	size_t len = 0;
-	int odd = 0;
-	for (const char *p = path; *p; p++, len++) {
+		return 0;
+	for (const char *p = path; *p; p++) {
 		if (p[0] != '/')
 			continue;
 		if (p[1] == '/')
-			odd = 1;
-		else if (p[1] == '.' && (p[2] == '/' || p[2] == '\0'))
-			odd = 1;
-		else if (p[1] == '.' && p[2] == '.' &&
-			 (p[3] == '/' || p[3] == '\0'))
-			odd = 1;
+			return 1;
+		if (p[1] == '.' && (p[2] == '/' || p[2] == '\0'))
+			return 1;
+		if (p[1] == '.' && p[2] == '.' &&
+		    (p[3] == '/' || p[3] == '\0'))
+			return 1;
 	}
-	if (!odd)
+	return 0;
+}
+
+const char *vfs_canon(const char *path, char *buf)
+{
+	if (!vfs_path_odd(path))
 		return path;
+	size_t len = kstrlen(path);
 	if (normalize_path("/", path, buf, VFS_MAX_PATH) != 0)
 		return path; /* too long to fix: the filesystem decides */
 	if (len > 1 && path[len - 1] == '/') {
@@ -111,6 +121,20 @@ const char *vfs_canon(const char *path, char *buf)
 		}
 	}
 	return buf;
+}
+
+/* vfs_canon() with a buffer of its own, taken only when one is needed: *bufp
+ * is then a path buffer the caller puts, else NULL.  NULL when no memory
+ * could be had (ST_NOMEM). */
+static const char *vfs_canon_get(const char *path, char **bufp)
+{
+	*bufp = NULL;
+	if (!vfs_path_odd(path))
+		return path;
+	*bufp = pathbuf_get();
+	if (!*bufp)
+		return NULL;
+	return vfs_canon(path, *bufp);
 }
 
 /* ---- Walking through symbolic links ------------------------------------------
@@ -148,10 +172,30 @@ struct vfs_walk {
 	int follow; /* a link in the last component is followed */
 	int hopped; /* a link was handed over: `next' is where to go on */
 	int err; /* it cannot be followed: the operation fails with this */
+	int fail; /* not even begun (no memory): the operation's status */
 	unsigned hops;
-	char buf[VFS_MAX_PATH]; /* the path, when it is not the caller's */
-	char next[VFS_MAX_PATH];
+	/* Path buffers (pathbuf.h), taken when first needed and put by
+	 * vfs_walk_free(): the path when it is not the caller's, and where
+	 * the link handed over leads.  The two trade places at each hop. */
+	char *buf;
+	char *next;
 };
+
+/* A name in `path' longer than VFS_NAME_MAX?  Every filesystem below would
+ * have to cut it, and a cut name is a different name: refused here, once,
+ * for all of them (ENAMETOOLONG, as POSIX has it). */
+static int vfs_name_too_long(const char *path)
+{
+	unsigned long n = 0;
+
+	for (; *path; path++) {
+		if (*path == '/')
+			n = 0;
+		else if (++n > VFS_NAME_MAX)
+			return 1;
+	}
+	return 0;
+}
 
 static const char *vfs_walk_begin(struct vfs_walk *w, const char *path,
 				  int follow)
@@ -162,8 +206,20 @@ static const char *vfs_walk_begin(struct vfs_walk *w, const char *path,
 	w->follow = follow;
 	w->hopped = 0;
 	w->err = 0;
+	w->fail = 0;
 	w->hops = 0;
-	w->path = vfs_canon(path, w->buf);
+	w->next = NULL;
+	if (path && vfs_name_too_long(path)) {
+		w->buf = NULL;
+		w->path = NULL;
+		w->fail = ST_NAMETOOLONG;
+		return NULL;
+	}
+	w->path = vfs_canon_get(path, &w->buf);
+	if (!w->path && path) {
+		w->fail = ST_NOMEM;
+		return NULL;
+	}
 	if (cur && !cur->vfs_walk && w->path && w->path[0] == '/') {
 		cur->vfs_walk = w;
 		w->owner = cur;
@@ -175,7 +231,7 @@ static const char *vfs_walk_begin(struct vfs_walk *w, const char *path,
  * on w->path (a link was handed over), 0 when *r is the answer. */
 static int vfs_walk_again(struct vfs_walk *w, int *r)
 {
-	unsigned long i;
+	char *tmp;
 
 	if (!w->owner || !w->hopped)
 		return 0;
@@ -190,9 +246,12 @@ static int vfs_walk_again(struct vfs_walk *w, int *r)
 		*r = ST_LOOP;
 		return 0;
 	}
-	for (i = 0; w->next[i] && i + 1 < VFS_MAX_PATH; i++)
-		w->buf[i] = w->next[i];
-	w->buf[i] = '\0';
+	/* Where the link leads (in `next', which vfs_hop_join filled) is the
+	 * path now; the old path's buffer, if it had one, is free for the
+	 * next hop. */
+	tmp = w->buf;
+	w->buf = w->next;
+	w->next = tmp;
 	w->path = w->buf;
 	return 1;
 }
@@ -203,33 +262,58 @@ static void vfs_walk_end(struct vfs_walk *w)
 		w->owner->vfs_walk = NULL;
 }
 
+/* After vfs_walk_end(): the walk's buffers back.  The path the walk ran on
+ * may have been in one of them. */
+static void vfs_walk_free(struct vfs_walk *w)
+{
+	pathbuf_put(w->next);
+	pathbuf_put(w->buf);
+	w->next = NULL;
+	w->buf = NULL;
+	w->path = NULL;
+}
+
 /* Run `expr' on the path `p_' -- and again on wherever the links met on it
  * lead -- leaving its status in `r'.  `w' is a struct vfs_walk of the
- * caller's, so `p_' (possibly pointing into it) is still good afterwards. */
-#define VFS_WALK(w, p_, follow, r, expr)                                    \
+ * caller's.  VFS_WALK_RUN leaves `p_' (possibly pointing into the walk's
+ * buffers) good until the caller's vfs_walk_free(); VFS_WALK frees them
+ * itself and leaves `p_' NULL. */
+#define VFS_WALK_RUN(w, p_, follow, r, expr)                                \
 	do {                                                                \
 		for ((p_) = vfs_walk_begin(&(w), (p_), (follow));;          \
 		     (p_) = (w).path) {                                     \
-			(r) = (expr);                                       \
+			(r) = (w).fail ? (w).fail : (expr);                 \
 			if (!vfs_walk_again(&(w), &(r)))                    \
 				break;                                      \
 		}                                                           \
 		vfs_walk_end(&(w));                                         \
 	} while (0)
 
+#define VFS_WALK(w, p_, follow, r, expr)                                    \
+	do {                                                                \
+		VFS_WALK_RUN(w, p_, follow, r, expr);                       \
+		vfs_walk_free(&(w));                                        \
+		(p_) = NULL;                                                \
+	} while (0)
+
 /* Where the link at op[ns_cs, ns_end) of the operation's path leads, with
  * the rest of the path after it, into w->next: from the task's root for an
  * absolute target, from the link's directory for a relative one, ".." taken
- * lexically and never above the root.  A trailing slash is kept. */
+ * lexically and never above the root.  A trailing slash is kept.  The three
+ * pieces are taken a name at a time (normalize_path_append), never joined
+ * into one string first: only where they lead has to fit in a path. */
 static int vfs_hop_join(struct vfs_walk *w, task_t *cur, const char *op,
 			unsigned long ns_cs, unsigned long ns_end,
 			const char *target)
 {
-	const char *root = (cur && cur->root[0]) ? cur->root : NULL;
+	const char *root = task_root(cur)[0] ? task_root(cur) : NULL;
 	unsigned long rlen = root ? kstrlen(root) : 0, n = 0;
-	char *j = w->next;
-	char tmp[VFS_MAX_PATH];
-	int trailing;
+	const char *rest = op + ns_end;
+	unsigned long tlen = kstrlen(target), restlen = kstrlen(rest);
+	char *j = w->next; /* a path buffer (vfs_link_hop) */
+	char *tmp = NULL;
+	size_t tl = 1;
+	int trailing, r;
 
 	/* The root counts only when the operation's path is inside it (it
 	 * always is for a jailed task's own paths). */
@@ -240,26 +324,42 @@ static int vfs_hop_join(struct vfs_walk *w, task_t *cur, const char *op,
 	}
 #define HOP_PUT(c)                                                          \
 	do {                                                                \
-		if (n + 1 >= VFS_MAX_PATH)                                  \
-			return ST_NAMETOOLONG;                              \
+		if (n + 1 >= VFS_MAX_PATH) {                                \
+			r = ST_NAMETOOLONG;                                 \
+			goto out;                                           \
+		}                                                           \
 		j[n++] = (c);                                               \
 	} while (0)
-	if (target[0] != '/') {
-		/* The directory holding the link, as the task sees it. */
-		for (unsigned long i = rlen; i < ns_cs; i++)
-			HOP_PUT(op[i]);
-		if (n == 0 || j[n - 1] != '/')
-			HOP_PUT('/');
+	/* The target and the rest, joined, end in a slash: kept (unless all
+	 * there is is the root). */
+	{
+		const char *last = restlen ? rest : target;
+		unsigned long llen = restlen ? restlen : tlen;
+
+		trailing = llen && last[llen - 1] == '/' &&
+			   (target[0] != '/' || tlen + restlen > 1);
 	}
-	for (const char *t = target; *t; t++)
-		HOP_PUT(*t);
-	for (const char *t = op + ns_end; *t; t++)
-		HOP_PUT(*t);
-	j[n] = '\0';
-	trailing = n > 1 && j[n - 1] == '/';
-	if (normalize_path("/", j, tmp, sizeof(tmp)) != 0)
-		return ST_NAMETOOLONG;
-	n = 0;
+	tmp = pathbuf_get();
+	if (!tmp) {
+		r = ST_NOMEM;
+		goto out;
+	}
+	tmp[0] = '/';
+	tmp[1] = '\0';
+	r = 0;
+	if (target[0] != '/' && ns_cs > rlen)
+		/* The directory holding the link, as the task sees it. */
+		r = normalize_path_append(tmp, PATHBUF_SIZE, &tl, op + rlen,
+					  ns_cs - rlen);
+	if (r == 0)
+		r = normalize_path_append(tmp, PATHBUF_SIZE, &tl, target, tlen);
+	if (r == 0)
+		r = normalize_path_append(tmp, PATHBUF_SIZE, &tl, rest,
+					  restlen);
+	if (r != 0) {
+		r = ST_NAMETOOLONG;
+		goto out;
+	}
 	if (root) {
 		for (unsigned long i = 0; i < rlen; i++)
 			HOP_PUT(root[i]);
@@ -273,8 +373,11 @@ static int vfs_hop_join(struct vfs_walk *w, task_t *cur, const char *op,
 	if (trailing && !(n == 1 && j[0] == '/'))
 		HOP_PUT('/');
 	j[n] = '\0';
+	r = ST_OK;
 #undef HOP_PUT
-	return ST_OK;
+out:
+	pathbuf_put(tmp);
+	return r;
 }
 
 int vfs_link_hop(vfs_mount_t *m, const char *path, unsigned long comp_start,
@@ -311,6 +414,8 @@ int vfs_link_hop(vfs_mount_t *m, const char *path, unsigned long comp_start,
 		w->err = ST_NOT_FOUND; /* an empty link leads nowhere */
 	else if (m->flags & VFS_MS_NOSYMFOLLOW)
 		w->err = ST_LOOP;
+	else if (!w->next && !(w->next = pathbuf_get()))
+		w->err = ST_NOMEM;
 	else
 		w->err = vfs_hop_join(w, cur, op, mlen + comp_start, ns_end,
 				      target);
@@ -331,20 +436,28 @@ int vfs_resolve(const char *path, int follow, char *out)
 	unsigned long i;
 	int r;
 
-	VFS_WALK(w, path, follow, r,
-		 follow ? vfs_raw_stat(path, &st) : vfs_raw_lstat(path, &st));
+	VFS_WALK_RUN(w, path, follow, r,
+		     follow ? vfs_raw_stat(path, &st) :
+			      vfs_raw_lstat(path, &st));
 	/* (ST_LINK: nested in an operation that is about to restart on
 	 * another path.) */
-	if (r == ST_LOOP || r == ST_NAMETOOLONG || r == ST_LINK)
-		return r;
+	if (r == ST_LOOP || r == ST_NAMETOOLONG || r == ST_LINK ||
+	    r == ST_NOMEM)
+		goto out;
 	if (!path) {
 		out[0] = '\0';
-		return ST_INVALID;
+		r = ST_INVALID;
+		goto out;
 	}
+	/* (`out' may be the caller's `path' itself: copying it onto itself
+	 * changes nothing.) */
 	for (i = 0; path[i] && i + 1 < VFS_MAX_PATH; i++)
 		out[i] = path[i];
 	out[i] = '\0';
-	return ST_OK;
+	r = ST_OK;
+out:
+	vfs_walk_free(&w);
+	return r;
 }
 
 /* ============================ Permission layer ============================
@@ -570,19 +683,31 @@ int vfs_permission(const char *path, int want)
 int vfs_check_access(const char *path, const struct kstat *st, int want,
 		     int use_real)
 {
-	char cbuf_[VFS_MAX_PATH];
+	char *cbuf, *rbuf = NULL;
 	cred_t *c = current_cred();
-	path = vfs_canon(path, cbuf_);
+	int r;
 	BUG_ON(path == NULL);
 	BUG_ON(st == NULL);
+	path = vfs_canon_get(path, &cbuf);
+	if (!path)
+		return ST_NOMEM;
 	/* For a caller the ACL applies to, the ACL is read from the
 	 * filesystem `st' came from: the one the path leads to once its
 	 * links are followed -- the last one too, unless `st' describes the
 	 * link itself. */
-	if (c && (use_real ? c->uid : c->euid) != 0 &&
-	    vfs_resolve(path, !S_ISLNK(st->st_mode), cbuf_) == ST_OK)
-		path = cbuf_;
-	return vfs_perm_access(path, st, want, use_real);
+	if (c && (use_real ? c->uid : c->euid) != 0) {
+		rbuf = pathbuf_get();
+		if (!rbuf) {
+			pathbuf_put(cbuf);
+			return ST_NOMEM;
+		}
+		if (vfs_resolve(path, !S_ISLNK(st->st_mode), rbuf) == ST_OK)
+			path = rbuf;
+	}
+	r = vfs_perm_access(path, st, want, use_real);
+	pathbuf_put(rbuf);
+	pathbuf_put(cbuf);
+	return r;
 }
 
 /* Access check of an OPEN file against its own stat (effective ids): the
@@ -621,8 +746,10 @@ int vfs_check_access_file(vfs_file_t *f, const struct kstat *st, int want)
  * hook): ST_OK, a refusal, or ST_UNSUPPORTED when it has none or defers. */
 int vfs_fs_permission(const char *path, unsigned long ino, int want)
 {
-	char cbuf_[VFS_MAX_PATH];
-	path = vfs_canon(path, cbuf_);
+	char *cbuf;
+	path = vfs_canon_get(path, &cbuf);
+	if (!path)
+		return ST_NOMEM;
 	const char *rel;
 	vfs_mount_t *m = vfs_mnt_get(path, &rel);
 	int r = ST_UNSUPPORTED;
@@ -630,6 +757,7 @@ int vfs_fs_permission(const char *path, unsigned long ino, int want)
 	if (m && m->ops->permission)
 		r = m->ops->permission(m, rel, ino, want);
 	vfs_mnt_put(m);
+	pathbuf_put(cbuf);
 	return r;
 }
 
@@ -639,13 +767,27 @@ int vfs_fs_permission(const char *path, unsigned long ino, int want)
  * cwd-relative path directly (there are no *at dirfd variants that reach here
  * unresolved), so resolving here keeps the DAC checks from being silently
  * skipped for a non-root caller. */
-static const char *vfs_abspath(const char *path, char *buf, size_t bufsz)
+/* (`buf' is taken here, a path buffer, only for a relative path: *bufp, put
+ * by the caller.  NULL with *err set when it cannot be had (ST_NOMEM) or the
+ * two do not fit in a path together (ST_NAMETOOLONG) -- never cut short,
+ * which would check some other path.) */
+static const char *vfs_abspath(const char *path, char **bufp, int *err)
 {
+	char *buf;
+
+	*bufp = NULL;
 	if (!path || path[0] == '/')
 		return path;
+	buf = pathbuf_get();
+	if (!buf) {
+		*err = ST_NOMEM;
+		return NULL;
+	}
 	const char *cwd = current_cwd(); /* absolute; "/" if unset */
 	size_t ci = 0;
-	while (cwd[ci] && ci < bufsz - 2) {
+	while (cwd[ci]) {
+		if (ci >= PATHBUF_SIZE - 2)
+			goto too_long;
 		buf[ci] = cwd[ci];
 		ci++;
 	}
@@ -654,10 +796,18 @@ static const char *vfs_abspath(const char *path, char *buf, size_t bufsz)
 	if (buf[ci - 1] != '/')
 		buf[ci++] = '/';
 	size_t pi = 0;
-	while (path[pi] && ci < bufsz - 1)
+	while (path[pi]) {
+		if (ci >= PATHBUF_SIZE - 1)
+			goto too_long;
 		buf[ci++] = path[pi++];
+	}
 	buf[ci] = '\0';
+	*bufp = buf;
 	return buf;
+too_long:
+	pathbuf_put(buf);
+	*err = ST_NAMETOOLONG;
+	return NULL;
 }
 
 /* Per-component traversal: a non-privileged task needs search (x) on every
@@ -673,20 +823,27 @@ static int vfs_permission_traverse_id(const char *path, int use_real)
 		return ST_OK; /* privileged: bypass */
 	if (!path)
 		return ST_OK;
-	char abuf[VFS_MAX_PATH];
-	path = vfs_abspath(path, abuf, sizeof(abuf));
+	char *abuf, *dir;
+	int r = ST_OK;
+	path = vfs_abspath(path, &abuf, &r);
+	if (!path)
+		return r;
 	size_t len = 0;
 	while (path[len])
 		len++;
 	while (len > 1 && path[len - 1] == '/')
 		len--; /* ignore a trailing slash */
 	if (len <= 1)
-		return ST_OK; /* "/" has no ancestors */
+		goto out_abuf; /* "/" has no ancestors */
 	size_t last = 0;
 	for (size_t i = 0; i < len; i++)
 		if (path[i] == '/')
 			last = i;
-	char dir[VFS_MAX_PATH];
+	dir = pathbuf_get();
+	if (!dir) {
+		r = ST_NOMEM;
+		goto out_abuf;
+	}
 	for (size_t i = 0; i <= last; i++) { /* ancestors only */
 		if (path[i] != '/')
 			continue;
@@ -694,25 +851,32 @@ static int vfs_permission_traverse_id(const char *path, int use_real)
 			dir[0] = '/';
 			dir[1] = '\0';
 		} else {
-			if (i >= sizeof(dir))
-				return ST_OK;
+			if (i >= PATHBUF_SIZE)
+				break; /* (cannot be: `path' fits) */
 			for (size_t j = 0; j < i; j++)
 				dir[j] = path[j];
 			dir[i] = '\0';
 		}
 		struct kstat st;
 		int sr = traverse_stat(dir, &st);
-		if (sr == ST_LINK)
-			return ST_LINK; /* the walk goes on elsewhere */
+		if (sr == ST_LINK) {
+			r = ST_LINK; /* the walk goes on elsewhere */
+			break;
+		}
 		if (sr != ST_OK)
 			continue; /* defer to the resolver */
 		if ((st.st_mode & S_IFMT) != S_IFDIR)
 			continue;
 		int pr = vfs_perm_access(dir, &st, MAY_EXEC, use_real);
-		if (pr != ST_OK)
-			return pr;
+		if (pr != ST_OK) {
+			r = pr;
+			break;
+		}
 	}
-	return ST_OK;
+	pathbuf_put(dir);
+out_abuf:
+	pathbuf_put(abuf);
+	return r;
 }
 
 int vfs_permission_traverse(const char *path)
@@ -789,15 +953,25 @@ static int vfs_permission_parent_at(const char *path, int want)
 {
 	if (capable())
 		return ST_OK;
-	char abuf[VFS_MAX_PATH];
-	path = vfs_abspath(path, abuf, sizeof(abuf)); /* parent-of needs absolute */
-	char parent[VFS_MAX_PATH];
-	if (!vfs_parent_of(path, parent, sizeof(parent)))
-		return ST_OK;
-	int tr = vfs_permission_traverse_id(parent, 0);
-	if (tr != ST_OK)
-		return tr;
-	return vfs_permission_id(parent, want, 0);
+	char *abuf, *parent;
+	int r = ST_OK;
+	path = vfs_abspath(path, &abuf, &r); /* parent-of needs absolute */
+	if (!path)
+		return r;
+	parent = pathbuf_get();
+	if (!parent) {
+		r = ST_NOMEM;
+		goto out;
+	}
+	if (!vfs_parent_of(path, parent, PATHBUF_SIZE))
+		goto out;
+	r = vfs_permission_traverse_id(parent, 0);
+	if (r == ST_OK)
+		r = vfs_permission_id(parent, want, 0);
+out:
+	pathbuf_put(parent);
+	pathbuf_put(abuf);
+	return r;
 }
 
 int vfs_permission_parent(const char *path, int want)
@@ -817,32 +991,46 @@ static int vfs_permission_remove_at(const char *path)
 {
 	if (capable())
 		return ST_OK;
-	char abuf[VFS_MAX_PATH];
-	path = vfs_abspath(path, abuf, sizeof(abuf)); /* parent-of / raw_stat need it */
-	int pr = vfs_permission_parent_at(path, MAY_WRITE | MAY_EXEC);
-	if (pr != ST_OK)
-		return pr;
-	char parent[VFS_MAX_PATH];
-	if (!vfs_parent_of(path, parent, sizeof(parent)))
-		return ST_OK;
+	char *abuf, *parent = NULL;
+	int r = ST_OK;
+	path = vfs_abspath(path, &abuf, &r); /* parent-of / raw_stat need it */
+	if (!path)
+		return r;
+	r = vfs_permission_parent_at(path, MAY_WRITE | MAY_EXEC);
+	if (r != ST_OK)
+		goto out;
+	parent = pathbuf_get();
+	if (!parent) {
+		r = ST_NOMEM;
+		goto out;
+	}
+	if (!vfs_parent_of(path, parent, PATHBUF_SIZE))
+		goto out;
 	struct kstat pst;
 	int sr = vfs_raw_stat(parent, &pst);
-	if (sr == ST_LINK)
-		return ST_LINK;
+	if (sr == ST_LINK) {
+		r = ST_LINK;
+		goto out;
+	}
 	if (sr != ST_OK)
-		return ST_OK;
+		goto out;
 	if (!(pst.st_mode & S_ISVTX))
-		return ST_OK; /* no sticky bit: parent write is enough */
+		goto out; /* no sticky bit: parent write is enough */
 	struct kstat st;
 	sr = vfs_raw_lstat(path, &st);
-	if (sr == ST_LINK)
-		return ST_LINK;
+	if (sr == ST_LINK) {
+		r = ST_LINK;
+		goto out;
+	}
 	if (sr != ST_OK)
-		return ST_OK;
+		goto out;
 	uint32_t me = current_fsuid();
-	if ((uint32_t)st.st_uid == me || (uint32_t)pst.st_uid == me)
-		return ST_OK;
-	return ST_PERM;
+	if ((uint32_t)st.st_uid != me && (uint32_t)pst.st_uid != me)
+		r = ST_PERM;
+out:
+	pathbuf_put(parent);
+	pathbuf_put(abuf);
+	return r;
 }
 
 int vfs_permission_remove(const char *path)
@@ -865,8 +1053,15 @@ static int vfs_attr_allow_modify_ino(vfs_mount_t *m, unsigned long ino,
 	if (!m || !m->ops->inode_flags)
 		return ST_OK;
 	uint32_t fl = 0;
-	if (m->ops->inode_flags(m, ino, &fl) != ST_OK)
+	int r = m->ops->inode_flags(m, ino, &fl);
+
+	/* A filesystem that cannot tell (out of memory, a read error) must not
+	 * let the modification through: the flags it could not read may well
+	 * say immutable.  Only "no such flags here" counts as none. */
+	if (r == ST_UNSUPPORTED)
 		return ST_OK;
+	if (r != ST_OK)
+		return r;
 	if (fl & VFS_ATTR_IMMUTABLE)
 		return ST_PERM;
 	if ((fl & VFS_ATTR_APPEND) && !is_append_write)
@@ -909,6 +1104,7 @@ static void vfs_fix_dev(const vfs_mount_t *m, struct kstat *st)
 
 int vfs_init(void)
 {
+	pathbuf_init();
 	/* The mount table is static (kernel/fs/mount.c): filesystems arrive
 	 * through vfs_register_root(), vfs_register_devfs(),
 	 * vfs_register_mount(), vfs_mount_boot() and mount(2).  These are the
@@ -916,6 +1112,9 @@ int vfs_init(void)
 	 * boot instance (/ram). */
 	vfs_fstype_register(&ext4_fstype);
 	vfs_fstype_register(&fat32_fstype);
+	vfs_fstype_register(&ntfs_fstype);
+	vfs_fstype_register(&exfat_fstype);
+	vfs_fstype_register(&isofs_fstype);
 	return ST_OK;
 }
 
@@ -992,6 +1191,7 @@ static int vfs_open_common(const char *path, int flags, unsigned int cmode,
 	BUG_ON(out == NULL);
 	struct kstat est;
 	int exists;
+	char *dpath = NULL; /* a device's /dev path (path buffer) */
 
 	/* Permission enforcement (canonical for every filesystem): search the
 	 * path prefix, then check read/write on an existing target — or write on
@@ -1108,7 +1308,6 @@ static int vfs_open_common(const char *path, int flags, unsigned int cmode,
 	 * symbolic link led into /dev.  The path the caller used stays the
 	 * handle's own (at_path below). */
 	{
-		char dpath[VFS_MAX_PATH];
 		const char *devp = NULL;
 
 		if (exists && !m->full_paths &&
@@ -1117,9 +1316,14 @@ static int vfs_open_common(const char *path, int flags, unsigned int cmode,
 				ret = ST_ACCESS;
 				goto out;
 			}
+			dpath = pathbuf_get();
+			if (!dpath) {
+				ret = ST_NOMEM;
+				goto out;
+			}
 			if (devfs_path_for_rdev(S_ISBLK(est.st_mode) ? 1 : 0,
 						est.st_rdev, dpath,
-						sizeof(dpath)) != ST_OK) {
+						PATHBUF_SIZE) != ST_OK) {
 				ret = ST_NO_DEVICE;
 				goto out;
 			}
@@ -1178,6 +1382,7 @@ not_device:
 	WARN_ON(ret == ST_OK && *out == NULL);
 out:
 	vfs_mnt_put(m);
+	pathbuf_put(dpath);
 	return ret;
 }
 
@@ -1195,10 +1400,11 @@ int vfs_open_mode(const char *path, int flags, unsigned int mode,
 	int existed = 1;
 	int r;
 
-	VFS_WALK(w, path, vfs_open_follows(flags), r,
-		 vfs_open_common(path, flags, mode, out, &existed));
+	VFS_WALK_RUN(w, path, vfs_open_follows(flags), r,
+		     vfs_open_common(path, flags, mode, out, &existed));
 	if (r == ST_OK && *out)
 		vfs_notify_open(path, flags, existed, *out);
+	vfs_walk_free(&w);
 	return r;
 }
 
@@ -1550,14 +1756,22 @@ static int vfs_two_name_path(const char *path, int follow, char *out,
 
 int vfs_link(const char *oldpath, const char *newpath, int follow)
 {
-	char obuf_[VFS_MAX_PATH], nbuf_[VFS_MAX_PATH];
+	char *obuf_ = pathbuf_get(), *nbuf_ = pathbuf_get();
 	int r;
 
+	if (!obuf_ || !nbuf_) {
+		pathbuf_put(nbuf_);
+		pathbuf_put(obuf_);
+		return ST_NOMEM;
+	}
 	r = vfs_two_name_path(oldpath, follow, obuf_, &oldpath);
 	if (r == ST_OK)
 		r = vfs_two_name_path(newpath, 0, nbuf_, &newpath);
-	if (r != ST_OK)
+	if (r != ST_OK) {
+		pathbuf_put(nbuf_);
+		pathbuf_put(obuf_);
 		return r;
+	}
 	/* A hard link's two ends share an inode, so both live on one
 	 * filesystem: one mount, or EXDEV. */
 	const char *orel, *nrel;
@@ -1589,6 +1803,8 @@ int vfs_link(const char *oldpath, const char *newpath, int follow)
 out:
 	vfs_mnt_put(m);
 	vfs_mnt_put(mo);
+	pathbuf_put(nbuf_);
+	pathbuf_put(obuf_);
 	return r;
 }
 
@@ -2124,14 +2340,17 @@ int vfs_fremovexattr(vfs_file_t *f, const char *name)
 int vfs_getxattr_ino(const char *path, unsigned long ino, const char *name,
 		     void *val, unsigned long size)
 {
-	char cbuf_[VFS_MAX_PATH];
-	path = vfs_canon(path, cbuf_);
+	char *cbuf;
+	path = vfs_canon_get(path, &cbuf);
+	if (!path)
+		return ST_NOMEM;
 	vfs_mount_t *m = vfs_mnt_get(path, NULL);
 	int r = ST_UNSUPPORTED;
 
 	if (m && m->ops->getxattr_ino)
 		r = m->ops->getxattr_ino(m, ino, name, val, size);
 	vfs_mnt_put(m);
+	pathbuf_put(cbuf);
 	return r;
 }
 
@@ -2369,27 +2588,34 @@ int vfs_unlink(const char *path)
 }
 int vfs_rename(const char *oldpath, const char *newpath)
 {
-	char obuf_[VFS_MAX_PATH], nbuf_[VFS_MAX_PATH];
+	char *obuf_ = pathbuf_get(), *nbuf_ = pathbuf_get();
 	int r, locked = 0;
+	const char *orel, *nrel;
+	vfs_mount_t *m = NULL, *mn = NULL;
 
+	if (!obuf_ || !nbuf_) {
+		r = ST_NOMEM;
+		goto out;
+	}
 	/* Neither name is followed if it is a link; the links on the way to
 	 * them are, here, beforehand. */
 	r = vfs_two_name_path(oldpath, 0, obuf_, &oldpath);
 	if (r == ST_OK)
 		r = vfs_two_name_path(newpath, 0, nbuf_, &newpath);
 	if (r != ST_OK)
-		return r;
+		goto out;
 	/* Neither end may be a mount point: a mount is in use by what is
 	 * mounted on it. */
-	if (vfs_mnt_is_point(oldpath) || vfs_mnt_is_point(newpath))
-		return ST_BUSY;
+	if (vfs_mnt_is_point(oldpath) || vfs_mnt_is_point(newpath)) {
+		r = ST_BUSY;
+		goto out;
+	}
 	/* By path, like unlink: a name below a mount point belongs to that
 	 * filesystem.  Both names must be on the same one -- a rename cannot
 	 * move data between filesystems, and EXDEV is what tells mv to copy
 	 * and delete instead. */
-	const char *orel, *nrel;
-	vfs_mount_t *m = vfs_mnt_get(oldpath, &orel);
-	vfs_mount_t *mn = vfs_mnt_get(newpath, &nrel);
+	m = vfs_mnt_get(oldpath, &orel);
+	mn = vfs_mnt_get(newpath, &nrel);
 
 	if (!m || !m->ops->rename) {
 		r = ST_UNSUPPORTED;
@@ -2446,6 +2672,8 @@ int vfs_rename(const char *oldpath, const char *newpath)
 out:
 	vfs_mnt_put(mn);
 	vfs_mnt_put(m);
+	pathbuf_put(nbuf_);
+	pathbuf_put(obuf_);
 	return r;
 }
 /* Create a socket, FIFO or device node.  Same permission rule as creating any

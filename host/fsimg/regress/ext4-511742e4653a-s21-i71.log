@@ -1,0 +1,15 @@
+[k] pagecache: initialized (4096 hash buckets)
+[k] ext4: locate -> whole-device (ext4 magic at LBA0+1024)
+kernel/fs/ext4.c:11098:26: runtime error: shift exponent 2147483650 is too large for 32-bit type 'unsigned int'
+    #0 0x5d16e86109aa in ext4_mount_sb kernel/fs/ext4.c:11098
+    #1 0x5d16e86109aa in ext4_mount_opts kernel/fs/ext4.c:11548
+    #2 0x5d16e86135c0 in ext4_fst_mount kernel/fs/ext4.c:12133
+    #3 0x5d16e86537bf in do_mount host/test-fs-main.c:415
+    #4 0x5d16e8668de8 in run_cmd host/test-fs-main.c:2443
+    #5 0x5d16e8668de8 in run_line host/test-fs-main.c:3224
+    #6 0x5d16e8671816 in run_script_text host/test-fs-main.c:3253
+    #7 0x5d16e8671816 in main host/test-fs-main.c:3347
+    #8 0x76c44002a1c9 in __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58
+    #9 0x76c44002a28a in __libc_start_main_impl ../csu/libc-start.c:360
+    #10 0x5d16e85aebc4 in _start (/tmp/claude-1000/-home-kcope-Dokumente-LikeOS-64/4f1902d5-5d27-41e5-9420-2138ed60e472/scratchpad/pathreview/tfs/build-ext4/test-fs-ext4+0xedbc4) (BuildId: 1fc25f599160e408d2ecb449c77be682cc1b24f2)
+

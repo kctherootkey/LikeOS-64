@@ -2,6 +2,7 @@
 //
 // Copyright (C) 2026 The LikeOS Project
 
+#include <kernel/ke/task_path.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/timer.h>
 #include <kernel/ke/syscall.h>
@@ -371,6 +372,10 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 
 	// Initialize child from parent
 	mm_memcpy(child, cur, sizeof(task_t));
+	/* The working directory, root and executable path are references:
+	 * none is taken yet, so a failure before the child is listed has
+	 * nothing to give back (task_paths_fork below takes them). */
+	task_paths_clear(child);
 
 	/* Per-task state the copy must not leave pointing at the parent, for
 	 * EVERY kind of clone -- a thread needs its own FPU register file just
@@ -889,6 +894,10 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	*(--k_sp) = 0; // R15
 
 	child->sp = k_sp;
+
+	/* Nothing can fail the child from here: its own references to the
+	 * parent's working directory, root and executable path. */
+	task_paths_fork(child, cur);
 
 	// Add to global task list
 	spin_lock_irqsave(&g_task_list_lock, &irq_flags);

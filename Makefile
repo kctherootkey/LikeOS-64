@@ -177,7 +177,7 @@ BUILD_DIR = build
 # ---------------------------------------------------------------------------
 BUILD_MODE := DEBUG=$(DEBUG)/CRASH_VERBOSE=$(CRASH_VERBOSE)
 MODE_STAMP := $(BUILD_DIR)/.build-mode
-$(shell mkdir -p $(BUILD_DIR);   if [ ! -f $(MODE_STAMP) ] || [ "$$(cat $(MODE_STAMP) 2>/dev/null)" != "$(BUILD_MODE)" ]; then     if ls $(BUILD_DIR)/*.o >/dev/null 2>&1; then       echo "build mode changed to $(BUILD_MODE): cleaning kernel objects" >&2;       rm -f $(BUILD_DIR)/*.o; rm -rf $(BUILD_DIR)/acpica;     fi;     printf '%s' "$(BUILD_MODE)" > $(MODE_STAMP);   fi)
+$(shell mkdir -p $(BUILD_DIR);   if [ ! -f $(MODE_STAMP) ] || [ "$$(cat $(MODE_STAMP) 2>/dev/null)" != "$(BUILD_MODE)" ]; then     if ls $(BUILD_DIR)/*.o >/dev/null 2>&1; then       echo "build mode changed to $(BUILD_MODE): cleaning kernel objects" >&2;       rm -f $(BUILD_DIR)/*.o; rm -rf $(BUILD_DIR)/acpica; rm -rf $(BUILD_DIR)/fs;     fi;     printf '%s' "$(BUILD_MODE)" > $(MODE_STAMP);   fi)
 
 KERNEL_DIR = kernel
 BOOT_DIR = boot
@@ -253,6 +253,23 @@ ACPICA_SRCS = $(shell find $(ACPICA_DIR) -name '*.c' \
 			-not -path '*/debugger/*' -not -path '*/disassembler/*' \
 			-not -name 'rsdump.c' -not -name 'rsdumpinfo.c' | sort)
 ACPICA_OBJS = $(patsubst $(ACPICA_DIR)/%.c,$(BUILD_DIR)/acpica/%.o,$(ACPICA_SRCS))
+
+# Filesystem drivers made of several files: kernel/fs/<driver>/*.c, objects
+# in $(BUILD_DIR)/fs/<driver>/ (same-named files of two drivers never clash).
+EXT4_OBJS = $(addprefix $(BUILD_DIR)/fs/ext4/, \
+	super.o csum.o lock.o buffer.o balloc.o ialloc.o mballoc.o inode.o \
+	extents.o indirect.o namei.o hash.o dir.o file.o symlink.o xattr.o \
+	ops.o journal.o)
+FAT32_OBJS = $(addprefix $(BUILD_DIR)/fs/fat32/, \
+	misc.o lock.o devio.o cache.o fatent.o nls.o namei.o inode.o dir.o \
+	commit.o file.o xattr.o)
+NTFS_OBJS = $(addprefix $(BUILD_DIR)/fs/ntfs/, \
+	super.o misc.o bdev.o mft.o attrib.o runlist.o inode.o aops.o \
+	compress.o unistr.o index.o dir.o ea.o xattr.o reparse.o security.o \
+	lcnalloc.o file.o namei.o logfile.o)
+EXFAT_OBJS = $(addprefix $(BUILD_DIR)/fs/exfat/, \
+	super.o misc.o cache.o fatent.o balloc.o nls.o inode.o dir.o namei.o \
+	file.o)
 
 # Compiler flags for userspace programs
 USER_CFLAGS = -O2 -fno-strict-aliasing -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
@@ -485,11 +502,15 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/pci_driver.o \
 			  $(BUILD_DIR)/block.o \
 			  $(BUILD_DIR)/xhci.o \
-			  $(BUILD_DIR)/fat32.o \
+			  $(FAT32_OBJS) \
 			  $(BUILD_DIR)/pagecache.o \
 			  $(BUILD_DIR)/dcache.o \
+			  $(BUILD_DIR)/pathbuf.o \
 			  $(BUILD_DIR)/icache.o \
-			  $(BUILD_DIR)/ext4.o \
+			  $(EXT4_OBJS) \
+			  $(NTFS_OBJS) \
+			  $(EXFAT_OBJS) \
+			  $(BUILD_DIR)/isofs.o \
 			  $(BUILD_DIR)/usb.o \
 			  $(BUILD_DIR)/usb_serial.o \
 			  $(BUILD_DIR)/usb_msd.o \
@@ -562,6 +583,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/ap_trampoline.o \
 			  $(BUILD_DIR)/futex.o \
 			  $(BUILD_DIR)/cred.o \
+			  $(BUILD_DIR)/task_path.o \
 			  $(BUILD_DIR)/i2c_hid.o \
 			  $(BUILD_DIR)/net.o \
 			  $(BUILD_DIR)/e1000.o \
@@ -772,10 +794,14 @@ ROOT_BIN_PROGS = bash ls cat cmp pwd stat uname shutdown poweroff reboot halt ps
 # System binaries -> /sbin/<name>, the disk administration tools (hdparm,
 # blkid, fdisk, sfdisk, wipefs, blockdev, blkdiscard, findfs) and the file
 # system tools (e2fsprogs: mke2fs, e2fsck, tune2fs, dumpe2fs, resize2fs,
-# debugfs, badblocks; dosfstools: mkfs.fat, fsck.fat, fatlabel) among them.
+# debugfs, badblocks; dosfstools: mkfs.fat, fsck.fat, fatlabel; exfatprogs:
+# mkfs.exfat, fsck.exfat, exfatlabel, tune.exfat; ntfsprogs: mkntfs,
+# ntfsfix, ntfslabel, ntfsinfo) among them.
 ROOT_SBIN_PROGS = init getty hdparm blkid fdisk sfdisk wipefs blockdev blkdiscard findfs \
 	mke2fs e2fsck tune2fs dumpe2fs resize2fs debugfs badblocks \
-	mkfs.fat fsck.fat fatlabel
+	mkfs.fat fsck.fat fatlabel \
+	mkfs.exfat fsck.exfat exfatlabel tune.exfat \
+	mkntfs ntfsfix ntfslabel ntfsinfo
 # The other names of those tools, as symbolic links in /sbin (<link>:<target>):
 # the programs act on the name they are started under (mkfs.ext4 makes ext4,
 # e2label is tune2fs -L ...).
@@ -783,7 +809,7 @@ ROOT_SBIN_LINKS = mkfs.ext2:mke2fs mkfs.ext3:mke2fs mkfs.ext4:mke2fs \
 	fsck.ext2:e2fsck fsck.ext3:e2fsck fsck.ext4:e2fsck e2label:tune2fs \
 	mkfs.vfat:mkfs.fat mkfs.msdos:mkfs.fat mkdosfs:mkfs.fat \
 	fsck.vfat:fsck.fat fsck.msdos:fsck.fat dosfsck:fsck.fat \
-	dosfslabel:fatlabel
+	dosfslabel:fatlabel mkfs.ntfs:mkntfs
 ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so.3 \
 	libz.so.1 libnghttp2.so.14 libcurl.so.4 libtestlib.so libcrypt.so libpam.so \
 	libdlbase.so libdlchain.so libaudio.so
@@ -797,7 +823,8 @@ USR_LIBEXEC_PROGS = likeos-display-save likeos-keyboard-save
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
 	netstress openssltest usbtest ext4test permbench fbtest pmap ttydump \
 	cxxprobe forkstress oncetest shmtest dirtest tlstest souptest snifftest \
-	webstress wkstress codecheck apload disktest mounttest usbhotplug
+	webstress wkstress codecheck apload disktest mounttest usbhotplug \
+	pathtest
 # Configuration and data files staged into the image, and the script that stages
 # the X.Org tree.  These are prerequisites for exactly the same reason the
 # binaries are: editing one and rebuilding has to CHANGE the image.  Without
@@ -868,7 +895,8 @@ GTK3_TESTCXX = $(BUILD_DIR)/testcxx
 # The desktop bar widgets; built like testcxx, against the GTK3 sysroot.
 GTK3_BAR_PROGS = $(BUILD_DIR)/datetime $(BUILD_DIR)/load $(BUILD_DIR)/taskbar \
 	$(BUILD_DIR)/likeos-display-settings $(BUILD_DIR)/likeos-settings \
-	$(BUILD_DIR)/likeos-keyboard-settings $(BUILD_DIR)/likeos-volume-agent
+	$(BUILD_DIR)/likeos-keyboard-settings $(BUILD_DIR)/likeos-volume-agent \
+	$(BUILD_DIR)/likeos-journal-prompt
 # The shell's meson programs (user/bin/shell/<name>/), built like the bar
 # widgets against the GTK3 sysroot and installed into it; see their rule.
 SHELL_MESON_PROGS = gst-likeos-audio likeos-mediaplayer likeos-imageviewer \
@@ -1215,7 +1243,9 @@ $(BUILD_DIR)/block.o: $(KERNEL_DIR)/dev/block/block.c | $(BUILD_DIR)
 $(BUILD_DIR)/xhci.o: $(KERNEL_DIR)/dev/usb/xhci.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/fat32.o: $(KERNEL_DIR)/fs/fat32.c | $(BUILD_DIR)
+# The FAT driver (kernel/fs/fat32/).
+$(BUILD_DIR)/fs/fat32/%.o: $(KERNEL_DIR)/fs/fat32/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/pagecache.o: $(KERNEL_DIR)/fs/pagecache.c | $(BUILD_DIR)
@@ -1224,10 +1254,28 @@ $(BUILD_DIR)/pagecache.o: $(KERNEL_DIR)/fs/pagecache.c | $(BUILD_DIR)
 $(BUILD_DIR)/dcache.o: $(KERNEL_DIR)/fs/dcache.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/pathbuf.o: $(KERNEL_DIR)/fs/pathbuf.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/icache.o: $(KERNEL_DIR)/fs/icache.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/ext4.o: $(KERNEL_DIR)/fs/ext4.c | $(BUILD_DIR)
+# The ext4 driver (kernel/fs/ext4/).
+$(BUILD_DIR)/fs/ext4/%.o: $(KERNEL_DIR)/fs/ext4/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# The NTFS driver (kernel/fs/ntfs/).
+$(BUILD_DIR)/fs/ntfs/%.o: $(KERNEL_DIR)/fs/ntfs/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# The exFAT driver (kernel/fs/exfat/).
+$(BUILD_DIR)/fs/exfat/%.o: $(KERNEL_DIR)/fs/exfat/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/isofs.o: $(KERNEL_DIR)/fs/isofs.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/usb.o: $(KERNEL_DIR)/dev/usb/usb.c | $(BUILD_DIR)
@@ -1521,6 +1569,9 @@ $(BUILD_DIR)/futex.o: $(KERNEL_DIR)/ke/futex.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/cred.o: $(KERNEL_DIR)/ke/cred.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/task_path.o: $(KERNEL_DIR)/ke/task_path.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # Build userland C library
@@ -1845,6 +1896,13 @@ $(BUILD_DIR)/disktest: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/mounttest: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/mounttest
 	cp $(USER_DIR)/tests/mounttest $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# pathtest: path names up to PATH_MAX (4095 bytes) in work directories made
+# in the directories named on its command line (see the source).
+$(BUILD_DIR)/pathtest: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) tests/pathtest
+	cp $(USER_DIR)/tests/pathtest $@
 	$(USER_STRIP) --strip-unneeded $@
 
 # usbhotplug: watches /sys/block for USB storage coming and going; --io
@@ -2327,6 +2385,32 @@ $(addprefix $(BUILD_DIR)/,$(DOSFSTOOLS_PROGS)): ports-dosfstools | $(BUILD_DIR)
 	cp ports/dosfstools-4.2/build/$(notdir $@) $@
 	$(USER_STRIP) --strip-unneeded $@
 
+# exfatprogs: exFAT file systems (SD cards, USB drives) -- mkfs.exfat,
+# fsck.exfat, exfatlabel and tune.exfat.  libblkid (ports-disktools
+# builds it first) is linked into mkfs.exfat as a static
+# archive, the release's libexfat into every tool.
+.PHONY: ports-exfatprogs
+ports-exfatprogs: userland-libc userland-rtld ports-disktools
+	$(MAKE) -C ports/exfatprogs-1.4.5 -f Makefile.likeos
+
+EXFATPROGS_PROGS = mkfs.exfat fsck.exfat exfatlabel tune.exfat
+$(addprefix $(BUILD_DIR)/,$(EXFATPROGS_PROGS)): ports-exfatprogs | $(BUILD_DIR)
+	cp ports/exfatprogs-1.4.5/build/$(notdir $@) $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# ntfsprogs from ntfs-3g: NTFS file systems -- mkntfs (mkfs.ntfs), ntfsfix,
+# ntfslabel and ntfsinfo.  libntfs-3g is a static archive linked into each
+# tool; the FUSE driver and its mount helper are not built.  libuuid
+# (ports-disktools) gives mkntfs its volume GUIDs.
+.PHONY: ports-ntfsprogs
+ports-ntfsprogs: userland-libc userland-rtld ports-disktools
+	$(MAKE) -C ports/ntfs-3g-2026.9.28 -f Makefile.likeos
+
+NTFSPROGS_PROGS = mkntfs ntfsfix ntfslabel ntfsinfo
+$(addprefix $(BUILD_DIR)/,$(NTFSPROGS_PROGS)): ports-ntfsprogs | $(BUILD_DIR)
+	cp ports/ntfs-3g-2026.9.28/build/$(notdir $@) $@
+	$(USER_STRIP) --strip-unneeded $@
+
 # nvme-cli: the `nvme' program -- list, id-ctrl/id-ns, smart-log, error-log,
 # fw-log/fw-download/fw-commit, get/set-feature, format, sanitize, self-test,
 # ns management, zns, reservations, telemetry and the vendor plugins -- on
@@ -2678,6 +2762,13 @@ $(BUILD_DIR)/likeos-display-settings: user/bin/shell/display-settings.c $(GTK3_S
 		-o $@ $< $(GTK3_BAR_LIBS) \
 		$$(LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
 		   ports/xorg/toolchain/likeos-pkg-config --libs xrandr)
+
+# The question before a drive's journal is replayed: GTK3 only.  The volume
+# agent and Explorer run it when devd refuses a mount with EUCLEAN.
+$(BUILD_DIR)/likeos-journal-prompt: user/bin/shell/journal-prompt.c $(GTK3_SENTINEL) | $(BUILD_DIR)
+	LIKEOS_SYSROOT=$(CURDIR)/$(XORG_SYSROOT) \
+	ports/xorg/toolchain/likeos-cc $(GTK3_BAR_CFLAGS) -Wall -Wextra \
+		-o $@ $< $(GTK3_BAR_LIBS)
 
 # The Settings window: the cards that open each area's settings.
 $(BUILD_DIR)/likeos-settings: user/bin/shell/settings.c $(KBDCONF_SRC) $(GTK3_SENTINEL) | $(BUILD_DIR)
@@ -3047,6 +3138,9 @@ $(EXT4_STAGING_STAMP): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER
 	# The session's volume agent (xinitrc starts it): mounts USB drives
 	# through devd and plays the device sounds.
 	cp $(BUILD_DIR)/likeos-volume-agent $(EXT4_STAGING)/usr/bin/likeos-volume-agent
+	# The question before a drive's journal is replayed, which the volume
+	# agent and Explorer run.
+	cp $(BUILD_DIR)/likeos-journal-prompt $(EXT4_STAGING)/usr/bin/likeos-journal-prompt
 	# Display settings: the dialog -> /usr/bin (the desktop menu starts it,
 	# xinitrc runs it with --restore), its setuid-root helper ->
 	# /usr/libexec, and /etc/likeos, where the helper saves the setting.
@@ -3138,6 +3232,7 @@ $(EXT4_STAGING_STAMP): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER
 	cp $(BUILD_DIR)/apload        $(EXT4_STAGING)/usr/local/bin/apload
 	cp $(BUILD_DIR)/disktest      $(EXT4_STAGING)/usr/local/bin/disktest
 	cp $(BUILD_DIR)/mounttest     $(EXT4_STAGING)/usr/local/bin/mounttest
+	cp $(BUILD_DIR)/pathtest      $(EXT4_STAGING)/usr/local/bin/pathtest
 	cp $(BUILD_DIR)/usbhotplug    $(EXT4_STAGING)/usr/local/bin/usbhotplug
 	cp user/bin/tests/apnews-urls.txt $(EXT4_STAGING)/usr/local/bin/apnews-urls.txt
 	# Shebang smoke-test script (mode 755 propagates via fakeroot mkfs -d)
@@ -3622,6 +3717,8 @@ distclean: clean
 	$(MAKE) -C ports/nvme-cli-2.16 -f Makefile.likeos distclean
 	$(MAKE) -C ports/e2fsprogs-1.47.4 -f Makefile.likeos distclean
 	$(MAKE) -C ports/dosfstools-4.2 -f Makefile.likeos distclean
+	$(MAKE) -C ports/exfatprogs-1.4.5 -f Makefile.likeos distclean
+	$(MAKE) -C ports/ntfs-3g-2026.9.28 -f Makefile.likeos distclean
 	$(MAKE) -C ports/netcat-OpenBSD -f Makefile.likeos clean
 	$(MAKE) -C ports/openssl-3.5.6 -f Makefile.likeos clean
 	$(MAKE) -C ports/curl-8.14.1 -f Makefile.likeos clean
@@ -3692,6 +3789,31 @@ openssh-manpages:
 			| col -bx | $(MANPAGE_FIXUP) > res/man/$$base.1; \
 		echo "  res/man/$$base.1 ($$(wc -l < res/man/$$base.1) lines)"; \
 	done
+
+# Render the exFAT and NTFS tools' manual pages (exfatprogs, ntfsprogs) into
+# res/man, from the ports' own troff sources.  A maintenance target like
+# openssh-manpages: the rendered pages are checked in, groff is not a build
+# dependency.  Requires ./unpack.sh in both ports first.  The ntfsprogs
+# pages are templates (*.8.in) that carry the release version; mkfs.ntfs.1
+# is the page of the name mkntfs is also installed under.
+EXFATPROGS_MANPAGES = mkfs.exfat fsck.exfat exfatlabel tune.exfat
+NTFSPROGS_MANPAGES = mkntfs ntfsfix ntfslabel ntfsinfo
+.PHONY: fstools-manpages
+fstools-manpages:
+	@for p in $(EXFATPROGS_MANPAGES); do \
+		GROFF_NO_SGR=1 groff -t -e -mandoc -Tascii -rLL=78n -rLT=78n \
+			ports/exfatprogs-1.4.5/src/manpages/$$p.8 \
+			| col -bx > res/man/$$p.1; \
+		echo "  res/man/$$p.1 ($$(wc -l < res/man/$$p.1) lines)"; \
+	done
+	@for p in $(NTFSPROGS_MANPAGES); do \
+		sed 's/@VERSION@/2026.9.28/g' \
+			ports/ntfs-3g-2026.9.28/src/ntfsprogs/$$p.8.in \
+			| GROFF_NO_SGR=1 groff -t -e -mandoc -Tascii -rLL=78n \
+				-rLT=78n | col -bx > res/man/$$p.1; \
+		echo "  res/man/$$p.1 ($$(wc -l < res/man/$$p.1) lines)"; \
+	done
+	cp res/man/mkntfs.1 res/man/mkfs.ntfs.1
 
 # The naming rule, checked rather than remembered.
 #
@@ -4119,3 +4241,4 @@ include user/bin/installer/installer.mk
 # not exist yet belongs to an object that is going to be compiled anyway.
 -include $(wildcard $(BUILD_DIR)/*.d)
 -include $(wildcard $(BUILD_DIR)/acpica/*/*.d)
+-include $(wildcard $(BUILD_DIR)/fs/*/*.d)

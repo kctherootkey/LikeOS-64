@@ -161,23 +161,28 @@ int copy_user_string(const char *user_str, size_t max_len,
 	return 0;
 }
 
-// Helper: Copy user path string directly into fixed kernel buffer (no allocation)
-// Returns 0 on success, negative error on failure
+// Helper: Copy a user path string into a kernel buffer of `kbuf_size' bytes
+// (a path buffer, PATHBUF_SIZE), terminating NUL included: a path of up to
+// kbuf_size - 1 bytes fits.  No allocation.  0, -EFAULT, or -ENAMETOOLONG
+// for a string that does not fit.
 int copy_user_path(const char *user_path, char *kbuf, size_t kbuf_size)
 {
-	if (!user_path || !kbuf || kbuf_size < 2) {
+	if (!kbuf || kbuf_size < 2) {
 		return -EINVAL;
 	}
-	char *kstr = NULL;
+	if (!user_path)
+		return -EFAULT;
 	size_t len = 0;
-	int ret = copy_user_string(user_path, kbuf_size - 1, &kstr, &len);
-	if (ret != 0) {
+	int ret = user_strnlen(user_path, kbuf_size, &len);
+	if (ret == -EINVAL)
+		return -ENAMETOOLONG; /* no NUL in the first kbuf_size bytes */
+	if (ret != 0)
 		return ret;
-	}
-	for (size_t i = 0; i <= len; i++) {
-		kbuf[i] = kstr[i];
-	}
-	kfree(kstr);
+	if (len >= kbuf_size)
+		return -ENAMETOOLONG;
+	if (copy_from_user(kbuf, user_path, len) != 0)
+		return -EFAULT;
+	kbuf[len] = '\0';
 	return 0;
 }
 
@@ -192,11 +197,10 @@ void free_user_string_array(char **arr)
 	kfree(arr);
 }
 
-int copy_user_string_array(const char *const *user_arr, size_t max_count,
-			   size_t max_str_len, size_t max_total_bytes,
-			   char ***out_arr)
+int copy_user_string_array(const char *const *user_arr, size_t *count_left,
+			   size_t *bytes_left, char ***out_arr)
 {
-	if (!out_arr) {
+	if (!out_arr || !count_left || !bytes_left) {
 		return -EFAULT;
 	}
 	*out_arr = NULL;
@@ -205,49 +209,67 @@ int copy_user_string_array(const char *const *user_arr, size_t max_count,
 		return 0;
 	}
 
-	if (!validate_user_ptr((uint64_t)user_arr, sizeof(uint64_t))) {
-		return -EFAULT;
+	/* How many entries: the pointers up to the NULL, no more than the
+	 * budget allows (a longer array is E2BIG before anything is
+	 * allocated for it).  Element i is read only once its own address is
+	 * known to be user memory: copy_from_user checks it first. */
+	size_t n = 0;
+	for (;;) {
+		const char *user_str;
+
+		if (copy_from_user(&user_str, &user_arr[n], sizeof(user_str)))
+			return -EFAULT;
+		if (!user_str)
+			break;
+		if (n >= *count_left)
+			return -E2BIG;
+		n++;
 	}
 
-	char **karr = (char **)kalloc((max_count + 1) * sizeof(char *));
+	char **karr = (char **)kalloc((n + 1) * sizeof(char *));
 	if (!karr) {
 		return -ENOMEM;
 	}
-	mm_memset(karr, 0, (max_count + 1) * sizeof(char *));
+	mm_memset(karr, 0, (n + 1) * sizeof(char *));
 
-	size_t total = 0;
-	for (size_t i = 0; i < max_count; i++) {
-		/* Element i is read only once its own address is known to be
-		 * user memory: copy_from_user checks it (and the task) first. */
+	size_t bytes = *bytes_left;
+	size_t i;
+	for (i = 0; i < n; i++) {
 		const char *user_str;
 		if (copy_from_user(&user_str, &user_arr[i], sizeof(user_str))) {
 			free_user_string_array(karr);
 			return -EFAULT;
 		}
-		if (!user_str) {
-			karr[i] = NULL;
-			*out_arr = karr;
-			return 0;
-		}
+		if (!user_str)
+			break; /* shortened meanwhile: it ends here */
 
-		char *kstr = NULL;
+		/* The NUL has to come within what is left of the budget. */
 		size_t len = 0;
-		int ret = copy_user_string(user_str, max_str_len, &kstr, &len);
+		int ret = user_strnlen(user_str, bytes, &len);
+		if (ret == -EINVAL || (ret == 0 && len + 1 > bytes)) {
+			free_user_string_array(karr);
+			return -E2BIG;
+		}
 		if (ret != 0) {
 			free_user_string_array(karr);
 			return ret;
 		}
-
-		total += len + 1;
-		if (total > max_total_bytes) {
+		char *kstr = (char *)kalloc(len + 1);
+		if (!kstr) {
+			free_user_string_array(karr);
+			return -ENOMEM;
+		}
+		if (copy_from_user(kstr, user_str, len) != 0) {
 			kfree(kstr);
 			free_user_string_array(karr);
-			return -EINVAL;
+			return -EFAULT;
 		}
-
+		kstr[len] = '\0';
 		karr[i] = kstr;
+		bytes -= len + 1;
 	}
-
-	free_user_string_array(karr);
-	return -EINVAL; // Too many entries
+	*count_left -= i;
+	*bytes_left = bytes;
+	*out_arr = karr;
+	return 0;
 }

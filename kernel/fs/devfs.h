@@ -34,6 +34,8 @@ int devfs_fpath(vfs_file_t *f, char *out, size_t cap);
 int devfs_is_devfile(vfs_file_t *f);
 int devfs_file_is_blk(vfs_file_t *f); // a block-device node (kernel/fs/device.h)
 int devfs_is_fb0(vfs_file_t *f);
+/* /dev/zero: a mapping of it is zero-filled anonymous memory. */
+int devfs_is_zero(vfs_file_t *f);
 /* POSIX shared memory object behind a /dev/shm handle, or NULL. */
 struct shm_object *devfs_shm_object(vfs_file_t *f);
 /* memfd seals: add==0 reads into *out, add!=0 ORs seals in. */

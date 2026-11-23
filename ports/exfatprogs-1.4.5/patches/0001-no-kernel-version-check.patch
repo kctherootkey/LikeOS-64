@@ -1,0 +1,45 @@
+exfat_get_blk_dev_info() refuses to run unless the release uname() reports
+is at least 2.6, the kernel version from which on the /sys/dev/block
+attributes it reads exist.  On LikeOS that release is the LikeOS version
+("0.2.9"), which would refuse every device; LikeOS provides those
+attributes (start, partition, removable, device, slaves, alignment_offset),
+so the version test is skipped.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/lib/libexfat.c	2026-11-18 06:45:02.318037872 +0100
++++ b/lib/libexfat.c	2026-11-20 15:59:03.118430929 +0100
+@@ -462,6 +462,7 @@
+ 	return ret;
+ }
+ 
++#ifndef __LIKEOS__
+ static int exfat_cmp_kernel_ver(const unsigned short *req)
+ {
+ 	struct utsname uts;
+@@ -476,6 +477,7 @@
+ 	ret = exfat_cmp_swver(req, parsed);
+ 	return ret > 0 ? 1 : 0;
+ }
++#endif
+ 
+ int exfat_get_blk_dev_info(struct exfat_user_input *ui,
+ 		struct exfat_blk_dev *bd)
+@@ -492,6 +494,7 @@
+ 	 * characteristics of the target block device. As exFAT is developed in 2010's, we can enjoy
+ 	 * the luxury of the relatively recent sysfs interfaces at our disposal.
+ 	 */
++#ifndef __LIKEOS__
+ 	switch (exfat_cmp_kernel_ver(MIN_KERNEL_VER)) {
+ 	case -1:
+ 		exfat_err("failed to get kernel version.\n");
+@@ -500,6 +503,9 @@
+ 		exfat_err("pre-2.6 kernel version not supported\n");
+ 		return -1;
+ 	}
++#else
++	(void)MIN_KERNEL_VER;
++#endif
+ 
+ 	/*
+ 	 * Neat trick: the extra one character is for causing open() to

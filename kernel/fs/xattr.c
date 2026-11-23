@@ -9,6 +9,7 @@
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/file.h>
 #include <kernel/fs/namei.h>
+#include <kernel/fs/pathbuf.h>
 
 static int64_t fsetxattr_held(task_t *cur, vfs_file_t *f, uint64_t u_name, uint64_t u_val, uint64_t size, uint64_t flags);
 static int64_t fgetxattr_held(task_t *cur, vfs_file_t *f, uint64_t u_name, uint64_t u_val, uint64_t size);
@@ -66,20 +67,12 @@ static int xattr_ns_perm(task_t *cur, const char *name, uint32_t owner_uid)
 /* The syscall ABI here passes at most 5 args, so setxattr's nofollow is carried
  * in a private high bit of `flags` (libc's lsetxattr sets it). */
 #define XATTR_SYS_NOFOLLOW 0x40000000
-int64_t sys_setxattr(uint64_t u_path, uint64_t u_name, uint64_t u_val,
-		     uint64_t size, uint64_t flags)
+static int64_t setxattr_path(task_t *cur, const char *kpath, uint64_t u_name,
+			     uint64_t u_val, uint64_t size, uint64_t flags,
+			     int nofollow)
 {
-	int nofollow = (flags & XATTR_SYS_NOFOLLOW) ? 1 : 0;
-	flags &= ~(uint64_t)XATTR_SYS_NOFOLLOW;
-	task_t *cur = sched_current();
-	if (!cur)
-		return -EFAULT;
-	char kpath[VFS_MAX_PATH];
-	int c = copy_user_path((const char *)u_path, kpath, sizeof(kpath));
-	if (c)
-		return c;
 	char kname[256];
-	c = xattr_copy_name(u_name, kname);
+	int c = xattr_copy_name(u_name, kname);
 	if (c)
 		return c;
 	if (size > XATTR_MAX_VALUE)
@@ -125,18 +118,11 @@ int64_t sys_setxattr(uint64_t u_path, uint64_t u_name, uint64_t u_val,
 	return (r >= 0) ? 0 : vfs_status_to_errno(r);
 }
 
-int64_t sys_getxattr(uint64_t u_path, uint64_t u_name, uint64_t u_val,
-		     uint64_t size, uint64_t nofollow)
+static int64_t getxattr_path(task_t *cur, const char *kpath, uint64_t u_name,
+			     uint64_t u_val, uint64_t size, uint64_t nofollow)
 {
-	task_t *cur = sched_current();
-	if (!cur)
-		return -EFAULT;
-	char kpath[VFS_MAX_PATH];
-	int c = copy_user_path((const char *)u_path, kpath, sizeof(kpath));
-	if (c)
-		return c;
 	char kname[256];
-	c = xattr_copy_name(u_name, kname);
+	int c = xattr_copy_name(u_name, kname);
 	if (c)
 		return c;
 	if (cur->cred.euid != 0) {
@@ -161,16 +147,9 @@ int64_t sys_getxattr(uint64_t u_path, uint64_t u_name, uint64_t u_val,
 	return (r >= 0) ? r : vfs_status_to_errno(r);
 }
 
-int64_t sys_listxattr(uint64_t u_path, uint64_t u_list, uint64_t size,
-		      uint64_t nofollow)
+static int64_t listxattr_path(task_t *cur, const char *kpath, uint64_t u_list,
+			      uint64_t size, uint64_t nofollow)
 {
-	task_t *cur = sched_current();
-	if (!cur)
-		return -EFAULT;
-	char kpath[VFS_MAX_PATH];
-	int c = copy_user_path((const char *)u_path, kpath, sizeof(kpath));
-	if (c)
-		return c;
 	if (cur->cred.euid != 0) {
 		int tr = perm_traverse(kpath);
 		if (tr < 0)
@@ -193,18 +172,11 @@ int64_t sys_listxattr(uint64_t u_path, uint64_t u_list, uint64_t size,
 	return (r >= 0) ? r : vfs_status_to_errno(r);
 }
 
-int64_t sys_removexattr(uint64_t u_path, uint64_t u_name,
-			uint64_t nofollow)
+static int64_t removexattr_path(task_t *cur, const char *kpath,
+				uint64_t u_name, uint64_t nofollow)
 {
-	task_t *cur = sched_current();
-	if (!cur)
-		return -EFAULT;
-	char kpath[VFS_MAX_PATH];
-	int c = copy_user_path((const char *)u_path, kpath, sizeof(kpath));
-	if (c)
-		return c;
 	char kname[256];
-	c = xattr_copy_name(u_name, kname);
+	int c = xattr_copy_name(u_name, kname);
 	if (c)
 		return c;
 	if (cur->cred.euid != 0) {
@@ -225,6 +197,70 @@ int64_t sys_removexattr(uint64_t u_path, uint64_t u_name,
 	}
 	int r = vfs_removexattr(kpath, (int)nofollow, kname);
 	return (r >= 0) ? 0 : vfs_status_to_errno(r);
+}
+
+/* The path syscalls: the path made absolute against the caller's working
+ * directory (and root) in a path buffer, then the operation on it. */
+int64_t sys_setxattr(uint64_t u_path, uint64_t u_name, uint64_t u_val,
+		     uint64_t size, uint64_t flags)
+{
+	int nofollow = (flags & XATTR_SYS_NOFOLLOW) ? 1 : 0;
+	flags &= ~(uint64_t)XATTR_SYS_NOFOLLOW;
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+	char *kpath;
+	int64_t r = user_path_get_canon(u_path, &kpath);
+	if (r)
+		return r;
+	r = setxattr_path(cur, kpath, u_name, u_val, size, flags, nofollow);
+	pathbuf_put(kpath);
+	return r;
+}
+
+int64_t sys_getxattr(uint64_t u_path, uint64_t u_name, uint64_t u_val,
+		     uint64_t size, uint64_t nofollow)
+{
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+	char *kpath;
+	int64_t r = user_path_get_canon(u_path, &kpath);
+	if (r)
+		return r;
+	r = getxattr_path(cur, kpath, u_name, u_val, size, nofollow);
+	pathbuf_put(kpath);
+	return r;
+}
+
+int64_t sys_listxattr(uint64_t u_path, uint64_t u_list, uint64_t size,
+		      uint64_t nofollow)
+{
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+	char *kpath;
+	int64_t r = user_path_get_canon(u_path, &kpath);
+	if (r)
+		return r;
+	r = listxattr_path(cur, kpath, u_list, size, nofollow);
+	pathbuf_put(kpath);
+	return r;
+}
+
+int64_t sys_removexattr(uint64_t u_path, uint64_t u_name,
+			uint64_t nofollow)
+{
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+	char *kpath;
+	int64_t r = user_path_get_canon(u_path, &kpath);
+	if (r)
+		return r;
+	r = removexattr_path(cur, kpath, u_name, nofollow);
+	pathbuf_put(kpath);
+	return r;
 }
 
 int64_t sys_fsetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,

@@ -26,6 +26,7 @@
 #include "services/ex-settings.h"
 #include "services/ex-undo.h"
 
+#include <signal.h>
 #include <string.h>
 
 /* The view switch at the right of the status bar. */
@@ -875,7 +876,7 @@ static void set_search_hint(ExTab *t, ExLocation *loc)
 	g_free(name);
 }
 
-/* ---- a USB drive not opened yet -------------------------------------------------- */
+/* ---- a drive not opened yet (USB, CD/DVD, a built-in disk's partition) ---------- */
 
 static gboolean go_device_folder(gpointer data)
 {
@@ -905,7 +906,143 @@ typedef struct {
 	ExTab *t;
 	GCancellable *cancel; /* the tab's, for this place */
 	char *device;
+	gboolean recover; /* mounted with the journal replayed */
+	GPid prompt; /* the journal question on the screen, or 0 */
+	gulong cancel_id;
 } MountReq;
+
+/* Asks whether a drive's journal may be replayed (exit status 0: yes). */
+#define JOURNAL_PROMPT "/usr/bin/likeos-journal-prompt"
+
+static void device_mounted(GObject *src, GAsyncResult *res, gpointer data);
+
+/* What a failed mount is remembered by: the device and its medium, so
+ * that another disc or card in the same drive is tried again. */
+static char *medium_key(const char *device, const ExVolume *v)
+{
+	return g_strdup_printf("%s|%s|%" G_GUINT64_FORMAT, device,
+			       v ? v->uuid : "", v ? v->capacity : 0);
+}
+
+static void mount_req_free(MountReq *m)
+{
+	g_object_unref(m->cancel);
+	g_free(m->device);
+	g_free(m);
+}
+
+/* The tab left the drive while the question was on the screen: it goes. */
+static void prompt_cancelled(GCancellable *cancel, gpointer data)
+{
+	MountReq *m = data;
+
+	if (m->prompt > 0)
+		kill(m->prompt, SIGTERM);
+}
+
+static void prompt_answered(GPid pid, gint status, gpointer data)
+{
+	MountReq *m = data;
+	gboolean yes = g_spawn_check_wait_status(status, NULL);
+
+	g_spawn_close_pid(pid);
+	m->prompt = 0;
+	/* not from inside the cancellable's own handler: disconnecting there
+	 * would wait for itself */
+	g_cancellable_disconnect(m->cancel, m->cancel_id);
+	m->cancel_id = 0;
+	if (g_cancellable_is_cancelled(m->cancel)) {
+		mount_req_free(m);
+		return;
+	}
+	if (yes) {
+		/* the same as a mount, the journal replayed first */
+		m->recover = TRUE;
+		ex_devd_mount_recover_async(ex_devd_get_default(), m->device,
+					    m->cancel, device_mounted, m);
+		return;
+	}
+	{
+		ExTab *t = m->t;
+		const ExVolume *v = ex_volumes_find_device(
+			ex_volumes_get_default(), m->device);
+		char *msg = g_strdup_printf(
+			"%s was not opened, because its journal was not "
+			"replayed.",
+			v ? v->name : EX_USB_DRIVE_NAME);
+
+		t->mounting = FALSE;
+		g_free(t->mount_failed);
+		t->mount_failed = medium_key(m->device, v);
+		show_note(t, v ? v->icon_name : "dialog-warning", msg, NULL,
+			  FALSE);
+		g_free(msg);
+	}
+	mount_req_free(m);
+}
+
+/* The drive's journal must be replayed before it is opened: the user is
+ * asked, in a program of its own, with what the drive is.  TRUE when the
+ * question is on the screen; `m' is then the question's. */
+static gboolean ask_replay(MountReq *m)
+{
+	const ExVolume *v = ex_volumes_find_device(ex_volumes_get_default(),
+						   m->device);
+	const ExDevdDevice *dev;
+	GPtrArray *argv;
+	GError *e = NULL;
+	char *size = NULL, *drive = NULL;
+	gboolean ok;
+
+	if (!v || !v->fs_type || !*v->fs_type)
+		return FALSE;
+	/* the drive's name: the volume's own line carries its disk's */
+	dev = ex_devd_find(ex_devd_get_default(), m->device);
+	if (!dev || (!*dev->model && v->disk))
+		dev = ex_devd_find(ex_devd_get_default(), v->disk);
+	if (dev && *dev->model)
+		drive = *dev->vendor && g_ascii_strncasecmp(dev->model, dev->vendor,
+							    strlen(dev->vendor)) ?
+				g_strdup_printf("%s %s", dev->vendor, dev->model) :
+				g_strdup(dev->model);
+
+	argv = g_ptr_array_new();
+	g_ptr_array_add(argv, (gpointer)JOURNAL_PROMPT);
+	g_ptr_array_add(argv, (gpointer) "--device");
+	g_ptr_array_add(argv, m->device);
+	g_ptr_array_add(argv, (gpointer) "--fstype");
+	g_ptr_array_add(argv, v->fs_type);
+	if (v->label && *v->label) {
+		g_ptr_array_add(argv, (gpointer) "--label");
+		g_ptr_array_add(argv, v->label);
+	}
+	if (v->capacity) {
+		size = g_strdup_printf("%" G_GUINT64_FORMAT, v->capacity);
+		g_ptr_array_add(argv, (gpointer) "--size");
+		g_ptr_array_add(argv, size);
+	}
+	if (drive) {
+		g_ptr_array_add(argv, (gpointer) "--drive");
+		g_ptr_array_add(argv, drive);
+	}
+	g_ptr_array_add(argv, NULL);
+	ok = g_spawn_async(NULL, (char **)argv->pdata, NULL,
+			   G_SPAWN_DO_NOT_REAP_CHILD, NULL, NULL, &m->prompt, &e);
+	g_ptr_array_free(argv, TRUE);
+	g_free(size);
+	g_free(drive);
+	if (!ok) {
+		g_warning("%s: %s", JOURNAL_PROMPT, e->message);
+		g_error_free(e);
+		m->prompt = 0;
+		return FALSE;
+	}
+	g_child_watch_add(m->prompt, prompt_answered, m);
+	m->cancel_id = g_cancellable_connect(m->cancel,
+					     G_CALLBACK(prompt_cancelled), m,
+					     NULL);
+	return TRUE;
+}
 
 static void device_mounted(GObject *src, GAsyncResult *res, gpointer data)
 {
@@ -913,6 +1050,14 @@ static void device_mounted(GObject *src, GAsyncResult *res, gpointer data)
 	GError *e = NULL;
 	char *path = ex_devd_mount_finish(EX_DEVD(src), res, &e);
 
+	/* Not replayed behind the user's back: asked first.  The tab stays
+	 * "Opening…" (and mounting) while the question is open. */
+	if (!path && !m->recover && !g_cancellable_is_cancelled(m->cancel) &&
+	    g_error_matches(e, EX_DEVD_ERROR, EX_DEVD_ERROR_UNCLEAN) &&
+	    ask_replay(m)) {
+		g_clear_error(&e);
+		return;
+	}
 	if (!g_cancellable_is_cancelled(m->cancel)) {
 		ExTab *t = m->t;
 
@@ -930,16 +1075,14 @@ static void device_mounted(GObject *src, GAsyncResult *res, gpointer data)
 						    e->message);
 
 			g_free(t->mount_failed);
-			t->mount_failed = g_strdup(m->device);
+			t->mount_failed = medium_key(m->device, v);
 			show_message(t, msg);
 			g_free(msg);
 		}
 	}
 	g_clear_error(&e);
 	g_free(path);
-	g_object_unref(m->cancel);
-	g_free(m->device);
-	g_free(m);
+	mount_req_free(m);
 }
 
 /* Opening a drive: its folder when it is mounted, else mounted first; a
@@ -956,8 +1099,15 @@ static void load_device(ExTab *t)
 
 	if (t->mounting || t->device_to)
 		return;
-	if (t->mount_failed && strcmp(t->mount_failed, dev) == 0)
-		return;
+	if (t->mount_failed) {
+		char *key = medium_key(dev, v);
+		gboolean same = strcmp(t->mount_failed, key) == 0;
+
+		g_free(key);
+		if (same)
+			return;
+		g_clear_pointer(&t->mount_failed, g_free);
+	}
 	if (!v) {
 		show_message(t, ex_devd_is_connected(devd) ?
 					"This drive is no longer connected." :
@@ -967,6 +1117,14 @@ static void load_device(ExTab *t)
 	}
 	if (v->root) {
 		open_device_folder(t, v->root);
+		return;
+	}
+	if (ex_volume_no_disc(v)) {
+		msg = g_strdup_printf("There is no disc in %s. Insert one to "
+				      "open it.",
+				      v->name);
+		show_note(t, v->icon_name, msg, NULL, FALSE);
+		g_free(msg);
 		return;
 	}
 	if (strcmp(v->state, "formatting") == 0) {
@@ -986,7 +1144,11 @@ static void load_device(ExTab *t)
 			      g_strdup_printf("%s uses a file system LikeOS "
 					      "can't open (%s).",
 					      v->name, fs);
-		show_note(t, "dialog-warning", msg, ex_location_id(loc), FALSE);
+		/* Format… only where formatting is possible: a USB drive
+		 * that is not write-protected. */
+		show_note(t, "dialog-warning", msg,
+			  ex_volume_can_format(v) ? ex_location_id(loc) : NULL,
+			  FALSE);
 		g_free(msg);
 		g_free(fs);
 		return;

@@ -22,6 +22,7 @@ typedef struct {
 	GtkWidget *bar, *status, *start, *close;
 	GtkWidget *label_note; /* why the label does not suit, under it */
 	ExDevdFormat *job; /* while formatting */
+	guint pulse_id; /* the bar moves while mkfs runs */
 	gboolean filling; /* the combos are being refilled */
 	gboolean present; /* the drive is there */
 } Fmt;
@@ -29,8 +30,17 @@ typedef struct {
 /* The open windows, by device. */
 static GHashTable *g_open;
 
+static void pulse_stop(Fmt *f)
+{
+	if (f->pulse_id) {
+		g_source_remove(f->pulse_id);
+		f->pulse_id = 0;
+	}
+}
+
 static void fmt_free(Fmt *f)
 {
+	pulse_stop(f);
 	if (f->job) {
 		/* The window went with its parent while formatting: the job
 		 * finishes on its own, unwatched. */
@@ -110,43 +120,85 @@ static const ExDevdFs *chosen_fs(Fmt *f)
 }
 
 /* The label as long as the file system allows, cut at a character. */
-static void clip_label(Fmt *f, guint max)
+/* exFAT and NTFS store the label in UTF-16, so their limit counts UTF-16
+ * code units (a character beyond U+FFFF takes two); the other file systems
+ * store bytes. */
+static gboolean label_in_utf16(const ExDevdFs *fs)
+{
+	return fs && (strcmp(fs->id, "exfat") == 0 || strcmp(fs->id, "ntfs") == 0);
+}
+
+/* The length of the first `n' bytes of `s' (valid UTF-8) the way `fs'
+ * counts it. */
+static gsize label_len(const ExDevdFs *fs, const char *s, gsize n)
+{
+	gsize units = 0;
+	const char *p = s, *end = s + n;
+
+	if (!label_in_utf16(fs))
+		return n;
+	while (p < end && *p) {
+		gunichar c = g_utf8_get_char(p);
+
+		units += c > 0xFFFF ? 2 : 1;
+		p = g_utf8_next_char(p);
+	}
+	return units;
+}
+
+/* The longest prefix of `s' (whole characters) that keeps `used' + its
+ * length within `max'; returns its byte length. */
+static gsize label_fit(const ExDevdFs *fs, const char *s, gsize n, gsize used,
+		       gsize max)
+{
+	const char *p = s, *end = s + n;
+
+	while (p < end && *p) {
+		const char *next = g_utf8_next_char(p);
+
+		if (next > end ||
+		    used + label_len(fs, s, (gsize)(next - s)) > max)
+			break;
+		p = next;
+	}
+	return (gsize)(p - s);
+}
+
+static void clip_label(Fmt *f, const ExDevdFs *fs)
 {
 	const char *t = gtk_entry_get_text(GTK_ENTRY(f->label));
+	gsize n = strlen(t);
+	gsize max = fs ? fs->labelmax : 0;
 
-	if (strlen(t) > max) {
-		const char *end = t + max;
-		char *cut;
+	if (label_len(fs, t, n) > max) {
+		char *cut = g_strndup(t, label_fit(fs, t, n, 0, max));
 
-		while (end > t && (((guchar)*end) & 0xc0) == 0x80)
-			end--;
-		cut = g_strndup(t, (gsize)(end - t));
 		gtk_entry_set_text(GTK_ENTRY(f->label), cut);
 		g_free(cut);
 	}
 }
 
-/* Typing stops where the file system's label is full (counted in bytes,
- * as the file system stores it). */
+/* Typing stops where the file system's label is full (counted the way the
+ * file system stores it: bytes, or UTF-16 units for exFAT and NTFS). */
 static void label_insert(GtkEditable *e, const char *text, int len, int *pos,
 			 Fmt *f)
 {
 	const ExDevdFs *fs = chosen_fs(f);
-	gsize have = strlen(gtk_entry_get_text(GTK_ENTRY(e)));
+	const char *cur = gtk_entry_get_text(GTK_ENTRY(e));
 	gsize add = len < 0 ? strlen(text) : (gsize)len;
 	gsize max = fs ? fs->labelmax : 0;
-	gsize room = have >= max ? 0 : max - have;
-	const char *end;
+	gsize used = label_len(fs, cur, strlen(cur));
+	gsize keep;
 
-	if (add <= room)
+	if (!g_utf8_validate(text, (gssize)add, NULL))
+		return; /* GTK only inserts valid text; leave it to GTK */
+	if (used + label_len(fs, text, add) <= max)
 		return;
 	g_signal_stop_emission_by_name(e, "insert-text");
-	end = text + room;
-	while (end > text && (((guchar)*end) & 0xc0) == 0x80)
-		end--;
-	if (end > text) {
+	keep = used >= max ? 0 : label_fit(fs, text, add, used, max);
+	if (keep > 0) {
 		g_signal_handlers_block_by_func(e, label_insert, f);
-		gtk_editable_insert_text(e, text, (int)(end - text), pos);
+		gtk_editable_insert_text(e, text, (int)keep, pos);
 		g_signal_handlers_unblock_by_func(e, label_insert, f);
 	}
 	gtk_widget_error_bell(GTK_WIDGET(e));
@@ -187,7 +239,7 @@ static void fill_clusters(Fmt *f)
 				    g_strdup_printf("Up to %u characters", fs->labelmax) :
 				    g_strdup("This file system has no label");
 
-		clip_label(f, fs->labelmax);
+		clip_label(f, fs);
 		gtk_widget_set_tooltip_text(f->label, tip);
 		g_free(tip);
 	}
@@ -199,7 +251,7 @@ static const char *label_problem(const ExDevdFs *fs, const char *label)
 {
 	if (!fs || !*label)
 		return NULL;
-	if (strlen(label) > fs->labelmax)
+	if (label_len(fs, label, strlen(label)) > fs->labelmax)
 		return "The label is too long for this file system.";
 	if (strcmp(fs->id, "vfat") == 0) {
 		for (const guchar *c = (const guchar *)label; *c; c++) {
@@ -209,6 +261,18 @@ static const char *label_problem(const ExDevdFs *fs, const char *label)
 			if (strchr("\"*+,./:;<=>?[\\]|", *c))
 				return "A FAT32 label can't contain any of "
 				       "\" * + , . / : ; < = > ? [ \\ ] |";
+		}
+		return NULL;
+	}
+	if (label_in_utf16(fs)) {
+		/* exFAT and NTFS: no control characters and none of the
+		 * characters file names may not hold either. */
+		for (const guchar *c = (const guchar *)label; *c; c++) {
+			if (*c < 0x20 || *c == 0x7f)
+				return "A label can't contain control characters.";
+			if (strchr("\"*/:<>?\\|", *c))
+				return "A label can't contain any of "
+				       "\" * / : < > ? \\ |";
 		}
 		return NULL;
 	}
@@ -352,10 +416,31 @@ static void error_box(Fmt *f, const char *primary, const char *secondary)
 	gtk_widget_show(d);
 }
 
+static gboolean pulse_tick(gpointer data)
+{
+	Fmt *f = data;
+
+	gtk_progress_bar_pulse(GTK_PROGRESS_BAR(f->bar));
+	return G_SOURCE_CONTINUE;
+}
+
 static void job_progress(ExDevdFormat *job, int pct, Fmt *f)
 {
-	char *s = g_strdup_printf("Formatting… %d %%", pct);
+	char *s;
 
+	if (pct < 0) {
+		/* Writing the file system reports no progress: the bar
+		 * moves instead of standing at a number. */
+		gtk_label_set_text(GTK_LABEL(f->status),
+				   "Formatting… writing the file system");
+		gtk_progress_bar_set_pulse_step(GTK_PROGRESS_BAR(f->bar), 0.08);
+		gtk_progress_bar_pulse(GTK_PROGRESS_BAR(f->bar));
+		if (!f->pulse_id)
+			f->pulse_id = g_timeout_add(100, pulse_tick, f);
+		return;
+	}
+	pulse_stop(f);
+	s = g_strdup_printf("Formatting… %d %%", pct);
 	gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(f->bar), pct / 100.0);
 	gtk_label_set_text(GTK_LABEL(f->status), s);
 	g_free(s);
@@ -377,6 +462,7 @@ static void job_finished(ExDevdFormat *job, GError *e, Fmt *f)
 {
 	g_signal_handlers_disconnect_by_data(job, f);
 	g_clear_object(&f->job);
+	pulse_stop(f);
 	if (e) {
 		char *what = g_strdup_printf("%s could not be formatted", f->name);
 
@@ -519,7 +605,9 @@ void ex_format_dialog_show(ExWindow *w, const char *device)
 	char *title, *cap;
 	int r = 0;
 
-	if (!v)
+	/* USB drives only, and not write-protected ones: the service refuses
+	 * the others anyway. */
+	if (!ex_volume_can_format(v))
 		return;
 	if (!g_open)
 		g_open = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,

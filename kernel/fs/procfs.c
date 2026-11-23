@@ -8,6 +8,8 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/fs/pseudofs.h>
+#include <kernel/fs/pathbuf.h>
+#include <kernel/ke/task_path.h>
 #include <kernel/fs/chrdev.h>
 #include <kernel/mm/rwsem.h>
 #include <kernel/fs/vfs.h>
@@ -519,7 +521,18 @@ static struct pfs_node *fd_lookup(struct pfs_node *dir, const char *name)
 	struct pfs_node *n = pfs_node_new(dir->fs, dir, name, PFS_LINK);
 	if (!n)
 		return NULL;
-	fd_target(t, fd, n->link, sizeof(n->link));
+	/* The path a file was opened by is up to a whole path long. */
+	char *target = pathbuf_get();
+	if (!target) {
+		pfs_node_put(n);
+		return NULL;
+	}
+	fd_target(t, fd, target, PATHBUF_SIZE);
+	if (pfs_set_link(n, target) != ST_OK) {
+		pfs_node_put(n);
+		n = NULL;
+	}
+	pathbuf_put(target);
 	return n;
 }
 
@@ -573,19 +586,34 @@ static struct pfs_node *pid_lookup(struct pfs_node *dir, const char *name)
 		if (proc_may_access(t, ACCESS_READ_MEM) != 0)
 			return NULL;
 		n = pfs_node_new(dir->fs, dir, name, PFS_LINK);
+		/* Either is up to a whole path long: built in a path buffer
+		 * (the cwd copied out first -- the task may change it). */
+		char *target = n ? pathbuf_get() : NULL;
+		if (n && !target) {
+			pfs_node_put(n);
+			return NULL;
+		}
 		if (n && kstrcmp(name, "cwd") == 0) {
-			ksnprintf(n->link, sizeof(n->link), "%s",
-				  t->cwd[0] ? t->cwd : "/");
+			/* Another task's: a counted reference, so a chdir
+			 * or exit meanwhile cannot free it under us. */
+			struct task_path *cp = task_path_ref(t, TASK_PATH_CWD);
+			ksnprintf(target, PATHBUF_SIZE, "%s", cp ? cp->s : "/");
+			task_path_put(cp);
 		} else if (n) {
 			/* argv[0] is the best record of the image there is. */
 			size_t k = 0;
 			while (t->cmdline[k] && t->cmdline[k] != ' ' &&
-			       k < sizeof(n->link) - 1) {
-				n->link[k] = t->cmdline[k];
+			       k < PATHBUF_SIZE - 1) {
+				target[k] = t->cmdline[k];
 				k++;
 			}
-			n->link[k] = 0;
+			target[k] = 0;
 		}
+		if (n && pfs_set_link(n, target) != ST_OK) {
+			pfs_node_put(n);
+			n = NULL;
+		}
+		pathbuf_put(target);
 	} else if (kstrcmp(name, "cmdline") == 0) {
 		n = pfs_node_new(dir->fs, dir, name, PFS_FILE);
 		if (n)

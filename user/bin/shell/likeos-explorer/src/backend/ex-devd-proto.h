@@ -46,6 +46,9 @@ typedef enum {
 	EX_DEVD_ERROR_ROFS, /* EROFS */
 	EX_DEVD_ERROR_NOT_RUNNING, /* no service, or the connection was lost */
 	EX_DEVD_ERROR_PROTOCOL, /* an answer that breaks the protocol */
+	EX_DEVD_ERROR_UNCLEAN, /* EUCLEAN: the file system's journal must be
+				  replayed before it is mounted (ask the
+				  user, then mount with recovery) */
 } ExDevdErrorCode;
 
 /* The code for an error name ("EBUSY"). */
@@ -105,6 +108,11 @@ typedef struct {
 	gint64 mountuid; /* -1 when not mounted by the service */
 	gboolean ejected;
 	char *state; /* "ready", "busy", "formatting" */
+	/* Added later, at the end of the line; a service that does not send
+	 * them leaves them FALSE. */
+	gboolean readonly; /* write-protected or a disc: mounted read-only */
+	gboolean optical; /* a CD/DVD drive */
+	gboolean internal; /* a built-in disk: mount and unmount only */
 } ExDevdDevice;
 
 /* The device a DEV or EVENT line describes, from its pairs; NULL when the

@@ -10,6 +10,8 @@
 #include <kernel/fs/icache.h>
 #include <kernel/ke/uaccess.h>
 #include <kernel/fs/namei.h>
+#include <kernel/fs/pathbuf.h>
+#include <kernel/ke/task_path.h>
 
 // SYS_EXECVE - execute a new program, replacing current process image
 // This is the POSIX-compliant version that replaces the current task
@@ -50,19 +52,32 @@ int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 	char *kpath = NULL;
 	char **kargv = NULL;
 	char **kenvp = NULL;
+	struct task_path *new_exe = NULL; /* the executable's path, made early */
 
 	int ret = copy_user_string(user_path, VFS_MAX_PATH, &kpath, NULL);
 	if (ret != 0) {
-		return ret;
+		/* No NUL within a whole path: too long, not invalid. */
+		return ret == -EINVAL ? -ENAMETOOLONG : ret;
+	}
+	if (!kpath[0]) {
+		/* An empty path names no program (ENOENT), not the working
+		 * directory. */
+		kfree(kpath);
+		return -ENOENT;
 	}
 
-	ret = copy_user_string_array(user_argv, 128, 4096, 16384, &kargv);
+	/* argv and envp share one budget (EXEC_ARG_MAX, elf.h). */
+	size_t arg_count_left = EXEC_ARG_COUNT_MAX, arg_bytes_left = EXEC_ARG_MAX;
+
+	ret = copy_user_string_array(user_argv, &arg_count_left,
+				     &arg_bytes_left, &kargv);
 	if (ret != 0) {
 		kfree(kpath);
 		return ret;
 	}
 
-	ret = copy_user_string_array(user_envp, 128, 4096, 16384, &kenvp);
+	ret = copy_user_string_array(user_envp, &arg_count_left,
+				     &arg_bytes_left, &kenvp);
 	if (ret != 0) {
 		free_user_string_array(kargv);
 		kfree(kpath);
@@ -241,6 +256,30 @@ int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 					   __ATOMIC_SEQ_CST);
 	}
 
+	/* The executable's path for PTRACE_GETEXECPATH (set below, once the
+	 * old image is gone): made now, while ENOMEM can still be returned.
+	 * Absolute, against the working directory this exec started from.
+	 * A path that cannot be made canonical is left empty. */
+	{
+		task_t *cur = sched_current();
+		char *full = cur ? pathbuf_get() : NULL;
+
+		if (cur && !full) {
+			ret = -ENOMEM;
+			goto out_err;
+		}
+		if (cur && normalize_path(task_cwd(cur), kpath, full,
+					  PATHBUF_SIZE) == 0) {
+			new_exe = task_path_new(full);
+			if (!new_exe) {
+				pathbuf_put(full);
+				ret = -ENOMEM;
+				goto out_err;
+			}
+		}
+		pathbuf_put(full);
+	}
+
 	uint64_t new_stack_ptr = 0;
 	/* The handle passes to the loader here, whatever the outcome. */
 	vfs_file_t *load_file = xfile;
@@ -384,23 +423,10 @@ int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 			 * exec started from: a debugger that attaches later has
 			 * a different one, and a relative path would name a
 			 * different file (or none) by then. */
-			{
-				char full[256];
-				const char *base = (cur->cwd[0] != 0) ?
-							   cur->cwd :
-							   "/";
-
-				if (normalize_path(base, kpath, full,
-						   sizeof(full)) == 0) {
-					int i;
-
-					for (i = 0; i < 255 && full[i]; i++)
-						cur->exe_path[i] = full[i];
-					cur->exe_path[i] = '\0';
-				} else {
-					cur->exe_path[0] = '\0';
-				}
-			}
+			/* (Made before the image was replaced, when a
+			 * failure could still be reported: new_exe.) */
+			task_path_set(cur, TASK_PATH_EXE, new_exe);
+			new_exe = NULL;
 
 			if (cur->tracer_pid != 0)
 				task_ptrace_stop(cur, SIGTRAP,
@@ -467,6 +493,7 @@ int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 	free_user_string_array(kenvp);
 	free_user_string_array(kargv);
 	kfree(kpath);
+	task_path_put(new_exe); /* (NULL: the task took it) */
 
 	// Success! Jump to the new program
 	// We need to return to userspace at the new entry point with the new stack
@@ -506,6 +533,7 @@ int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 	__builtin_unreachable();
 
 out_err:
+	task_path_put(new_exe);
 	if (xfile)
 		vfs_close(xfile);
 	free_user_string_array(kenvp);

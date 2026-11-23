@@ -257,6 +257,7 @@ static const char *const verbs[] = {
 typedef struct {
 	ReqKind kind;
 	char *name; /* MOUNT, UNMOUNT, EJECT */
+	gboolean recover; /* MOUNT <name> recover */
 	GTask *task; /* the caller's, or NULL */
 } Req;
 
@@ -397,7 +398,8 @@ static void lost(ExDevd *d, const GError *why)
 		g_signal_emit(d, sigs[SIG_CHANGED], 0);
 }
 
-static void send_req(ExDevd *d, ReqKind kind, const char *name, GTask *task)
+static void send_req(ExDevd *d, ReqKind kind, const char *name,
+		     gboolean recover, GTask *task)
 {
 	Req *r;
 	char *line;
@@ -418,11 +420,16 @@ static void send_req(ExDevd *d, ReqKind kind, const char *name, GTask *task)
 	r = g_new0(Req, 1);
 	r->kind = kind;
 	r->name = g_strdup(name);
+	r->recover = recover;
 	r->task = task;
 	g_queue_push_tail(&d->pending, r);
-	line = kind == R_HELLO ? g_strdup("HELLO 1") :
-	       name		? g_strdup_printf("%s %s", verbs[kind], name) :
-				  g_strdup(verbs[kind]);
+	if (kind == R_HELLO)
+		line = g_strdup("HELLO 1");
+	else if (name)
+		line = g_strdup_printf("%s %s%s", verbs[kind], name,
+				       recover ? " recover" : "");
+	else
+		line = g_strdup(verbs[kind]);
 	conn_send(d->conn, line);
 	g_free(line);
 }
@@ -643,10 +650,10 @@ static void connect_now(ExDevd *d)
 	if (d->conn)
 		return;
 	d->conn = conn_open(d, &client_funcs, d->path);
-	send_req(d, R_HELLO, NULL, NULL);
-	send_req(d, R_SUBSCRIBE, NULL, NULL);
-	send_req(d, R_LIST, NULL, NULL);
-	send_req(d, R_FSTYPES, NULL, NULL);
+	send_req(d, R_HELLO, NULL, FALSE, NULL);
+	send_req(d, R_SUBSCRIBE, NULL, FALSE, NULL);
+	send_req(d, R_LIST, NULL, FALSE, NULL);
+	send_req(d, R_FSTYPES, NULL, FALSE, NULL);
 }
 
 /* ---- the interface ------------------------------------------------------------ */
@@ -737,12 +744,12 @@ char *ex_devd_volume_fs_name(ExDevd *d, const char *fstype, gboolean supported)
 void ex_devd_refresh_fstypes(ExDevd *d)
 {
 	if (d->conn && !first_pending(d, R_FSTYPES, NULL))
-		send_req(d, R_FSTYPES, NULL, NULL);
+		send_req(d, R_FSTYPES, NULL, FALSE, NULL);
 }
 
 static void request(ExDevd *d, ReqKind kind, const char *name,
-		    GCancellable *cancel, GAsyncReadyCallback done,
-		    gpointer user_data, gpointer tag)
+		    gboolean recover, GCancellable *cancel,
+		    GAsyncReadyCallback done, gpointer user_data, gpointer tag)
 {
 	GTask *t = g_task_new(d, cancel, done, user_data);
 
@@ -754,13 +761,22 @@ static void request(ExDevd *d, ReqKind kind, const char *name,
 		g_object_unref(t);
 		return;
 	}
-	send_req(d, kind, name, t);
+	send_req(d, kind, name, recover, t);
 }
 
 void ex_devd_mount_async(ExDevd *d, const char *name, GCancellable *cancel,
 			 GAsyncReadyCallback done, gpointer user_data)
 {
-	request(d, R_MOUNT, name, cancel, done, user_data, ex_devd_mount_async);
+	request(d, R_MOUNT, name, FALSE, cancel, done, user_data,
+		ex_devd_mount_async);
+}
+
+void ex_devd_mount_recover_async(ExDevd *d, const char *name,
+				 GCancellable *cancel, GAsyncReadyCallback done,
+				 gpointer user_data)
+{
+	request(d, R_MOUNT, name, TRUE, cancel, done, user_data,
+		ex_devd_mount_recover_async);
 }
 
 char *ex_devd_mount_finish(ExDevd *d, GAsyncResult *res, GError **error)
@@ -771,7 +787,7 @@ char *ex_devd_mount_finish(ExDevd *d, GAsyncResult *res, GError **error)
 void ex_devd_unmount_async(ExDevd *d, const char *name, GCancellable *cancel,
 			   GAsyncReadyCallback done, gpointer user_data)
 {
-	request(d, R_UNMOUNT, name, cancel, done, user_data,
+	request(d, R_UNMOUNT, name, FALSE, cancel, done, user_data,
 		ex_devd_unmount_async);
 }
 
@@ -783,7 +799,8 @@ gboolean ex_devd_unmount_finish(ExDevd *d, GAsyncResult *res, GError **error)
 void ex_devd_eject_async(ExDevd *d, const char *disk, GCancellable *cancel,
 			 GAsyncReadyCallback done, gpointer user_data)
 {
-	request(d, R_EJECT, disk, cancel, done, user_data, ex_devd_eject_async);
+	request(d, R_EJECT, disk, FALSE, cancel, done, user_data,
+		ex_devd_eject_async);
 }
 
 gboolean ex_devd_eject_finish(ExDevd *d, GAsyncResult *res, GError **error)
@@ -871,9 +888,13 @@ static void format_line(gpointer owner, const char *text, gsize len)
 	if (!strcmp(w0, "PROGRESS")) {
 		guint64 pct;
 
+		const char *w3 = ex_devd_line_word(l, 3);
+
+		/* "busy": the step that reports no progress has started */
 		if (w1 && w2 && !strcmp(w1, f->name) &&
 		    g_ascii_string_to_unsigned(w2, 10, 0, 100, &pct, NULL))
-			g_signal_emit(f, fsigs[SIG_PROGRESS], 0, (int)pct);
+			g_signal_emit(f, fsigs[SIG_PROGRESS], 0,
+				      w3 && !strcmp(w3, "busy") ? -1 : (int)pct);
 	} else if (!strcmp(w0, "OK") && w1 && !strcmp(w1, "HELLO")) {
 		f->hello_ok = TRUE;
 	} else if (!strcmp(w0, "OK") && w1 && !strcmp(w1, "FORMAT") &&

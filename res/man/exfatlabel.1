@@ -1,0 +1,26 @@
+exfatlabel(8)               System Manager's Manual              exfatlabel(8)
+
+NAME
+       exfatlabel  -  Get  or  Set  volume  label or volume serial of an exFAT
+       filesystem
+
+SYNOPSIS
+       exfatlabel [ -i ] [ -V ] device [ label_string or serial_value ]
+       exfatlabel -V
+
+DESCRIPTION
+       exfatlabel Print or set volume label of an existing exFAT filesystem.
+
+       If there is a label_string in the argument of exfatlabel,  it  will  be
+       written to the volume label field on a given device. If not, exfatlabel
+       will  just print it after reading the volume label field from the given
+       device. If -i or --volume-serial is given, it will switch to volume se-
+       rial mode.
+
+OPTIONS
+       -i --volume-serial
+              Switch to volume serial mode.
+
+       -V     Prints the version number and exits.
+
+                                                                 exfatlabel(8)

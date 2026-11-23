@@ -29,11 +29,16 @@
 // lock is never taken inside the table lock and nothing is allocated under
 // either.
 //
+// A mark keeps a path of up to FSN_PATH_INLINE - 1 bytes in itself, and a
+// longer one in a path buffer (pathbuf.h) of its own; the buffers a rename
+// needs are taken before the table lock (fsnotify_renamed()).
+//
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/fs/device.h>
 #include <kernel/fs/fsnotify.h>
 #include <kernel/fs/namei.h>
+#include <kernel/fs/pathbuf.h>
 #include <kernel/fs/file.h>
 #include <kernel/uapi/inotify.h>
 #include <kernel/uapi/stat.h>
@@ -57,6 +62,9 @@
 
 /* The events a watch can ask for. */
 #define IN_WATCHABLE IN_ALL_EVENTS
+/* A mark's path up to this size (NUL included) is kept in the mark itself. */
+#define FSN_PATH_INLINE 256
+
 /* Bits that only go to the directory holding the name, and bits that only go
  * to the object itself. */
 #define IN_DIR_ONLY (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO)
@@ -83,7 +91,8 @@ struct fsn_mark {
 	int in_path_table;
 	uint32_t path_hash;
 	struct inotify_watch *watches;
-	char path[VFS_MAX_PATH];
+	char *path; /* path_inline, or a path buffer for a longer path */
+	char path_inline[FSN_PATH_INLINE];
 };
 
 /* One queued event.  `ev' and its name are what read() copies out. */
@@ -141,12 +150,13 @@ static int str_eq(const char *a, const char *b)
 	return *a == *b;
 }
 
-static uint32_t path_hash(const char *s)
+/* Hash of the first `n' bytes of `s'. */
+static uint32_t path_hash_n(const char *s, unsigned long n)
 {
 	uint32_t h = 2166136261u;
 
-	while (*s) {
-		h ^= (uint8_t)*s++;
+	for (unsigned long i = 0; i < n; i++) {
+		h ^= (uint8_t)s[i];
 		h *= 16777619u;
 	}
 	return h;
@@ -159,9 +169,10 @@ static unsigned ino_bucket(const void *fs, uint64_t ino)
 	return (unsigned)(h >> 56) % MARK_BUCKETS;
 }
 
-/* The directory part of `path' into `out' ("/a/b" -> "/a", "/a" -> "/"), and
- * the offset of the last component in `*name'.  0 when there is none. */
-static int split_path(const char *path, char *out, unsigned long outsz,
+/* The directory part of `path' -- its first *dlen bytes ("/a/b" -> "/a",
+ * "/a" -> "/") -- and the offset of the last component in `*name'.  0 when
+ * there is none. */
+static int split_path(const char *path, unsigned long *dlen,
 		      unsigned long *name)
 {
 	unsigned long len = str_len(path), slash = (unsigned long)-1;
@@ -175,17 +186,7 @@ static int split_path(const char *path, char *out, unsigned long outsz,
 			slash = i;
 	if (slash == (unsigned long)-1 || slash + 1 >= len)
 		return 0;
-	if (slash == 0) {
-		if (outsz < 2)
-			return 0;
-		out[0] = '/';
-		out[1] = '\0';
-	} else {
-		if (slash >= outsz)
-			return 0;
-		mm_memcpy(out, path, slash);
-		out[slash] = '\0';
-	}
+	*dlen = slash == 0 ? 1 : slash;
 	*name = slash + 1;
 	return 1;
 }
@@ -201,14 +202,22 @@ static struct fsn_mark *mark_by_ino(const void *fs, uint64_t ino)
 	return NULL;
 }
 
-static struct fsn_mark *mark_by_path(const char *path)
+/* The directory mark filed under the path path[0, n). */
+static struct fsn_mark *mark_by_path(const char *path, unsigned long n)
 {
-	uint32_t h = path_hash(path);
+	uint32_t h = path_hash_n(path, n);
 
 	for (struct fsn_mark *m = g_by_path[h % MARK_BUCKETS]; m;
-	     m = m->path_next)
-		if (m->path_hash == h && str_eq(m->path, path))
+	     m = m->path_next) {
+		unsigned long i;
+
+		if (m->path_hash != h)
+			continue;
+		for (i = 0; i < n && m->path[i] == path[i]; i++)
+			;
+		if (i == n && m->path[n] == '\0')
 			return m;
+	}
 	return NULL;
 }
 
@@ -216,7 +225,7 @@ static void path_table_add(struct fsn_mark *m)
 {
 	unsigned b;
 
-	m->path_hash = path_hash(m->path);
+	m->path_hash = path_hash_n(m->path, str_len(m->path));
 	b = m->path_hash % MARK_BUCKETS;
 	m->path_next = g_by_path[b];
 	g_by_path[b] = m;
@@ -289,6 +298,8 @@ static void watch_detach(struct inotify_watch *w)
 	account(w->mask, 0);
 	if (!m->watches) {
 		mark_unlink(m);
+		if (m->path != m->path_inline)
+			pathbuf_put(m->path);
 		kfree(m);
 	}
 }
@@ -480,7 +491,7 @@ void fsnotify_event(const char *path, const struct fsnotify_ident *id,
 		    uint32_t mask, uint32_t cookie, int check_name)
 {
 	struct fsn_batch b;
-	char parent[VFS_MAX_PATH];
+	unsigned long plen = 0; /* the parent directory: path[0, plen) */
 	unsigned long name = 0;
 	int have_parent = 0;
 	uint32_t self_mask = mask & ~IN_DIR_ONLY;
@@ -491,7 +502,7 @@ void fsnotify_event(const char *path, const struct fsnotify_ident *id,
 	if (!fsnotify_wants(mask))
 		return;
 	batch_init(&b);
-	if (path && dir_mask && split_path(path, parent, sizeof(parent), &name))
+	if (path && dir_mask && split_path(path, &plen, &name))
 		have_parent = 1;
 
 	/* An event found through a descriptor names the path the descriptor
@@ -503,7 +514,7 @@ void fsnotify_event(const char *path, const struct fsnotify_ident *id,
 		int watched;
 
 		spin_lock_irqsave(&g_lock, &fl);
-		watched = mark_by_path(parent) != NULL;
+		watched = mark_by_path(path, plen) != NULL;
 		spin_unlock_irqrestore(&g_lock, fl);
 		if (!watched) {
 			have_parent = 0;
@@ -526,7 +537,7 @@ void fsnotify_event(const char *path, const struct fsnotify_ident *id,
 				(self_mask & IN_MOVE) ? cookie : 0, 0);
 	}
 	if (have_parent) {
-		struct fsn_mark *m = mark_by_path(parent);
+		struct fsn_mark *m = mark_by_path(path, plen);
 
 		if (m)
 			collect(&b, m, dir_mask, isdir,
@@ -571,16 +582,12 @@ void fsnotify_gone(const struct fsnotify_ident *id)
 	flush(&b, NULL);
 }
 
-void fsnotify_renamed(const char *oldpath, const char *newpath)
+/* Marks the rename moves: directory marks at or below `oldpath'
+ * (`ol' bytes), taken out of the path table onto a list. */
+static struct fsn_mark *renamed_take(const char *oldpath, unsigned long ol)
 {
-	unsigned long ol = str_len(oldpath), nl = str_len(newpath);
 	struct fsn_mark *moved = NULL;
-	char tmp[VFS_MAX_PATH];
-	uint64_t fl;
 
-	if (!fsnotify_wants(~0u))
-		return;
-	spin_lock_irqsave(&g_lock, &fl);
 	for (unsigned b = 0; b < MARK_BUCKETS; b++) {
 		struct fsn_mark **pp = &g_by_path[b];
 
@@ -605,22 +612,120 @@ void fsnotify_renamed(const char *oldpath, const char *newpath)
 			moved = m;
 		}
 	}
+	return moved;
+}
+
+/* How many path buffers the rename needs that the marks do not have: one
+ * for every mark whose new path is too long for the mark itself and that
+ * keeps its path there now.  Under g_lock. */
+static unsigned long renamed_need(const char *oldpath, unsigned long ol,
+				  unsigned long nl)
+{
+	unsigned long need = 0;
+
+	for (unsigned b = 0; b < MARK_BUCKETS; b++)
+		for (struct fsn_mark *m = g_by_path[b]; m; m = m->path_next) {
+			unsigned long i;
+
+			for (i = 0; i < ol && m->path[i] == oldpath[i]; i++)
+				;
+			if (i < ol || (m->path[ol] != '\0' && m->path[ol] != '/'))
+				continue;
+			if (m->path == m->path_inline &&
+			    nl + str_len(m->path + ol) + 1 > FSN_PATH_INLINE)
+				need++;
+		}
+	return need;
+}
+
+void fsnotify_renamed(const char *oldpath, const char *newpath)
+{
+	unsigned long ol = str_len(oldpath), nl = str_len(newpath);
+	struct fsn_mark *moved;
+	/* Path buffers taken before the lock (the first bytes of each link
+	 * them), and the ones the marks gave up, put after it. */
+	char *spare = NULL, *freed = NULL;
+	unsigned long need = 0;
+	uint64_t fl;
+
+	if (!fsnotify_wants(~0u))
+		return;
+	if (nl + 1 > FSN_PATH_INLINE ||
+	    nl > ol) { /* a moved path may outgrow its mark */
+		spin_lock_irqsave(&g_lock, &fl);
+		need = renamed_need(oldpath, ol, nl);
+		spin_unlock_irqrestore(&g_lock, fl);
+		for (unsigned long k = 0; k < need; k++) {
+			char *pb = pathbuf_get();
+
+			if (!pb)
+				break;
+			*(char **)pb = spare;
+			spare = pb;
+		}
+	}
+	spin_lock_irqsave(&g_lock, &fl);
+	moved = renamed_take(oldpath, ol);
 	while (moved) {
 		struct fsn_mark *m = moved;
 		unsigned long tail = str_len(m->path + ol);
+		unsigned long len = nl + tail; /* the new path, without NUL */
+		char *dst;
 
 		moved = m->path_next;
-		if (nl + tail + 1 > sizeof(m->path)) {
+		if (len + 1 > PATHBUF_SIZE) {
 			/* The new name does not fit: the directory can no
 			 * longer be found by path, only by identity. */
 			continue;
 		}
-		mm_memcpy(tmp, newpath, nl);
-		mm_memcpy(tmp + nl, m->path + ol, tail + 1);
-		mm_memcpy(m->path, tmp, nl + tail + 1);
+		if (len + 1 <= FSN_PATH_INLINE)
+			dst = m->path_inline;
+		else if (m->path != m->path_inline)
+			dst = m->path;
+		else if (spare) {
+			dst = spare;
+			spare = *(char **)spare;
+		} else {
+			/* No buffer to hold it (none could be had, or the
+			 * table changed since they were counted): found by
+			 * identity only, as above. */
+			continue;
+		}
+		/* new = newpath + the old path's tail.  dst may be m->path
+		 * itself: move the tail first, from the end when it moves
+		 * up, from the start when it moves down. */
+		if (dst == m->path) {
+			if (nl > ol)
+				for (unsigned long k = tail + 1; k-- > 0;)
+					dst[nl + k] = m->path[ol + k];
+			else
+				for (unsigned long k = 0; k <= tail; k++)
+					dst[nl + k] = m->path[ol + k];
+		} else {
+			for (unsigned long k = 0; k <= tail; k++)
+				dst[nl + k] = m->path[ol + k];
+		}
+		mm_memcpy(dst, newpath, nl);
+		if (dst != m->path && m->path != m->path_inline) {
+			*(char **)m->path = freed;
+			freed = m->path;
+		}
+		m->path = dst;
 		path_table_add(m);
 	}
 	spin_unlock_irqrestore(&g_lock, fl);
+	while (spare) {
+		char *n = *(char **)spare;
+
+		pathbuf_put(spare);
+		spare = n;
+	}
+	while (freed) {
+		char *n = *(char **)freed;
+
+		pathbuf_put(freed);
+		freed = n;
+	}
 }
 
 uint32_t fsnotify_cookie(void)
@@ -840,32 +945,17 @@ static vfs_file_t *inotify_fdget(task_t *cur, uint64_t fd, int *err)
 	return f;
 }
 
-int64_t sys_inotify_add_watch(uint64_t fd, uint64_t path_ptr, uint64_t mask)
+/* inotify_add_watch() on the canonical path `kpath'. */
+static int64_t add_watch_path(task_t *cur, uint64_t fd, const char *kpath,
+			      uint64_t mask)
 {
-	task_t *cur = sched_current();
 	uint32_t m32 = (uint32_t)mask;
 	uint32_t events = m32 & IN_WATCHABLE;
 	int follow = !(m32 & IN_DONT_FOLLOW);
-	char kpath[VFS_MAX_PATH];
 	struct kstat st;
 	struct fsnotify_ident id;
 	int err = 0;
 	uint64_t fl;
-
-	if (!cur)
-		return -EFAULT;
-	if (!events)
-		return -EINVAL;
-	if ((m32 & IN_MASK_ADD) && (m32 & IN_MASK_CREATE))
-		return -EINVAL;
-	if (!validate_user_ptr(path_ptr, 1))
-		return -EFAULT;
-	int cret = copy_user_path((const char *)path_ptr, kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
-	cret = canon_task_path(kpath, sizeof(kpath));
-	if (cret != 0)
-		return cret;
 
 	vfs_file_t *f = inotify_fdget(cur, fd, &err);
 	if (!f)
@@ -895,17 +985,23 @@ int64_t sys_inotify_add_watch(uint64_t fd, uint64_t path_ptr, uint64_t mask)
 		return -ENOENT;
 	}
 
-	/* Allocated up front: nothing is allocated under the table lock. */
+	/* Allocated up front: nothing is allocated under the table lock.  A
+	 * path too long for the mark itself goes into a path buffer. */
+	unsigned long klen = str_len(kpath);
 	struct fsn_mark *nm = kalloc(sizeof(*nm));
 	struct inotify_watch *nw = kalloc(sizeof(*nw));
-	if (!nm || !nw) {
+	char *lp = klen + 1 > FSN_PATH_INLINE ? pathbuf_get() : NULL;
+	if (!nm || !nw || (klen + 1 > FSN_PATH_INLINE && !lp)) {
 		kfree(nm);
 		kfree(nw);
+		pathbuf_put(lp);
 		fdput(f);
 		return -ENOMEM;
 	}
 	mm_memset(nm, 0, sizeof(*nm));
 	mm_memset(nw, 0, sizeof(*nw));
+	nm->path = lp ? lp : nm->path_inline;
+	mm_memcpy(nm->path, kpath, klen + 1);
 
 	uint32_t want = events | (m32 & (IN_ONESHOT | IN_EXCL_UNLINK));
 	int64_t ret;
@@ -938,7 +1034,7 @@ int64_t sys_inotify_add_watch(uint64_t fd, uint64_t path_ptr, uint64_t mask)
 			mk->fs = id.fs;
 			mk->ino = id.ino;
 			mk->isdir = id.isdir;
-			mm_memcpy(mk->path, kpath, str_len(kpath) + 1);
+			lp = NULL; /* the mark's own now (nm->path) */
 			unsigned b = ino_bucket(mk->fs, mk->ino);
 			mk->ino_next = g_by_ino[b];
 			g_by_ino[b] = mk;
@@ -963,9 +1059,34 @@ int64_t sys_inotify_add_watch(uint64_t fd, uint64_t path_ptr, uint64_t mask)
 		ret = w->wd;
 	}
 	spin_unlock_irqrestore(&g_lock, fl);
+	/* Not used: an existing mark got the watch, or none was made. */
+	pathbuf_put(lp);
 	kfree(nm);
 	kfree(nw);
 	fdput(f);
+	return ret;
+}
+
+int64_t sys_inotify_add_watch(uint64_t fd, uint64_t path_ptr, uint64_t mask)
+{
+	task_t *cur = sched_current();
+	uint32_t m32 = (uint32_t)mask;
+	char *kpath;
+	int64_t ret;
+
+	if (!cur)
+		return -EFAULT;
+	if (!(m32 & IN_WATCHABLE))
+		return -EINVAL;
+	if ((m32 & IN_MASK_ADD) && (m32 & IN_MASK_CREATE))
+		return -EINVAL;
+	if (!validate_user_ptr(path_ptr, 1))
+		return -EFAULT;
+	ret = user_path_get_canon(path_ptr, &kpath);
+	if (ret != 0)
+		return ret;
+	ret = add_watch_path(cur, fd, kpath, mask);
+	pathbuf_put(kpath);
 	return ret;
 }
 

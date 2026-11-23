@@ -632,6 +632,7 @@ typedef struct k_flock {
 #define EBADMSG 74 // Not a data message (corrupt structure)
 #define EOVERFLOW 75 // Value too large for defined data type
 #define EILSEQ 84 // Illegal byte sequence
+#define EUCLEAN 117 // Structure needs cleaning (a journal to replay first)
 #define EREMOTEIO 121 // Remote I/O error (device-reported failure)
 #define ENOMEDIUM 123 // No medium found
 #define EMEDIUMTYPE 124 // Wrong medium type

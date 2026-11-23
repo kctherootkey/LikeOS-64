@@ -59,6 +59,8 @@
 #include <kernel/fs/dcache.h>
 #include <kernel/fs/kdev_t.h>
 #include <kernel/fs/namei.h>
+#include <kernel/fs/pathbuf.h>
+#include <kernel/ke/task_path.h>
 #include <kernel/fs/file.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/mutex.h>
@@ -157,17 +159,30 @@ static void slot_write_end(vfs_mount_t *m)
 
 /* Reserve a free slot, left odd (being written) in state SETUP.  `active'
  * and `seq' are never cleared: a reader that raced with the slot's previous
- * life may still drop a count it took. */
+ * life may still drop a count it took.  A slot used for the first time gets
+ * its path and source buffers here, taken before the lock; NULL when the
+ * table is full or they cannot be had. */
 static vfs_mount_t *slot_alloc(void)
 {
 	vfs_mount_t *m = NULL;
+	char *np = pathbuf_get(), *ns = pathbuf_get();
 	uint64_t fl;
 
 	spin_lock_irqsave(&g_mnt_slot_lock, &fl);
 	for (int i = 0; i < VFS_MOUNT_MAX; i++) {
 		if (g_mnt[i].state != VFS_MNT_FREE)
 			continue;
+		if ((!g_mnt[i].path && !np) || (!g_mnt[i].source && !ns))
+			break; /* no memory for a new slot's buffers */
 		m = &g_mnt[i];
+		if (!m->path) {
+			m->path = np;
+			np = NULL;
+		}
+		if (!m->source) {
+			m->source = ns;
+			ns = NULL;
+		}
 		slot_write_begin(m);
 		__atomic_store_n(&m->state, VFS_MNT_SETUP, __ATOMIC_SEQ_CST);
 		m->open_files = 0;
@@ -195,6 +210,9 @@ static vfs_mount_t *slot_alloc(void)
 		break;
 	}
 	spin_unlock_irqrestore(&g_mnt_slot_lock, fl);
+	/* Not needed: the slot had its own already. */
+	pathbuf_put(ns);
+	pathbuf_put(np);
 	return m;
 }
 
@@ -499,14 +517,19 @@ static void mnt_resolved(const char *path, char *buf)
 
 unsigned long vfs_path_mount_flags(const char *path)
 {
-	char cbuf[VFS_MAX_PATH];
-	/* The mount of what the path names, its links followed: a link on
-	 * one filesystem to a program on another runs with the other's
-	 * noexec and nosuid. */
-	mnt_resolved(path, cbuf);
-	vfs_mount_t *m = vfs_mnt_get(cbuf, NULL);
+	char *cbuf = pathbuf_get();
+	vfs_mount_t *m;
 	unsigned long fl;
 
+	/* The mount of what the path names, its links followed: a link on
+	 * one filesystem to a program on another runs with the other's
+	 * noexec and nosuid.  Without memory to find out, the strictest
+	 * flags: nothing runs with privileges it may not have. */
+	if (!cbuf)
+		return VFS_MS_NOSUID | VFS_MS_NOEXEC | VFS_MS_NODEV;
+	mnt_resolved(path, cbuf);
+	m = vfs_mnt_get(cbuf, NULL);
+	pathbuf_put(cbuf);
 	if (!m)
 		return 0;
 	fl = m->flags;
@@ -627,9 +650,9 @@ static vfs_mount_t *mnt_register_boot(const char *path, const vfs_ops_t *ops,
 		kprintf("vfs: mount table full, %s not mounted\n", path);
 		return NULL;
 	}
-	mnt_strcpy(m->path, path, sizeof(m->path));
+	mnt_strcpy(m->path, path, VFS_MAX_PATH);
 	m->path_len = len;
-	mnt_strcpy(m->source, source, sizeof(m->source));
+	mnt_strcpy(m->source, source, VFS_MAX_PATH);
 	mnt_strcpy(m->fstype, fstype, sizeof(m->fstype));
 	m->ops = ops;
 	m->fs_data = fs_data;
@@ -670,7 +693,7 @@ void vfs_root_set_source(const char *source, uint64_t dev)
 	if (!m)
 		return;
 	spin_lock_irqsave(&g_mnt_slot_lock, &fl);
-	mnt_strcpy(m->source, source, sizeof(m->source));
+	mnt_strcpy(m->source, source, VFS_MAX_PATH);
 	m->dev = dev;
 	/* stat() on the root reports its device, the number mountinfo shows
 	 * and every other disk mount reports for its own files -- not the
@@ -736,9 +759,9 @@ int vfs_mount_boot(const char *prefix, const vfs_fstype_t *type,
 		kprintf("vfs: mount table full, %s not mounted\n", prefix);
 		return ST_NOMEM;
 	}
-	mnt_strcpy(m->path, prefix, sizeof(m->path));
+	mnt_strcpy(m->path, prefix, VFS_MAX_PATH);
 	m->path_len = len;
-	mnt_strcpy(m->source, type->name, sizeof(m->source));
+	mnt_strcpy(m->source, type->name, VFS_MAX_PATH);
 	mnt_strcpy(m->fstype, type->name, sizeof(m->fstype));
 	m->flags = flags & VFS_MS_PERMANENT;
 	if (data)
@@ -899,15 +922,23 @@ static int mnt_source_bdev(const char *source, block_device_t **out)
 /* ---- the mount point ----------------------------------------------------- */
 
 /* Resolve symbolic links in an absolute canonical path, so the mount is
- * entered under the name every later lookup will use.  0 or -errno. */
+ * entered under the name every later lookup will use.  `out' is `cap' bytes.
+ * 0 or -errno. */
 static int mnt_realpath(const char *in, char *out, unsigned cap)
 {
-	char work[VFS_MAX_PATH], next[VFS_MAX_PATH], link[VFS_MAX_PATH];
-	int hops = 0;
+	char *work = NULL, *next = NULL, *link = NULL;
+	int hops = 0, ret = 0;
 
 	if (!in || in[0] != '/' || cap < 2)
 		return -EINVAL;
-	mnt_strcpy(work, in, sizeof(work));
+	work = pathbuf_get();
+	next = pathbuf_get();
+	link = pathbuf_get();
+	if (!work || !next || !link) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
+	mnt_strcpy(work, in, PATHBUF_SIZE);
 restart:
 	out[0] = '/';
 	out[1] = '\0';
@@ -925,8 +956,10 @@ restart:
 		unsigned before = olen; /* length of the containing directory */
 		/* The path is canonical: no "." or ".." components. */
 		unsigned nlen = olen + (olen > 1 ? 1 : 0) + clen;
-		if (nlen + 1 >= cap)
-			return -ENAMETOOLONG;
+		if (nlen + 1 >= cap) {
+			ret = -ENAMETOOLONG;
+			goto out_free;
+		}
 		if (olen > 1)
 			out[olen++] = '/';
 		for (unsigned i = 0; i < clen; i++)
@@ -934,37 +967,54 @@ restart:
 		out[olen] = '\0';
 		struct kstat st;
 		int r = vfs_lstat(out, &st);
-		if (r != ST_OK)
-			return vfs_status_to_errno(r);
+		if (r != ST_OK) {
+			ret = vfs_status_to_errno(r);
+			goto out_free;
+		}
 		if (S_ISLNK(st.st_mode)) {
-			if (++hops > 8)
-				return -ELOOP;
-			int n = vfs_readlink(out, link, sizeof(link) - 1);
-			if (n <= 0)
-				return -EINVAL;
+			if (++hops > 8) {
+				ret = -ELOOP;
+				goto out_free;
+			}
+			int n = vfs_readlink(out, link, PATHBUF_SIZE - 1);
+			if (n <= 0) {
+				ret = -EINVAL;
+				goto out_free;
+			}
 			link[n] = '\0';
-			/* The directory holding the link. */
-			char dir[VFS_MAX_PATH];
-			mnt_strcpy(dir, out, before + 1);
-			/* target + the rest of the path */
-			char joined[VFS_MAX_PATH];
-			unsigned j = 0;
-			for (unsigned i = 0; link[i] && j + 1 < sizeof(joined);
-			     i++)
-				joined[j++] = link[i];
-			for (const char *q = e; *q && j + 1 < sizeof(joined);
-			     q++)
-				joined[j++] = *q;
-			joined[j] = '\0';
-			int nr = normalize_path(dir, joined, next, sizeof(next));
-			if (nr != 0)
-				return nr;
-			mnt_strcpy(work, next, sizeof(work));
+			/* Where the link leads, then the rest of the path: from
+			 * the directory holding the link (out[0, before)) for
+			 * a relative target. */
+			size_t nl = 1;
+			next[0] = '/';
+			next[1] = '\0';
+			int nr = 0;
+			if (link[0] != '/')
+				nr = normalize_path_append(next, PATHBUF_SIZE, &nl,
+							   out, before);
+			if (nr == 0)
+				nr = normalize_path_append(next, PATHBUF_SIZE, &nl,
+							   link, (size_t)n);
+			if (nr == 0)
+				nr = normalize_path_append(next, PATHBUF_SIZE, &nl,
+							   e, (size_t)-1);
+			if (nr != 0) {
+				ret = nr;
+				goto out_free;
+			}
+			/* `e' points into `work': only now may it change. */
+			char *t = work;
+			work = next;
+			next = t;
 			goto restart;
 		}
 		p = e;
 	}
-	return 0;
+out_free:
+	pathbuf_put(link);
+	pathbuf_put(next);
+	pathbuf_put(work);
+	return ret;
 }
 
 /* ---- tasks inside a mount ------------------------------------------------- */
@@ -977,18 +1027,27 @@ static int mnt_tasks_inside(const vfs_mount_t *m)
 		uint64_t fl;
 		int inside = 0, found = 0;
 
+		struct task_path *cp = NULL, *rp = NULL;
+
 		spin_lock_irqsave(&g_task_list_lock, &fl);
 		task_t *t = sched_find_next_task_by_id_locked(next);
 		if (t) {
 			found = 1;
 			next = (uint32_t)t->id + 1;
-			if (t->cwd[0] && mnt_under(t->cwd, m->path, m->path_len))
-				inside = 1;
-			if (t->root[0] &&
-			    mnt_under(t->root, m->path, m->path_len))
-				inside = 1;
+			/* References: the task may chdir or exit the moment
+			 * the list lock is dropped. */
+			cp = task_path_ref(t, TASK_PATH_CWD);
+			rp = task_path_ref(t, TASK_PATH_ROOT);
 		}
 		spin_unlock_irqrestore(&g_task_list_lock, fl);
+		/* (A NULL working directory is "/", which no mount point
+		 * other than the root's contains.) */
+		if (cp && mnt_under(cp->s, m->path, m->path_len))
+			inside = 1;
+		if (rp && mnt_under(rp->s, m->path, m->path_len))
+			inside = 1;
+		task_path_put(cp);
+		task_path_put(rp);
 		if (!found)
 			return 0;
 		if (inside)
@@ -1170,8 +1229,7 @@ void vfs_mnt_rename_end(int locked, const char *oldpath, const char *newpath,
 
 		for (int i = 0; i < hi; i++) {
 			vfs_mount_t *m = &g_mnt[i];
-			char np[VFS_MAX_PATH];
-			unsigned tail, k;
+			unsigned tail;
 			uint64_t fl;
 
 			if (m->state != VFS_MNT_LIVE &&
@@ -1182,19 +1240,27 @@ void vfs_mnt_rename_end(int locked, const char *oldpath, const char *newpath,
 				continue;
 			/* The new directory's name, then the part of the
 			 * mount point below the old one (checked to fit in
-			 * vfs_mnt_rename_begin). */
+			 * vfs_mnt_rename_begin).  Rewritten in place, inside
+			 * the slot's write section: a reader that looks
+			 * meanwhile sees the sequence change and looks
+			 * again.  The tail moves first -- from its end when
+			 * it moves up, from its start when it moves down. */
 			tail = m->path_len - olen;
 			if (nlen + tail >= VFS_MAX_PATH)
 				continue;
-			for (k = 0; k < nlen; k++)
-				np[k] = newpath[k];
-			for (unsigned j = 0; j < tail; j++)
-				np[k++] = m->path[olen + j];
-			np[k] = '\0';
 			spin_lock_irqsave(&g_mnt_slot_lock, &fl);
 			slot_write_begin(m);
-			mnt_strcpy(m->path, np, sizeof(m->path));
-			m->path_len = k;
+			if (nlen > olen) {
+				for (unsigned j = tail; j-- > 0;)
+					m->path[nlen + j] = m->path[olen + j];
+			} else {
+				for (unsigned j = 0; j < tail; j++)
+					m->path[nlen + j] = m->path[olen + j];
+			}
+			for (unsigned j = 0; j < nlen; j++)
+				m->path[j] = newpath[j];
+			m->path[nlen + tail] = '\0';
+			m->path_len = nlen + tail;
 			slot_write_end(m);
 			spin_unlock_irqrestore(&g_mnt_slot_lock, fl);
 			moved = 1;
@@ -1364,10 +1430,27 @@ out:
 	return r;
 }
 
+static int vfs_mount_in(const char *source, const char *target,
+			const char *fstype, unsigned long flags,
+			const char *data, char *tpath);
+
 int vfs_mount(const char *source, const char *target, const char *fstype,
 	      unsigned long flags, const char *data)
 {
-	char tpath[VFS_MAX_PATH];
+	char *tpath = pathbuf_get(); /* the mount point, links resolved */
+	int r;
+
+	if (!tpath)
+		return -ENOMEM;
+	r = vfs_mount_in(source, target, fstype, flags, data, tpath);
+	pathbuf_put(tpath);
+	return r;
+}
+
+static int vfs_mount_in(const char *source, const char *target,
+			const char *fstype, unsigned long flags,
+			const char *data, char *tpath)
+{
 	const vfs_fstype_t *type = NULL;
 	int is_auto = 0;
 	int r;
@@ -1395,7 +1478,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
 	vfs_mount_t *m = NULL;
 	int claimed = 0;
 
-	r = mnt_realpath(target, tpath, sizeof(tpath));
+	r = mnt_realpath(target, tpath, PATHBUF_SIZE);
 	if (r != 0)
 		goto fail;
 	if (flags & VFS_MS_REMOUNT) {
@@ -1471,10 +1554,10 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
 		claimed = 1;
 	}
 
-	mnt_strcpy(m->path, tpath, sizeof(m->path));
+	mnt_strcpy(m->path, tpath, VFS_MAX_PATH);
 	m->path_len = mnt_strlen(m->path);
 	mnt_strcpy(m->source, source && source[0] ? source : "none",
-		   sizeof(m->source));
+		   VFS_MAX_PATH);
 	/* The aliases of a FAT driver are one type to everyone else. */
 	if (mnt_streq(type->name, "vfat"))
 		mnt_strcpy(m->fstype, "vfat", sizeof(m->fstype));
@@ -1530,9 +1613,22 @@ fail:
 
 /* ---- umount2(2) ------------------------------------------------------------ */
 
+static int vfs_umount_in(const char *target, int flags, char *tpath);
+
 int vfs_umount(const char *target, int flags)
 {
-	char tpath[VFS_MAX_PATH];
+	char *tpath = pathbuf_get(); /* the mount point, links resolved */
+	int r;
+
+	if (!tpath)
+		return -ENOMEM;
+	r = vfs_umount_in(target, flags, tpath);
+	pathbuf_put(tpath);
+	return r;
+}
+
+static int vfs_umount_in(const char *target, int flags, char *tpath)
+{
 	int r;
 
 	if (!target || target[0] != '/')
@@ -1550,8 +1646,8 @@ int vfs_umount(const char *target, int flags)
 	 * for its links any more is still unmounted under the name it was
 	 * given. */
 	if ((flags & VFS_UMOUNT_NOFOLLOW) ||
-	    mnt_realpath(target, tpath, sizeof(tpath)) != 0)
-		mnt_strcpy(tpath, target, sizeof(tpath));
+	    mnt_realpath(target, tpath, PATHBUF_SIZE) != 0)
+		mnt_strcpy(tpath, target, PATHBUF_SIZE);
 	vfs_mount_t *m = mnt_find_exact(tpath);
 	if (!m) {
 		r = -EINVAL; /* not a mount point */
@@ -1609,14 +1705,14 @@ int vfs_umount(const char *target, int flags)
 		r = -EBUSY;
 		goto out;
 	}
-	char path[VFS_MAX_PATH];
-	mnt_strcpy(path, m->path, sizeof(path));
+	/* The slot is DYING: its path stays as it is until the teardown;
+	 * `tpath' names the same mount point (mnt_find_exact) and is ours. */
 	r = mnt_teardown(m);
 	vfs_meta_changed();
 	if (r != 0)
 		slot_set_state(m, VFS_MNT_LIVE);
 	else
-		kprintf("vfs: unmounted %s\n", path);
+		kprintf("vfs: unmounted %s\n", tpath);
 out:
 	mnt_unlock();
 	return r;
@@ -1873,10 +1969,14 @@ long vfs_mounts_show(char *buf, long cap, long pos, int info)
 
 int vfs_path_dev(const char *path, uint64_t *dev)
 {
-	char cbuf[VFS_MAX_PATH];
-	mnt_resolved(path, cbuf);
-	vfs_mount_t *m = vfs_mnt_get(cbuf, NULL);
+	char *cbuf = pathbuf_get();
+	vfs_mount_t *m;
 
+	if (!cbuf)
+		return ST_NOMEM;
+	mnt_resolved(path, cbuf);
+	m = vfs_mnt_get(cbuf, NULL);
+	pathbuf_put(cbuf);
 	if (!m)
 		return ST_NOT_FOUND;
 	*dev = m->dev;
@@ -1952,17 +2052,17 @@ int64_t sys_mount(uint64_t u_source, uint64_t u_target, uint64_t u_fstype,
 /* umount2(target, flags) */
 int64_t sys_umount2(uint64_t u_target, uint64_t flags)
 {
-	char target[VFS_MAX_PATH];
-	int r;
+	char *target;
+	int64_t r;
 
 	if (!capable())
 		return -EPERM;
-	r = copy_user_path((const char *)u_target, target, sizeof(target));
-	if (r == 0)
-		r = canon_task_path(target, sizeof(target));
+	r = user_path_get_canon(u_target, &target);
 	if (r != 0)
 		return r;
-	return vfs_umount(target, (int)flags);
+	r = vfs_umount(target, (int)flags);
+	pathbuf_put(target);
+	return r;
 }
 
 /* syncfs(fd) */

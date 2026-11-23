@@ -59,10 +59,28 @@ void devp_line_enc(struct devp_line *l, const char *value);
 /* Terminate with '\n'; returns the length, or -1 when it did not fit. */
 long devp_line_end(struct devp_line *l);
 
+/* A MOUNT request, split: "MOUNT <name>", or "MOUNT <name> recover" to
+ * have a journal replayed that must be (the user agreed).  0 and *recover,
+ * or -1 when it is neither. */
+int devp_mount_parse(char *const *tok, int n, int *recover);
+
 /* The conventional name of an errno value ("EPERM"), "EIO" when unknown. */
 const char *devp_errname(int err);
 
 /* Strict unsigned decimal: digits only, no sign, no blanks; 0 on success. */
 int devp_parse_u64(const char *s, uint64_t max, uint64_t *out);
+
+/* The flags of a DEV/EVENT line that decide what a client may do with a
+ * device by itself.  A line without one of the keys (an older devd) counts
+ * it as 0. */
+struct devp_flags {
+	int usb, removable, system, supported, ejected;
+	int readonly, optical, internal;
+};
+
+/* Mount it without being asked?  A USB drive or a CD/DVD that devd can
+ * mount, not ejected, not the system's -- never a built-in disk.  The rule
+ * the session's volume agent follows. */
+int devp_automount(const struct devp_flags *f);
 
 #endif

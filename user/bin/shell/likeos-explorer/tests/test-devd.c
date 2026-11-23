@@ -4,9 +4,10 @@
 // filesystems, errors, and lines that break the rules -- and then the
 // client against a stand-in service on a socket of its own (in a fresh
 // directory under $TMPDIR): the first requests, the table of devices and
-// filesystems, events, a mount, a refused eject, lines to drop, the
-// connection lost and found again.  Needs neither the real service nor a
-// display.
+// filesystems, events, a mount, a mount refused until its journal is
+// replayed and asked for again with recovery, a refused eject, lines to
+// drop, the connection lost and found again.  Needs neither the real
+// service nor a display.
 //
 //     explorer-devd-test
 //
@@ -185,6 +186,51 @@ static void test_devices(void)
 	ex_devd_device_free(d);
 	ex_devd_line_free(l);
 
+	/* the keys added later: absent (an older service) means 0 */
+	l = parse(DEV_SDB1);
+	d = l ? ex_devd_device_from_line(l) : NULL;
+	CHECK("older line: not read-only, optical or internal",
+	      d && !d->readonly && !d->optical && !d->internal);
+	ex_devd_device_free(d);
+	ex_devd_line_free(l);
+	l = parse("DEV name=sr0 disk=sr0 kind=disk size=734003200 removable=1 "
+		  "usb=0 system=0 fstype=iso9660 supported=1 label=MY%20CD "
+		  "uuid=2026-11-20-12-34-56-00 mounted= mountuid=-1 ejected=0 "
+		  "state=ready readonly=1 optical=1 internal=0");
+	d = l ? ex_devd_device_from_line(l) : NULL;
+	CHECK("CD/DVD drive parsed", d != NULL);
+	if (d) {
+		CHECK("optical, read-only, not internal",
+		      d->optical && d->readonly && !d->internal && !d->usb);
+		CHECK("ISO 9660 uuid kept",
+		      !strcmp(d->uuid, "2026-11-20-12-34-56-00"));
+		c = ex_devd_device_copy(d);
+		CHECK("copy keeps the new flags",
+		      c->optical && c->readonly && !c->internal);
+		ex_devd_device_free(c);
+	}
+	ex_devd_device_free(d);
+	ex_devd_line_free(l);
+	l = parse("DEV name=nvme0n1p3 disk=nvme0n1 kind=partition "
+		  "size=500000000000 removable=0 usb=0 system=0 fstype=ntfs "
+		  "supported=1 label= uuid=1122334455667788 mounted= "
+		  "mountuid=-1 ejected=0 state=ready readonly=0 optical=0 "
+		  "internal=1 future=whatever");
+	d = l ? ex_devd_device_from_line(l) : NULL;
+	CHECK("built-in disk parsed, unknown key ignored", d != NULL);
+	if (d)
+		CHECK("internal, not optical, writable",
+		      d->internal && !d->optical && !d->readonly);
+	ex_devd_device_free(d);
+	ex_devd_line_free(l);
+	l = parse("DEV name=sr1 disk=sr1 kind=disk optical=1 internal=1 "
+		  "readonly=yes");
+	d = l ? ex_devd_device_from_line(l) : NULL;
+	CHECK("an optical drive is never internal; a bad flag is 0",
+	      d && d->optical && !d->internal && !d->readonly);
+	ex_devd_device_free(d);
+	ex_devd_line_free(l);
+
 	l = parse("DEV name=sdd disk=sdd kind=disk label=%FF%FE");
 	d = l ? ex_devd_device_from_line(l) : NULL;
 	CHECK("invalid UTF-8 label made valid",
@@ -281,6 +327,9 @@ static void test_errors(void)
 	CHECK("error codes", ex_devd_error_code("EBUSY") == EX_DEVD_ERROR_BUSY &&
 				     ex_devd_error_code("EACCES") == EX_DEVD_ERROR_PERM &&
 				     ex_devd_error_code("EWHAT") == EX_DEVD_ERROR_FAILED);
+	CHECK("journal error code",
+	      ex_devd_error_code("EUCLEAN") == EX_DEVD_ERROR_UNCLEAN &&
+		      *ex_devd_error_explain(EX_DEVD_ERROR_UNCLEAN));
 }
 
 /* ---- the client against a stand-in service ----------------------------------- */
@@ -377,6 +426,14 @@ static gpointer server_main(gpointer data)
 	if (!expect(s, in, "MOUNT sdb1"))
 		goto done;
 	say(out, "PROGRESS sdb1 50");
+	say(out, "OK MOUNT sdb1 path=/media/u/MY%20STICK");
+	/* A journal to replay: refused, then asked for with recovery. */
+	if (!expect(s, in, "MOUNT sdb1"))
+		goto done;
+	say(out, "ERR MOUNT EUCLEAN the%20file%20system%20journal%20must%20be"
+		 "%20replayed%20first");
+	if (!expect(s, in, "MOUNT sdb1 recover"))
+		goto done;
 	say(out, "OK MOUNT sdb1 path=/media/u/MY%20STICK");
 	if (!expect(s, in, "EJECT sdb"))
 		goto done;
@@ -552,6 +609,29 @@ static void test_client(void)
 	CHECK("mount answered", RUN_UNTIL(r.done, 5000));
 	CHECK("mount path", r.path && !strcmp(r.path, "/media/u/MY STICK"));
 	g_free(r.path);
+	g_clear_error(&r.error);
+
+	memset(&r, 0, sizeof(r));
+	ex_devd_mount_async(d, "sdb1", NULL, mounted, &r);
+	CHECK("journal mount answered", RUN_UNTIL(r.done, 5000));
+	CHECK("journal mount refused as unclean",
+	      !r.path &&
+		      g_error_matches(r.error, EX_DEVD_ERROR, EX_DEVD_ERROR_UNCLEAN) &&
+		      !strcmp(r.error->message,
+			      "the file system journal must be replayed first"));
+	g_clear_error(&r.error);
+	memset(&r, 0, sizeof(r));
+	ex_devd_mount_recover_async(d, "sdb1", NULL, mounted, &r);
+	CHECK("recovery mount answered", RUN_UNTIL(r.done, 5000));
+	CHECK("recovery mount path",
+	      r.path && !strcmp(r.path, "/media/u/MY STICK") && !r.error);
+	g_free(r.path);
+	g_clear_error(&r.error);
+	memset(&r, 0, sizeof(r));
+	ex_devd_mount_recover_async(d, "../etc", NULL, mounted, &r);
+	CHECK("recovery mount: bad name refused at once",
+	      RUN_UNTIL(r.done, 1000) &&
+		      g_error_matches(r.error, EX_DEVD_ERROR, EX_DEVD_ERROR_NOENT));
 	g_clear_error(&r.error);
 
 	memset(&r, 0, sizeof(r));

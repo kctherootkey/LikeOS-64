@@ -155,7 +155,13 @@ MOUNT OPTIONS
               default 0755).
 
        Anything  else  is  the  file  system's own option and passed on to it.
-       ext4 has none.  vfat takes uid=n and gid=n (the owner every file shows;
+       ext4 takes norecovery (or noload: mount read-only without replaying the
+       journal) and recovery=ask (a journal that needs replaying fails the
+       mount with "Structure needs cleaning" instead of being replayed; a
+       mount without the option replays it).  ntfs takes recover (replay an
+       unclean journal, which is otherwise left alone and the volume mounted
+       read-only) and recovery=ask (an unclean journal that recover would
+       replay fails the mount the same way).  vfat takes uid=n and gid=n (the owner every file shows;
        FAT stores none), umask=octal, fmask=octal and dmask=octal (the permis-
        sion bits taken away from every file, from files, from directories; the
        defaults  give  files  0644   and   directories   0755),   and   short-

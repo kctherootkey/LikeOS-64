@@ -101,6 +101,9 @@ static void group_str(char *buf, size_t sz, gid_t gid, int numeric)
  * ====================================================================== */
 #define MAX_ENTRIES 4096
 #define PATH_MAX_LS 4096
+/* A name or path as displayed: every byte may become a four-byte escape,
+ * plus the quotes and the NUL. */
+#define NBUF_LS (PATH_MAX_LS * 4 + 3)
 
 /* Exit status */
 static int exit_status = 0;
@@ -252,11 +255,41 @@ static const char *color_reset(void)
  * ====================================================================== */
 typedef struct {
 	char name[256];
+	/* A command-line argument: the path exactly as given (argv lives as
+	 * long as the program), which may be longer than `name' can hold.
+	 * NULL for an entry read from a directory.  See ent_name(). */
+	const char *path;
 	struct stat st;
 	int stat_valid;
-	char link_target[256]; /* for symlink display */
+	char *link_target; /* for symlink display; malloc'd, see set_link */
 	int link_valid;
 } entry_t;
+
+/* What an entry is called: the whole argument for one named on the command
+ * line, the directory entry's name otherwise. */
+static const char *ent_name(const entry_t *e)
+{
+	return e->path ? e->path : e->name;
+}
+
+/* Read the target of the symbolic link `path' into e->link_target, whole.
+ * The entry arrays are reused from one directory to the next, so whatever
+ * the slot held before is released first. */
+static void set_link(entry_t *e, const char *path)
+{
+	char buf[PATH_MAX_LS];
+	ssize_t n;
+
+	free(e->link_target);
+	e->link_target = NULL;
+	e->link_valid = 0;
+	n = readlink(path, buf, sizeof(buf) - 1);
+	if (n <= 0)
+		return;
+	buf[n] = '\0';
+	e->link_target = strdup(buf);
+	e->link_valid = e->link_target != NULL;
+}
 
 /* ======================================================================
  * Helper: human-readable size formatting
@@ -407,6 +440,8 @@ static int print_name_to_buf(char *buf, size_t bufsz, const char *name)
 	for (const char *p = name; *p && pos < bufsz - 2; p++) {
 		unsigned char c = (unsigned char)*p;
 		if (opt_escape && !isprint(c)) {
+			if (pos + 4 > bufsz - 2)
+				break; /* no room for the whole escape */
 			int n = snprintf(buf + pos, bufsz - pos, "\\%03o", c);
 			if (n > 0)
 				pos += (size_t)n;
@@ -529,7 +564,7 @@ static int cmp_name(const void *a, const void *b)
 {
 	const entry_t *ea = (const entry_t *)a;
 	const entry_t *eb = (const entry_t *)b;
-	return strcmp(ea->name, eb->name);
+	return strcmp(ent_name(ea), ent_name(eb));
 }
 
 static int cmp_size(const void *a, const void *b)
@@ -540,7 +575,7 @@ static int cmp_size(const void *a, const void *b)
 		return -1;
 	if (ea->st.st_size < eb->st.st_size)
 		return 1;
-	return strcmp(ea->name, eb->name);
+	return strcmp(ent_name(ea), ent_name(eb));
 }
 
 static int cmp_time(const void *a, const void *b)
@@ -553,22 +588,22 @@ static int cmp_time(const void *a, const void *b)
 		return -1;
 	if (ta < tb)
 		return 1;
-	return strcmp(ea->name, eb->name);
+	return strcmp(ent_name(ea), ent_name(eb));
 }
 
 static int cmp_version(const void *a, const void *b)
 {
 	const entry_t *ea = (const entry_t *)a;
 	const entry_t *eb = (const entry_t *)b;
-	return version_compare(ea->name, eb->name);
+	return version_compare(ent_name(ea), ent_name(eb));
 }
 
 static int cmp_extension(const void *a, const void *b)
 {
 	const entry_t *ea = (const entry_t *)a;
 	const entry_t *eb = (const entry_t *)b;
-	const char *ext_a = strrchr(ea->name, '.');
-	const char *ext_b = strrchr(eb->name, '.');
+	const char *ext_a = strrchr(ent_name(ea), '.');
+	const char *ext_b = strrchr(ent_name(eb), '.');
 	if (!ext_a)
 		ext_a = "";
 	if (!ext_b)
@@ -576,18 +611,18 @@ static int cmp_extension(const void *a, const void *b)
 	int r = strcmp(ext_a, ext_b);
 	if (r != 0)
 		return r;
-	return strcmp(ea->name, eb->name);
+	return strcmp(ent_name(ea), ent_name(eb));
 }
 
 static int cmp_width_fn(const void *a, const void *b)
 {
 	const entry_t *ea = (const entry_t *)a;
 	const entry_t *eb = (const entry_t *)b;
-	int wa = (int)strlen(ea->name);
-	int wb = (int)strlen(eb->name);
+	int wa = (int)strlen(ent_name(ea));
+	int wb = (int)strlen(ent_name(eb));
 	if (wa != wb)
 		return wa - wb;
-	return strcmp(ea->name, eb->name);
+	return strcmp(ent_name(ea), ent_name(eb));
 }
 
 /* Wrapper that handles reverse and group-directories-first */
@@ -708,8 +743,8 @@ static int collect_entries(const char *dirpath, entry_t *entries,
 		entry_t *e = &entries[count];
 		strncpy(e->name, name, sizeof(e->name) - 1);
 		e->name[sizeof(e->name) - 1] = '\0';
+		e->path = NULL;
 		e->link_valid = 0;
-		e->link_target[0] = '\0';
 
 		char fullpath[PATH_MAX_LS];
 		build_path(fullpath, sizeof(fullpath), dirpath, name);
@@ -720,14 +755,8 @@ static int collect_entries(const char *dirpath, entry_t *entries,
 		}
 
 		/* If it's a symlink, read the target */
-		if (e->stat_valid && S_ISLNK(e->st.st_mode)) {
-			int n = readlink(fullpath, e->link_target,
-					 sizeof(e->link_target) - 1);
-			if (n > 0) {
-				e->link_target[n] = '\0';
-				e->link_valid = 1;
-			}
-		}
+		if (e->stat_valid && S_ISLNK(e->st.st_mode))
+			set_link(e, fullpath);
 
 		count++;
 	}
@@ -738,10 +767,14 @@ static int collect_entries(const char *dirpath, entry_t *entries,
 
 /* ======================================================================
  * Print in long format (-l)
+ *
+ * `dirpath' is the directory these entries are the contents of, or NULL for
+ * operands named on the command line (files, and directories under -d).
+ * Only a directory's contents get a "total" line: it sums the blocks of
+ * what the directory holds, which a list of operands is not.
  * ====================================================================== */
 static void print_long(entry_t *entries, int count, const char *dirpath)
 {
-	(void)dirpath;
 	/* Compute column widths */
 	int max_nlink = 1;
 	int max_uid = 1;
@@ -784,7 +817,7 @@ static void print_long(entry_t *entries, int count, const char *dirpath)
 	}
 
 	/* Compute total blocks */
-	if (!opt_dired) {
+	if (dirpath && !opt_dired) {
 		uint64_t total_blocks = 0;
 		for (int i = 0; i < count; i++) {
 			if (entries[i].stat_valid) {
@@ -867,8 +900,8 @@ static void print_long(entry_t *entries, int count, const char *dirpath)
 		printf("%s ", tbuf);
 
 		/* Name */
-		char nbuf[512];
-		print_name_to_buf(nbuf, sizeof(nbuf), e->name);
+		static char nbuf[NBUF_LS];
+		print_name_to_buf(nbuf, sizeof(nbuf), ent_name(e));
 		printf("%s%s%s", color_for(e->st.st_mode), nbuf, color_reset());
 
 		/* Symlink target */
@@ -919,8 +952,8 @@ static void print_one_per_line(entry_t *entries, int count)
 		if (opt_inode)
 			printf("%7lu ", (unsigned long)0);
 
-		char nbuf[512];
-		print_name_to_buf(nbuf, sizeof(nbuf), e->name);
+		static char nbuf[NBUF_LS];
+		print_name_to_buf(nbuf, sizeof(nbuf), ent_name(e));
 		printf("%s%s%s", color_for(e->st.st_mode), nbuf, color_reset());
 
 		if (opt_classify || opt_file_type) {
@@ -950,7 +983,7 @@ static void print_columns(entry_t *entries, int count, int across)
 	/* Compute max width per entry (name + indicator) */
 	int max_w = 0;
 	for (int i = 0; i < count; i++) {
-		int w = name_width(entries[i].name) +
+		int w = name_width(ent_name(&entries[i])) +
 			indicator_width(&entries[i]);
 		if (opt_inode)
 			w += 8;
@@ -981,7 +1014,7 @@ static void print_columns(entry_t *entries, int count, int across)
 				break;
 
 			entry_t *e = &entries[idx];
-			char nbuf[512];
+			static char nbuf[NBUF_LS];
 			int printed = 0;
 
 			if (opt_inode) {
@@ -998,7 +1031,7 @@ static void print_columns(entry_t *entries, int count, int across)
 			}
 
 			int nlen =
-				print_name_to_buf(nbuf, sizeof(nbuf), e->name);
+				print_name_to_buf(nbuf, sizeof(nbuf), ent_name(e));
 			printf("%s%s%s", color_for(e->st.st_mode), nbuf,
 			       color_reset());
 			printed += nlen;
@@ -1042,9 +1075,9 @@ static void print_commas(entry_t *entries, int count)
 {
 	int line_pos = 0;
 	for (int i = 0; i < count; i++) {
-		char nbuf[512];
+		static char nbuf[NBUF_LS];
 		int nlen =
-			print_name_to_buf(nbuf, sizeof(nbuf), entries[i].name);
+			print_name_to_buf(nbuf, sizeof(nbuf), ent_name(&entries[i]));
 
 		int extra = (i < count - 1) ? 2 : 0; /* ", " */
 		if (line_pos > 0 && line_pos + nlen + extra > term_width) {
@@ -1132,7 +1165,7 @@ static void list_directory(const char *path, int show_header, int first)
 
 		if (nsub > 0) {
 			/* Allocate an array of full path strings */
-			char(*subpaths)[256] = malloc(nsub * 256);
+			char **subpaths = calloc((size_t)nsub, sizeof(char *));
 			if (subpaths) {
 				int si = 0;
 				for (int i = 0; i < count && si < nsub; i++) {
@@ -1143,13 +1176,17 @@ static void list_directory(const char *path, int show_header, int first)
 					if (strcmp(entries[i].name, ".") == 0 ||
 					    strcmp(entries[i].name, "..") == 0)
 						continue;
-					build_path(subpaths[si], 256, path,
+					char sub[PATH_MAX_LS];
+					build_path(sub, sizeof(sub), path,
 						   entries[i].name);
-					si++;
+					subpaths[si++] = strdup(sub);
 				}
 
 				for (int i = 0; i < nsub; i++) {
-					list_directory(subpaths[i], 1, 0);
+					if (subpaths[i])
+						list_directory(subpaths[i], 1,
+							       0);
+					free(subpaths[i]);
 				}
 				free(subpaths);
 			}
@@ -1175,6 +1212,7 @@ static void process_arg(const char *path, entry_t *dir_args, int *dir_count,
 		entry_t *e = &dir_args[*dir_count];
 		strncpy(e->name, path, sizeof(e->name) - 1);
 		e->name[sizeof(e->name) - 1] = '\0';
+		e->path = path;
 		e->st = st;
 		e->stat_valid = 1;
 		e->link_valid = 0;
@@ -1183,18 +1221,13 @@ static void process_arg(const char *path, entry_t *dir_args, int *dir_count,
 		entry_t *e = &file_args[*file_count];
 		strncpy(e->name, path, sizeof(e->name) - 1);
 		e->name[sizeof(e->name) - 1] = '\0';
+		e->path = path;
 		e->st = st;
 		e->stat_valid = 1;
 		e->link_valid = 0;
 
-		if (S_ISLNK(st.st_mode)) {
-			int n = readlink(path, e->link_target,
-					 sizeof(e->link_target) - 1);
-			if (n > 0) {
-				e->link_target[n] = '\0';
-				e->link_valid = 1;
-			}
-		}
+		if (S_ISLNK(st.st_mode))
+			set_link(e, path);
 		(*file_count)++;
 	}
 }
@@ -1800,9 +1833,10 @@ int main(int argc, char **argv)
 
 	int first = 1;
 
-	/* Print files first */
+	/* Print files first (and, with -d, directories): operands, not the
+	 * contents of a directory, so no dirpath and no "total" line. */
 	if (file_count > 0) {
-		print_entries(file_args, file_count, ".");
+		print_entries(file_args, file_count, NULL);
 		first = 0;
 	}
 
@@ -1812,8 +1846,8 @@ int main(int argc, char **argv)
 		if (!first)
 			printf("\n");
 		if (show_header)
-			printf("%s:\n", dir_args[i].name);
-		list_directory(dir_args[i].name, 0, first);
+			printf("%s:\n", ent_name(&dir_args[i]));
+		list_directory(ent_name(&dir_args[i]), 0, first);
 		first = 0;
 	}
 

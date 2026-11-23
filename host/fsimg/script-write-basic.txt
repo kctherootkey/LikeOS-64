@@ -1,0 +1,48 @@
+# Write test common to every read-write driver (test-fs runner script).
+# Only operations every one of them has: files, directories, rename within
+# a directory, truncate, unlink.  Copyright (C) 2026 The LikeOS Project
+mount
+mkdir /wt
+mkdir /wt/sub
+write /wt/empty zero:0
+write /wt/one text:x
+write /wt/f511 pat:1:511
+write /wt/f4096 pat:2:4096
+write /wt/f4097 pat:3:4097
+write /wt/f65537 pat:4:65537
+write /wt/big pat:5:3m
+pwrite /wt/f4096 100 pat:6:50
+truncate /wt/f4097 4000
+truncate /wt/f511 10000
+append /wt/one text:yz
+=EXISTS mkdir /wt/sub
+=NOTEMPTY rmdir /wt
+=NOT_FOUND stat /wt/none
+rename /wt/f65537 /wt/renamed
+write /wt/sub/a pat:7:12345
+unlink /wt/big
+cycle
+check /wt/f4097 pat:3:4000
+check /wt/renamed pat:4:65537
+check /wt/sub/a pat:7:12345
+=NOT_FOUND stat /wt/big
+=NOT_FOUND stat /wt/f65537
+pread /wt/f4096 0 4096
+pread /wt/f511 0 10000
+cat /wt/one
+stat /wt/f511
+# an idle mounted filesystem writes nothing
+sync
+mark
+readall
+statfs
+nowrites
+# rewrite and delete everything again
+write /wt/big2 pat:8:2m
+unlink /wt/sub/a
+rmdir /wt/sub
+unlink /wt/renamed
+cycle
+check /wt/big2 pat:8:2m
+=NOT_FOUND stat /wt/sub
+manifest /wt

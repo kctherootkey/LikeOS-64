@@ -1071,7 +1071,7 @@ static BOOLEAN validate_elf64(Elf64_Ehdr *elf_header) {
  *
  *  On-disk fields are read by byte offset (little-endian) to avoid struct
  *  packing concerns in the freestanding EFI environment.  Mirrors the read
- *  logic in kernel/fs/ext4.c (superblock, group desc, inode, extent + classic
+ *  logic in kernel/fs/ext4/ (superblock, group desc, inode, extent + classic
  *  indirect mapping, linear directory scan).
  * =========================================================================== */
 

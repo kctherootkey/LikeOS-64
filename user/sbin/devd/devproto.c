@@ -247,8 +247,19 @@ const char *devp_errname(int err)
 	case ENOTSUP: return "ENOTSUP";
 	case ECANCELED: return "ECANCELED";
 	case ENOMEDIUM: return "ENOMEDIUM";
+	case EUCLEAN: return "EUCLEAN";
 	default: return "EIO";
 	}
+}
+
+int devp_mount_parse(char *const *tok, int n, int *recover)
+{
+	if (n < 2 || n > 3 || strcmp(tok[0], "MOUNT") != 0)
+		return -1;
+	if (n == 3 && strcmp(tok[2], "recover") != 0)
+		return -1;
+	*recover = n == 3;
+	return 0;
 }
 
 int devp_parse_u64(const char *s, uint64_t max, uint64_t *out)
@@ -266,4 +277,11 @@ int devp_parse_u64(const char *s, uint64_t max, uint64_t *out)
 	}
 	*out = v;
 	return 0;
+}
+
+int devp_automount(const struct devp_flags *f)
+{
+	if (f->system || f->internal || !f->supported || f->ejected)
+		return 0;
+	return f->optical || (f->usb && f->removable);
 }

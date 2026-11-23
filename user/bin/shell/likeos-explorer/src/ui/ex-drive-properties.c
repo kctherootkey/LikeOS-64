@@ -27,6 +27,19 @@ typedef struct {
 	gboolean fs_known;
 } Drive;
 
+/* Used and free as the file system reports them.  Used is its own figure
+ * where it gives one (the file system's own structures and the space kept
+ * back for the system count as neither), else what free leaves of the
+ * capacity. */
+static void space_split(Drive *d, guint64 size, guint64 fr, guint64 us)
+{
+	d->free = MIN(fr, size);
+	if (us != G_MAXUINT64)
+		d->used = MIN(us, size - d->free);
+	else
+		d->used = size - d->free;
+}
+
 static void drive_free(Drive *d)
 {
 	g_cancellable_cancel(d->cancel);
@@ -175,12 +188,14 @@ static void got_space(GObject *src, GAsyncResult *res, gpointer data)
 			i, G_FILE_ATTRIBUTE_FILESYSTEM_SIZE);
 		guint64 fr = g_file_info_get_attribute_uint64(
 			i, G_FILE_ATTRIBUTE_FILESYSTEM_FREE);
+		guint64 us = g_file_info_has_attribute(
+				     i, G_FILE_ATTRIBUTE_FILESYSTEM_USED) ?
+				     g_file_info_get_attribute_uint64(
+					     i, G_FILE_ATTRIBUTE_FILESYSTEM_USED) :
+				     G_MAXUINT64;
 
-		/* Used and free add up to the capacity: what is reserved
-		 * for the system counts as used. */
 		d->capacity = size;
-		d->free = MIN(fr, size);
-		d->used = size - d->free;
+		space_split(d, size, fr, us);
 		d->known = TRUE;
 		if (!d->fs_known) {
 			const char *t = g_file_info_get_attribute_string(
@@ -195,24 +210,6 @@ static void got_space(GObject *src, GAsyncResult *res, gpointer data)
 }
 
 /* ---- the window ------------------------------------------------------------------- */
-
-static const char *type_text(const ExVolume *v)
-{
-	switch (v->kind) {
-	case EX_VOLUME_USB:
-		return "USB drive";
-	case EX_VOLUME_RAM:
-		return "RAM disk";
-	case EX_VOLUME_NETWORK:
-		return "Network share";
-	case EX_VOLUME_OTHER:
-		return "Removable drive";
-	case EX_VOLUME_SYSTEM:
-	case EX_VOLUME_LOCAL:
-	default:
-		return "Local disk";
-	}
-}
 
 static GtkWidget *text_label(const char *text, gboolean right)
 {
@@ -338,9 +335,19 @@ void ex_drive_properties_show(ExWindow *w, const ExVolume *v)
 	/* What it is. */
 	grid = card(page);
 	gtk_grid_attach(GTK_GRID(grid), key_label("Type"), 0, r, 1, 1);
-	gtk_grid_attach(GTK_GRID(grid), text_label(type_text(v), FALSE), 1, r++,
-			1, 1);
-	if (v->kind == EX_VOLUME_USB) {
+	{
+		/* "CD/DVD drive", "Local disk", "USB drive" -- and a note
+		 * when nothing can be written to it */
+		char *type = v->kind == EX_VOLUME_DRIVE && v->readonly ?
+				     g_strdup_printf("%s (read-only)",
+						     ex_volume_type_text(v)) :
+				     g_strdup(ex_volume_type_text(v));
+
+		gtk_grid_attach(GTK_GRID(grid), text_label(type, FALSE), 1,
+				r++, 1, 1);
+		g_free(type);
+	}
+	if (v->kind == EX_VOLUME_DRIVE) {
 		fs = ex_devd_volume_fs_name(ex_devd_get_default(), v->fs_type,
 					    v->supported);
 		d->fs_known = TRUE;
@@ -391,8 +398,7 @@ void ex_drive_properties_show(ExWindow *w, const ExVolume *v)
 		a->cancel = g_object_ref(d->cancel);
 		if (v->size) {
 			d->capacity = v->size;
-			d->free = MIN(v->free, v->size);
-			d->used = v->size - d->free;
+			space_split(d, v->size, v->free, v->used);
 			d->known = TRUE;
 		}
 		g_file_query_filesystem_info_async(

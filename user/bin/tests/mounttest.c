@@ -29,6 +29,21 @@
  *   mounttest --yes --ext4 DEVICE only the ext4 tests (formats DEVICE)
  *   mounttest --yes --vfat DEVICE only the vfat tests (formats DEVICE)
  *   mounttest --tmpfs             only the tests that need no device
+ *   mounttest --yes --exfat DEVICE  exFAT: mkfs.exfat, then the common
+ *                                 tests and exFAT's own (Unicode names,
+ *                                 names without case, a large file kept
+ *                                 across mounts, truncate)
+ *   mounttest --yes --ntfs DEVICE   the same for NTFS (mkfs.ntfs)
+ *   ... --preformatted            with --exfat or --ntfs: DEVICE already
+ *                                 holds that filesystem (made on another
+ *                                 system); it is not formatted, but the
+ *                                 tests still write to it -- a scratch
+ *                                 volume only
+ *   mounttest --iso DEVICE        ISO 9660, read-only: DEVICE (a CD/DVD
+ *                                 drive with a disc, or a disk holding an
+ *                                 image) is mounted read-only, walked and
+ *                                 read completely; every write must fail
+ *                                 with EROFS.  Nothing is written.
  *
  * Without --yes nothing is formatted and the program stops.  A device that
  * is mounted (it appears in /proc/mounts) is refused.  The exit status is
@@ -38,6 +53,7 @@
  * Copyright (C) 2026 The LikeOS Project
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -56,6 +72,9 @@
 #define EXT4_MAGIC 0xEF53UL
 #define MSDOS_MAGIC 0x4d44UL
 #define TMPFS_MAGIC 0x01021994UL
+#define EXFAT_MAGIC 0x2011BAB0UL
+#define NTFS_MAGIC 0x5346544EUL
+#define ISOFS_MAGIC 0x9660UL
 
 static int g_fail, g_pass;
 static char g_base[64]; /* scratch directory: /tmp/mounttest.XXXXXX */
@@ -572,8 +591,12 @@ static void test_common(const char *fstype, unsigned long magic,
 		check(unlinkat(dfd, "g", 0) == 0 && unlinkat(dfd, "h", 0) == 0 &&
 			      unlinkat(dfd, "sub", AT_REMOVEDIR) == 0,
 		      "unlinkat");
+		/* FAT and exFAT keep no modes, NTFS keeps them only with
+		 * ACLs: there it only has to be accepted */
 		check(fchmodat(dfd, ".", 0750, 0) == 0 && stat(d, &st) == 0 &&
-			      ((fstype && strcmp(fstype, "vfat") == 0) ||
+			      ((fstype && (strcmp(fstype, "vfat") == 0 ||
+					   strcmp(fstype, "exfat") == 0 ||
+					   strcmp(fstype, "ntfs") == 0)) ||
 			       (st.st_mode & 0777) == 0750),
 		      "fchmodat");
 		close(dfd);
@@ -818,6 +841,404 @@ static void test_vfat(const char *dev)
 	umount(g_mnt);
 }
 
+/* ---- exFAT and NTFS ------------------------------------------------------ */
+
+/* A file of `size' bytes with a pattern that differs in every 4 KiB. */
+static int write_pattern(const char *path, size_t size)
+{
+	static unsigned char buf[65536];
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	size_t done = 0;
+
+	if (fd < 0)
+		return -1;
+	while (done < size) {
+		size_t n = size - done < sizeof(buf) ? size - done : sizeof(buf);
+
+		for (size_t i = 0; i < n; i++)
+			buf[i] = (unsigned char)(((done + i) >> 12) * 31 +
+						 (done + i) * 7);
+		if (write(fd, buf, n) != (ssize_t)n) {
+			close(fd);
+			return -1;
+		}
+		done += n;
+	}
+	return close(fd);
+}
+
+static int pattern_matches(const char *path, size_t size)
+{
+	static unsigned char buf[65536];
+	int fd = open(path, O_RDONLY);
+	size_t done = 0;
+
+	if (fd < 0)
+		return 0;
+	while (done < size) {
+		size_t want = size - done < sizeof(buf) ? size - done :
+							   sizeof(buf);
+		ssize_t n = read(fd, buf, want);
+
+		if (n <= 0) {
+			close(fd);
+			return 0;
+		}
+		for (ssize_t i = 0; i < n; i++)
+			if (buf[i] != (unsigned char)(((done + (size_t)i) >> 12) *
+							      31 +
+						      (done + (size_t)i) * 7)) {
+				close(fd);
+				return 0;
+			}
+		done += (size_t)n;
+	}
+	{
+		char extra;
+		ssize_t n = read(fd, &extra, 1);
+
+		close(fd);
+		return n == 0;
+	}
+}
+
+/* Is `name' listed in directory `dir'? */
+static int dir_lists(const char *dir, const char *name)
+{
+	DIR *d = opendir(dir);
+	struct dirent *e;
+	int found = 0;
+
+	if (!d)
+		return 0;
+	while ((e = readdir(d)))
+		if (strcmp(e->d_name, name) == 0)
+			found = 1;
+	closedir(d);
+	return found;
+}
+
+/* What exFAT and NTFS volumes share beyond the common tests. */
+static void test_foreign_rw(const char *fstype, const char *dev,
+			    const char *opts, int nocase)
+{
+	char a[192], b[192];
+	struct stat st;
+	const size_t big = 3 * 1024 * 1024 + 123;
+
+	printf("== %s: names, a large file, truncate\n", fstype);
+	path_in(a, sizeof(a), "Gr\xc3\xb6\xc3\x9f" "e \xe2\x82\xac.txt");
+	check(write_file(a, "unicode\n") == 0 && read_matches(a, "unicode\n"),
+	      "a file with a Unicode name");
+	check(dir_lists(g_mnt, "Gr\xc3\xb6\xc3\x9f" "e \xe2\x82\xac.txt"),
+	      "readdir lists the Unicode name as it was written");
+	if (nocase) {
+		path_in(b, sizeof(b), "GR\xc3\x96\xc3\x9f" "E \xe2\x82\xac.TXT");
+		check(read_matches(b, "unicode\n"),
+		      "the name is found in other case");
+		errno = 0;
+		check(open(b, O_WRONLY | O_CREAT | O_EXCL, 0644) < 0 &&
+			      errno == EEXIST,
+		      "creating it in other case: EEXIST");
+	}
+	unlink(a);
+	{
+		char longname[256], full[512];
+
+		memset(longname, 'n', 255);
+		longname[255] = '\0';
+		snprintf(full, sizeof(full), "%s/%s", g_mnt, longname);
+		check(write_file(full, "long\n") == 0 && unlink(full) == 0,
+		      "a name of 255 characters");
+	}
+
+	path_in(a, sizeof(a), "big.bin");
+	check(write_pattern(a, big) == 0 && stat(a, &st) == 0 &&
+		      (size_t)st.st_size == big,
+	      "write a file of 3 MiB and a bit");
+	check(pattern_matches(a, big), "read it back");
+	check(umount(g_mnt) == 0 && mount(dev, g_mnt, fstype, 0, opts) == 0,
+	      "umount and mount again");
+	check(pattern_matches(a, big), "the large file is intact after the "
+				       "new mount");
+	check(truncate(a, 5000) == 0 && stat(a, &st) == 0 &&
+		      st.st_size == 5000 && pattern_matches(a, 5000),
+	      "truncate shrinks it, the start stays");
+	check(truncate(a, 100000) == 0 && stat(a, &st) == 0 &&
+		      st.st_size == 100000,
+	      "truncate extends it");
+	{
+		char buf[4096];
+		int fd = open(a, O_RDONLY);
+		ssize_t n = -1;
+		int zero = 1;
+
+		if (fd >= 0 && lseek(fd, 50000, SEEK_SET) == 50000)
+			n = read(fd, buf, sizeof(buf));
+		for (ssize_t i = 0; i < n; i++)
+			if (buf[i])
+				zero = 0;
+		if (fd >= 0)
+			close(fd);
+		check(n == (ssize_t)sizeof(buf) && zero,
+		      "the extended part reads as zeros");
+	}
+	check(unlink(a) == 0, "unlink the large file");
+
+	/* a directory tree, renamed and removed */
+	path_in(a, sizeof(a), "tree");
+	path_in(b, sizeof(b), "tree2");
+	check(mkdir(a, 0755) == 0, "mkdir a directory");
+	{
+		char f[256];
+		int ok = 1;
+
+		for (int i = 0; i < 300; i++) {
+			snprintf(f, sizeof(f), "%s/file-%03d", a, i);
+			if (write_file(f, "x\n") != 0)
+				ok = 0;
+		}
+		check(ok, "300 files in it");
+		check(rename(a, b) == 0, "rename the directory");
+		for (int i = 0; i < 300; i++) {
+			snprintf(f, sizeof(f), "%s/file-%03d", b, i);
+			if (!read_matches(f, "x\n") || unlink(f) != 0)
+				ok = 0;
+		}
+		check(ok, "every file is there under the new name, then gone");
+		check(rmdir(b) == 0, "rmdir the empty directory");
+	}
+	check(umount(g_mnt) == 0, "umount");
+}
+
+static void test_exfat(const char *dev, int preformatted)
+{
+	char a[160];
+	struct stat st;
+	const char *opts = "uid=1000,gid=1001,fmask=0137,dmask=0027";
+	char *mk[] = { "mkfs.exfat", "-L", "MOUNTTEST", (char *)dev, NULL };
+
+	printf("== exfat on %s%s\n", dev,
+	       preformatted ? " (formatted elsewhere)" : "");
+	if (!preformatted && run(mk) != 0) {
+		check(0, "mkfs.exfat (use --preformatted for a volume made "
+			 "elsewhere)");
+		return;
+	}
+	check(mount(dev, g_mnt, "exfat", 0, opts) == 0,
+	      "mount exfat with uid=, gid=, fmask=, dmask=");
+	if (!listed(g_mnt, "exfat"))
+		return;
+	path_in(a, sizeof(a), "owner.txt");
+	write_file(a, "exfat\n");
+	check(stat(a, &st) == 0 && st.st_uid == 1000 && st.st_gid == 1001 &&
+		      (st.st_mode & 0777) == 0640,
+	      "the options are what stat reports");
+	unlink(a);
+	test_common("exfat", EXFAT_MAGIC, 1, dev, opts);
+	test_foreign_rw("exfat", dev, opts, 1);
+}
+
+static void test_ntfs(const char *dev, int preformatted)
+{
+	char a[160];
+	struct stat st;
+	const char *opts = "uid=1000,gid=1001,fmask=0137,dmask=0027";
+	char *mk[] = { "mkfs.ntfs", "-F", "-f", "-q", "-L", "MOUNTTEST",
+		       (char *)dev, NULL };
+
+	printf("== ntfs on %s%s\n", dev,
+	       preformatted ? " (formatted elsewhere)" : "");
+	if (!preformatted && run(mk) != 0) {
+		check(0, "mkfs.ntfs (use --preformatted for a volume made "
+			 "elsewhere)");
+		return;
+	}
+	check(mount(dev, g_mnt, "ntfs", 0, opts) == 0,
+	      "mount ntfs with uid=, gid=, fmask=, dmask=");
+	if (!listed(g_mnt, "ntfs"))
+		return;
+	path_in(a, sizeof(a), "owner.txt");
+	write_file(a, "ntfs\n");
+	check(stat(a, &st) == 0 && st.st_uid == 1000 && st.st_gid == 1001 &&
+		      (st.st_mode & 0777) == 0640,
+	      "the options are what stat reports");
+	unlink(a);
+	test_common("ntfs", NTFS_MAGIC, 1, dev, opts);
+	test_foreign_rw("ntfs", dev, opts, 0);
+}
+
+/* ---- ISO 9660: read-only -------------------------------------------------- */
+
+#define ISO_WALK_DEPTH 24
+#define ISO_WALK_MAX 200000
+
+struct walk {
+	long dirs, files, links, entries;
+	long long bytes;
+	int bad_size, bad_read, bad_link, too_deep;
+};
+
+/* Every directory listed, every file read to its end, every link read. */
+static void iso_walk(const char *dir, int depth, struct walk *w)
+{
+	DIR *d;
+	struct dirent *e;
+
+	if (depth > ISO_WALK_DEPTH) {
+		w->too_deep = 1;
+		return;
+	}
+	d = opendir(dir);
+	if (!d) {
+		w->bad_read++;
+		return;
+	}
+	w->dirs++;
+	while ((e = readdir(d)) && w->entries < ISO_WALK_MAX) {
+		char p[1024];
+		struct stat st;
+
+		if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+			continue;
+		w->entries++;
+		if (snprintf(p, sizeof(p), "%s/%s", dir, e->d_name) >=
+		    (int)sizeof(p))
+			continue;
+		if (lstat(p, &st) != 0) {
+			w->bad_read++;
+			continue;
+		}
+		if (S_ISDIR(st.st_mode)) {
+			iso_walk(p, depth + 1, w);
+		} else if (S_ISLNK(st.st_mode)) {
+			char t[1024];
+			ssize_t n = readlink(p, t, sizeof(t));
+
+			w->links++;
+			if (n <= 0)
+				w->bad_link++;
+		} else if (S_ISREG(st.st_mode)) {
+			static char buf[65536];
+			long long got = 0;
+			int fd = open(p, O_RDONLY);
+			ssize_t n;
+
+			w->files++;
+			if (fd < 0) {
+				w->bad_read++;
+				continue;
+			}
+			while ((n = read(fd, buf, sizeof(buf))) > 0)
+				got += n;
+			if (n < 0)
+				w->bad_read++;
+			close(fd);
+			if (got != (long long)st.st_size)
+				w->bad_size++;
+			w->bytes += got;
+		}
+	}
+	closedir(d);
+}
+
+static void test_iso(const char *dev)
+{
+	struct statfs sf;
+	struct statvfs sv;
+	struct walk w;
+	char a[192], first[256] = "";
+	DIR *d;
+	struct dirent *e;
+
+	printf("== iso9660 on %s (read-only; nothing is written)\n", dev);
+	check(mount(dev, g_mnt, "iso9660", MS_RDONLY | MS_NOSUID | MS_NODEV,
+		    NULL) == 0,
+	      "mount iso9660 read-only");
+	if (!listed(g_mnt, "iso9660"))
+		return;
+	check(statfs(g_mnt, &sf) == 0 && (unsigned long)sf.f_type == ISOFS_MAGIC &&
+		      sf.f_blocks > 0 && sf.f_bfree == 0,
+	      "statfs: type, size, nothing free");
+	check(statvfs(g_mnt, &sv) == 0 && (sv.f_flag & ST_RDONLY),
+	      "statvfs: read-only");
+
+	memset(&w, 0, sizeof(w));
+	iso_walk(g_mnt, 0, &w);
+	printf("     %ld directories, %ld files (%lld bytes), %ld links\n",
+	       w.dirs, w.files, w.bytes, w.links);
+	check(w.dirs >= 1 && !w.too_deep, "walk the whole tree");
+	check(w.bad_read == 0, "every directory and file opens and reads");
+	check(w.bad_size == 0, "every file reads exactly its size");
+	check(w.bad_link == 0, "every symbolic link reads");
+
+	/* writes: all refused */
+	path_in(a, sizeof(a), "mounttest-new.txt");
+	errno = 0;
+	check(open(a, O_WRONLY | O_CREAT, 0644) < 0 && errno == EROFS,
+	      "create: EROFS");
+	errno = 0;
+	path_in(a, sizeof(a), "mounttest-dir");
+	check(mkdir(a, 0755) < 0 && errno == EROFS, "mkdir: EROFS");
+	d = opendir(g_mnt);
+	while (d && (e = readdir(d)))
+		if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) {
+			snprintf(first, sizeof(first), "%s", e->d_name);
+			break;
+		}
+	if (d)
+		closedir(d);
+	if (first[0]) {
+		struct stat st;
+		char to[192];
+
+		path_in(a, sizeof(a), first);
+		path_in(to, sizeof(to), "mounttest-renamed");
+		errno = 0;
+		check(rename(a, to) < 0 && errno == EROFS, "rename: EROFS");
+		if (lstat(a, &st) == 0 && S_ISREG(st.st_mode)) {
+			int fd;
+
+			errno = 0;
+			fd = open(a, O_WRONLY);
+			check(fd < 0 && errno == EROFS,
+			      "open an existing file for writing: EROFS");
+			if (fd >= 0)
+				close(fd);
+			errno = 0;
+			check(unlink(a) < 0 && errno == EROFS, "unlink: EROFS");
+			errno = 0;
+			check(truncate(a, 0) < 0 && errno == EROFS,
+			      "truncate: EROFS");
+		} else if (lstat(a, &st) == 0 && S_ISDIR(st.st_mode)) {
+			errno = 0;
+			check(rmdir(a) < 0 && errno == EROFS, "rmdir: EROFS");
+		}
+		errno = 0;
+		check(chmod(a, 0777) < 0 && errno == EROFS, "chmod: EROFS");
+	}
+	errno = 0;
+	check(mount(dev, g_mnt, "iso9660", MS_REMOUNT, NULL) < 0,
+	      "remount read-write is refused");
+	check(statvfs(g_mnt, &sv) == 0 && (sv.f_flag & ST_RDONLY),
+	      "still read-only");
+	check(umount(g_mnt) == 0 && !listed(g_mnt, NULL), "umount");
+
+	/* asked for read-write: refused, or read-only all the same */
+	if (mount(dev, g_mnt, "iso9660", 0, NULL) == 0) {
+		check(statvfs(g_mnt, &sv) == 0 && (sv.f_flag & ST_RDONLY),
+		      "a read-write mount request gives a read-only mount");
+		path_in(a, sizeof(a), "mounttest-new.txt");
+		errno = 0;
+		check(open(a, O_WRONLY | O_CREAT, 0644) < 0 && errno == EROFS,
+		      "and creating still fails with EROFS");
+		check(umount(g_mnt) == 0, "umount");
+	} else {
+		check(errno == EROFS || errno == EACCES,
+		      "a read-write mount request is refused (EROFS)");
+	}
+}
+
 /* ---- tmpfs and the rest --------------------------------------------------- */
 
 static void test_tmpfs(void)
@@ -899,6 +1320,8 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: mounttest --yes [--ext4|--vfat] DEVICE   (DEVICE is formatted!)\n"
+		"       mounttest --yes --exfat|--ntfs [--preformatted] DEVICE\n"
+		"       mounttest --iso DEVICE                   (read-only)\n"
 		"       mounttest --tmpfs\n");
 	exit(2);
 }
@@ -906,6 +1329,7 @@ static void usage(void)
 int main(int argc, char **argv)
 {
 	int yes = 0, only_ext4 = 0, only_vfat = 0, only_tmpfs = 0;
+	int only_exfat = 0, only_ntfs = 0, only_iso = 0, preformatted = 0;
 	const char *dev = NULL;
 
 	for (int i = 1; i < argc; i++) {
@@ -917,6 +1341,14 @@ int main(int argc, char **argv)
 			only_vfat = 1;
 		else if (strcmp(argv[i], "--tmpfs") == 0)
 			only_tmpfs = 1;
+		else if (strcmp(argv[i], "--exfat") == 0)
+			only_exfat = 1;
+		else if (strcmp(argv[i], "--ntfs") == 0)
+			only_ntfs = 1;
+		else if (strcmp(argv[i], "--iso") == 0)
+			only_iso = 1;
+		else if (strcmp(argv[i], "--preformatted") == 0)
+			preformatted = 1;
 		else if (argv[i][0] == '-')
 			usage();
 		else
@@ -926,8 +1358,13 @@ int main(int argc, char **argv)
 		fprintf(stderr, "mounttest: must run as root\n");
 		return 2;
 	}
+	if (only_ext4 + only_vfat + only_tmpfs + only_exfat + only_ntfs +
+		    only_iso > 1 ||
+	    (preformatted && !only_exfat && !only_ntfs))
+		usage();
 	if (!only_tmpfs) {
-		if (!dev || !yes)
+		/* --iso writes nothing: no --yes needed */
+		if (!dev || (!yes && !only_iso))
 			usage();
 		struct stat st;
 		if (stat(dev, &st) != 0 || !S_ISBLK(st.st_mode)) {
@@ -955,12 +1392,20 @@ int main(int argc, char **argv)
 
 	test_misc();
 	test_root_dev();
-	if (!only_tmpfs && !only_vfat)
-		test_ext4(dev);
-	if (!only_tmpfs && !only_ext4)
-		test_vfat(dev);
-	if (!only_ext4 && !only_vfat)
-		test_tmpfs();
+	if (only_exfat)
+		test_exfat(dev, preformatted);
+	else if (only_ntfs)
+		test_ntfs(dev, preformatted);
+	else if (only_iso)
+		test_iso(dev);
+	if (!only_exfat && !only_ntfs && !only_iso) {
+		if (!only_tmpfs && !only_vfat)
+			test_ext4(dev);
+		if (!only_tmpfs && !only_ext4)
+			test_vfat(dev);
+		if (!only_ext4 && !only_vfat)
+			test_tmpfs();
+	}
 
 	/* leave nothing mounted behind */
 	while (listed(g_mnt, NULL) && umount2(g_mnt, MNT_DETACH) == 0)

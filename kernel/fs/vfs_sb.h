@@ -126,7 +126,75 @@ typedef struct vfs_sb_ops {
      * paths guard against this to avoid corrupting the root dir.  Drivers
      * with no such concept may return 0. */
 	unsigned long (*reserved_meta_block)(vfs_superblock_t *sb);
+
+	/* OPTIONAL delayed allocation.  NULL in every filesystem that gives a
+	 * written block its disk location before the page is dirtied (FAT32,
+	 * ext4): writeback then never calls it.
+	 *
+	 * A filesystem with delayed allocation lets write() only RESERVE space
+	 * and dirty the page; the block keeps mapping to LBA 0 (block_at()
+	 * gives its positional id, block_to_lba() gives 0) until writeback
+	 * asks for it to be placed.  Writeback calls this hook, before it
+	 * computes any LBA, for a dirty page at least one of whose blocks
+	 * has no disk location (block_at()/map_block() give 0, or
+	 * block_to_lba() of the id gives 0):
+	 *
+	 *   chain_id     the stream (pc_page_t.cluster_id of the page)
+	 *   first_block  block index (in block_size() units) of the range
+	 *   count        blocks in the range, >= 1:
+	 *                  block == page:  a run of consecutive dirty pages of
+	 *                                  the stream that all lack a location
+	 *                                  (at most 32 at a time);
+	 *                  block <  page:  the PAGE_SIZE / block_size blocks of
+	 *                                  the one page;
+	 *                  block >  page:  the one block holding the page.
+	 *
+	 * The driver gives a disk location to every block of the range that
+	 * write() reserved (it may place more -- the rest of the reserved
+	 * extent -- to get contiguous allocations), so that block_at() and
+	 * block_to_lba() map it to a non-zero LBA once this returns.  Blocks of
+	 * the range that are genuine holes (nothing reserved, the page holds
+	 * zeros there) may stay holes.  Returns:
+	 *
+	 *   0                  done: writeback maps the range again and writes
+	 *   VFS_SB_ALLOC_NONE  nothing of the range awaits allocation:
+	 *                      writeback goes on exactly as without the hook
+	 *   < 0 (ST_*)         failed: the page(s) stay dirty and are retried
+	 *                      by later writeback passes; writeback logs it
+	 *                      (rate limited).  Writeback cannot hand the error
+	 *                      to anybody, so the DRIVER records it on the
+	 *                      stream for fsync()/close()/syncfs() to report.
+	 *
+	 * Context: writeback (pagecache_flush_file / _fileset / _sb / _all /
+	 * _bounded, pagecache_balance_dirty, reclaim) holds lock_io() -- for a
+	 * driver with lock_map() that is the metadata lock EXCLUSIVE -- and
+	 * none of the cache's spinlocks; the pages concerned are held and
+	 * taken for writeback (PC_PAGE_LOCKED).  The call may be nested in the
+	 * driver's own write path (balance_dirty from write(), which holds
+	 * lock_io() recursively), and may concern any stream of the
+	 * filesystem.  So the hook must NOT take a per-stream/per-inode lock
+	 * or anything else ordered above the metadata lock, and must not call
+	 * back into a writeback entry point (pagecache_flush_*,
+	 * pagecache_balance_dirty) or invalidate the stream's pages.  It may
+	 * sleep, take the allocator lock and lower locks, and do device I/O
+	 * (bitmap reads/writes through the driver's write chokepoint).  If it
+	 * reads or dirties the driver's own metadata pages in the cache
+	 * (pagecache_get*, pagecache_get_for_write), those calls take
+	 * lock_map() or lock_io() again under this lock_io() hold, so the
+	 * driver's metadata lock must grant that recursion to its exclusive
+	 * owner (shared under exclusive included).  The
+	 * mapping it changes must be read only under lock_map() / lock_io(),
+	 * which is how the cache reads it.  Ordering on disk is the driver's:
+	 * writeback stores the data right after the hook returns, under the
+	 * same lock_io() hold; the record that references the new blocks
+	 * (inode / MFT record) is written later by write_inode() or the
+	 * driver's own metadata flush. */
+	int (*alloc_blocks)(vfs_superblock_t *sb, unsigned long chain_id,
+			    unsigned long first_block, unsigned long count);
 } vfs_sb_ops_t;
+
+/* vfs_sb_ops_t.alloc_blocks(): nothing in the range awaits allocation. */
+#define VFS_SB_ALLOC_NONE 1
 
 struct vfs_superblock {
 	const vfs_sb_ops_t *ops;

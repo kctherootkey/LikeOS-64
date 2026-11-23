@@ -15,16 +15,6 @@ extern "C" {
  * relies on exactly that and never includes <alloca.h> itself. */
 #include <alloca.h>
 
-/* Environment storage limits.
- * MAX_ENV_SIZE is the cap for ONE "NAME" or "value" string.  It was 4096,
- * which made libc's static env_names/env_values arrays (and execv's
- * conversion buffer) total ~2 MB of BSS — eagerly zero-faulted into every
- * process at exec, dominating process-start time.  The kernel caps the whole
- * environment at 16 KB total (copy_user_string_array), so 512 per string is
- * still generous. */
-#define MAX_ENV_VARS 128
-#define MAX_ENV_SIZE 512
-
 /* Longest multibyte character: four bytes, the most UTF-8 uses.  MB_CUR_MAX is
  * the same constant rather than a locale-dependent call because there is one
  * encoding here; code that sizes a buffer with it gets the right answer
@@ -83,14 +73,15 @@ int unsetenv(const char* name);
 int clearenv(void);
 int putenv(char* string);
 
-/* Iterate all environment variables.
- * Call with *cookie = 0 to start; returns name/value pairs.
- * Returns 0 when no more variables. */
+/* Iterate all environment variables (the entries of `environ').
+ * Call with *cookie = 0 to start; returns name/value pairs.  The name is a
+ * per-thread copy valid until this thread's next call; the value points
+ * into the entry.  Returns 0 when no more variables. */
 int env_iter(int *cookie, const char **name, const char **value);
 /* Return count of environment variables */
 int env_count(void);
 
-/* Initialize libc env storage from envp[] (called by _start before main) */
+/* Make envp[] the environment (called by _start before main) */
 void __libc_init_environ(char **envp);
 
 // Path utilities

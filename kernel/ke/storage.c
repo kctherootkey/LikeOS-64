@@ -52,7 +52,7 @@ void snd_late_init(void);
 #include <kernel/fs/pagecache.h>
 #include <kernel/fs/dcache.h>
 #include <kernel/fs/icache.h>
-#include <kernel/fs/ext4.h>
+#include <kernel/fs/ext4/ext4.h>
 #include <kernel/uapi/bug.h>
 
 /* ==========================================================================

@@ -299,12 +299,16 @@ static void req_fstypes(struct client *c)
 	client_ok(c, "FSTYPES", NULL);
 }
 
-/* MOUNT, UNMOUNT, EJECT, FORMAT: the device, the peer, the device rules. */
+/* MOUNT, UNMOUNT, EJECT, FORMAT: the device, the peer, the device rules
+ * (policy.c) -- the same for every caller, root included. */
 static struct dev *modify_target(struct client *c, const char *verb,
-				 const char *name, int with_name)
+				 enum dev_op op, const char *name,
+				 int with_name)
 {
 	struct dev *d = tab_find(name);
 	const char *n = with_name ? name : NULL;
+	const char *why = "";
+	int r;
 
 	if (!d) {
 		client_err(c, verb, n, ENOENT, "no such device");
@@ -315,18 +319,17 @@ static struct dev *modify_target(struct client *c, const char *verb,
 			   "only the user logged in at the console may do this");
 		return NULL;
 	}
-	if (!dev_policy_ok(d)) {
-		client_err(c, verb, n, EPERM,
-			   d->system ? "this is a system drive" :
-				       "not a removable USB drive");
+	r = dev_policy_check(d, op, &why);
+	if (r < 0) {
+		client_err(c, verb, n, -r, why);
 		return NULL;
 	}
 	return d;
 }
 
-static void req_mount(struct client *c, const char *name)
+static void req_mount(struct client *c, const char *name, int recover)
 {
-	struct dev *d = modify_target(c, "MOUNT", name, 0);
+	struct dev *d = modify_target(c, "MOUNT", OP_MOUNT, name, 0);
 	char path[DEVD_PATH_MAX], nm[DEVD_NAME_MAX];
 	const char *msg = "";
 	struct devp_line l;
@@ -335,7 +338,7 @@ static void req_mount(struct client *c, const char *name)
 	if (!d)
 		return;
 	strlcpy_d(nm, d->name, sizeof(nm));
-	r = do_mount(d, c->uid, c->gid, path, sizeof(path), &msg);
+	r = do_mount(d, c->uid, c->gid, recover, path, sizeof(path), &msg);
 	if (r < 0) {
 		client_err(c, "MOUNT", NULL, -r, msg);
 		return;
@@ -350,7 +353,7 @@ static void req_mount(struct client *c, const char *name)
 
 static void req_unmount(struct client *c, const char *name)
 {
-	struct dev *d = modify_target(c, "UNMOUNT", name, 0);
+	struct dev *d = modify_target(c, "UNMOUNT", OP_UNMOUNT, name, 0);
 	char nm[DEVD_NAME_MAX];
 	const char *msg = "";
 	int r;
@@ -368,7 +371,7 @@ static void req_unmount(struct client *c, const char *name)
 
 static void req_eject(struct client *c, const char *name)
 {
-	struct dev *d = modify_target(c, "EJECT", name, 0);
+	struct dev *d = modify_target(c, "EJECT", OP_EJECT, name, 0);
 	char disk[DEVD_NAME_MAX], nm[DEVD_NAME_MAX];
 	const char *msg = "";
 	int r;
@@ -398,7 +401,7 @@ static void req_eject(struct client *c, const char *name)
 
 static void req_format(struct client *c, char **tok, int ntok)
 {
-	struct dev *d = modify_target(c, "FORMAT", tok[1], 1);
+	struct dev *d = modify_target(c, "FORMAT", OP_FORMAT, tok[1], 1);
 	char nm[DEVD_NAME_MAX];
 	const char *msg = "";
 	int r;
@@ -418,6 +421,7 @@ static void handle_line(struct client *c, char *line)
 {
 	char *tok[DEVP_MAX_TOKENS];
 	int n = devp_split(line, tok, DEVP_MAX_TOKENS);
+	int recover = 0;
 
 	if (n == 0)
 		return; /* an empty line asks nothing */
@@ -438,8 +442,11 @@ static void handle_line(struct client *c, char *line)
 	} else if (strcmp(tok[0], "SUBSCRIBE") == 0 && n == 1) {
 		c->subscribed = 1;
 		client_ok(c, "SUBSCRIBE", NULL);
-	} else if (strcmp(tok[0], "MOUNT") == 0 && n == 2) {
-		req_mount(c, tok[1]);
+	} else if (strcmp(tok[0], "MOUNT") == 0 &&
+		   devp_mount_parse(tok, n, &recover) == 0) {
+		req_mount(c, tok[1], recover);
+	} else if (strcmp(tok[0], "MOUNT") == 0 && n == 3) {
+		client_err(c, "MOUNT", NULL, EINVAL, "bad arguments");
 	} else if (strcmp(tok[0], "UNMOUNT") == 0 && n == 2) {
 		req_unmount(c, tok[1]);
 	} else if (strcmp(tok[0], "EJECT") == 0 && n == 2) {

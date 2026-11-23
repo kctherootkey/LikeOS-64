@@ -1,7 +1,9 @@
 // LikeOS Explorer: the device service.
 //
 // devd, the system's device service, knows the disks and the partitions on
-// them, mounts, unmounts, ejects and formats USB drives, and tells its
+// them, mounts, unmounts, ejects and formats USB drives, mounts and ejects
+// CDs and DVDs, mounts the partitions of built-in disks the system does not
+// use (never formatting or ejecting those), and tells its
 // clients when a device came, changed or went.  This is Explorer's client:
 // one connection to the service's socket, opened in the background, with
 // HELLO, SUBSCRIBE, LIST and FSTYPES sent first; then the table of devices
@@ -19,7 +21,8 @@
 //                             connection came or went
 //   "fstypes-changed"  ()
 // Signals of ExDevdFormat:
-//   "progress"  (int percent)
+//   "progress"  (int percent)  -- -1: a step without progress of its own
+//                                 (writing the file system) has started
 //   "finished"  (GError *error)  -- NULL when the drive was formatted
 //
 // Copyright (C) 2026 The LikeOS Project
@@ -61,6 +64,12 @@ void ex_devd_refresh_fstypes(ExDevd *d);
 void ex_devd_mount_async(ExDevd *d, const char *name, GCancellable *cancel,
 			 GAsyncReadyCallback done, gpointer user_data);
 char *ex_devd_mount_finish(ExDevd *d, GAsyncResult *res, GError **error);
+/* MOUNT with recovery: for a volume whose mount failed with
+ * EX_DEVD_ERROR_UNCLEAN and whose user agreed to have the journal
+ * replayed.  Finished with ex_devd_mount_finish(). */
+void ex_devd_mount_recover_async(ExDevd *d, const char *name,
+				 GCancellable *cancel, GAsyncReadyCallback done,
+				 gpointer user_data);
 /* UNMOUNT one volume. */
 void ex_devd_unmount_async(ExDevd *d, const char *name, GCancellable *cancel,
 			   GAsyncReadyCallback done, gpointer user_data);

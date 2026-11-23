@@ -16,8 +16,11 @@
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
+#include <limits.h>
 
 #define SHM_DIR "/dev/shm/"
+/* The directory and one name of up to NAME_MAX bytes, with the NUL. */
+#define SHM_PATH_MAX (sizeof(SHM_DIR) + NAME_MAX)
 
 /* Build "/dev/shm/<name>", rejecting anything that is not a single component.
  * POSIX says the name should start with a slash and contain no others; a name
@@ -54,7 +57,7 @@ static int shm_build_path(const char *name, char *out, size_t cap)
 
 int shm_open(const char *name, int oflag, mode_t mode)
 {
-	char path[128];
+	char path[SHM_PATH_MAX];
 
 	if (shm_build_path(name, path, sizeof(path)) != 0)
 		return -1;
@@ -70,7 +73,7 @@ int shm_open(const char *name, int oflag, mode_t mode)
 
 int shm_unlink(const char *name)
 {
-	char path[128];
+	char path[SHM_PATH_MAX];
 
 	if (shm_build_path(name, path, sizeof(path)) != 0)
 		return -1;

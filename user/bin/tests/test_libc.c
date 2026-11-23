@@ -7591,6 +7591,254 @@ static void test_rtld_debug_rendezvous(void)
 	}
 }
 
+/* ---- dlopen of a tree with a missing piece -------------------------------
+ *
+ * A dlopen that fails part-way must leave nothing behind: an object left
+ * registered under its name with its load unfinished would be found by the
+ * next dlopen of that name and returned as a working handle.
+ *
+ * The libraries are made from /lib/libdlchain.so (DT_NEEDED libdlbase.so) by
+ * rewriting the 12-byte dependency name in a copy.  "tmp/dlmid.so" is found by
+ * the loader as /tmp/dlmid.so (it tries /lib/NAME, then /NAME). */
+
+#define DLMISS_MID "/tmp/dlmid.so"
+
+static int envl_copy(const char *src, const char *dst);
+
+/* Copy `src' to `dst', replacing the dependency name "libdlbase.so" with
+ * `need' (also 12 bytes).  0 on success. */
+static int dlmiss_make(const char *src, const char *dst, const char *need)
+{
+	static const char old[] = "libdlbase.so";
+	int in = open(src, O_RDONLY), out, ok = 0, hits = 0;
+	char *buf = NULL;
+	ssize_t n = 0, r;
+	size_t cap = 0;
+
+	if (in < 0 || strlen(need) != sizeof(old) - 1)
+		goto done;
+	for (;;) {
+		if ((size_t)n == cap) {
+			char *nb = realloc(buf, cap + 65536);
+			if (!nb)
+				goto done;
+			buf = nb;
+			cap += 65536;
+		}
+		r = read(in, buf + n, cap - (size_t)n);
+		if (r < 0)
+			goto done;
+		if (r == 0)
+			break;
+		n += r;
+	}
+	for (ssize_t i = 0; i + (ssize_t)sizeof(old) <= n; i++)
+		if (memcmp(buf + i, old, sizeof(old)) == 0) {
+			memcpy(buf + i, need, sizeof(old) - 1);
+			hits++;
+		}
+	out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+	if (out < 0)
+		goto done;
+	ok = hits > 0 && write(out, buf, (size_t)n) == n;
+	close(out);
+done:
+	if (in >= 0)
+		close(in);
+	free(buf);
+	return ok ? 0 : -1;
+}
+
+struct dlmiss_count {
+	int objects;
+	int strays; /* objects named after the test libraries */
+};
+
+static int dlmiss_count_cb(struct dl_phdr_info *info, size_t sz, void *data)
+{
+	struct dlmiss_count *c = data;
+
+	(void)sz;
+	c->objects++;
+	if (info->dlpi_name && (strstr(info->dlpi_name, "dlmid") ||
+				strstr(info->dlpi_name, "libdlmiss")))
+		c->strays++;
+	return 0;
+}
+
+static struct dlmiss_count dlmiss_count(void)
+{
+	struct dlmiss_count c = { 0, 0 };
+
+	(void)dl_iterate_phdr(dlmiss_count_cb, &c);
+	return c;
+}
+
+/* dlopen `top' expecting a clean failure that names `missing'. */
+static void dlmiss_expect_fail(const char *label, const char *top,
+			       const char *missing)
+{
+	struct dlmiss_count before = dlmiss_count(), after;
+	char what[160];
+	void *h;
+	const char *e;
+
+	(void)dlerror();
+	h = dlopen(top, RTLD_NOW);
+	e = dlerror();
+	after = dlmiss_count();
+	printf("  %s: dlerror: %s\n", label, e ? e : "(none)");
+	snprintf(what, sizeof(what), "%s: dlopen fails", label);
+	test_result(what, h == NULL);
+	snprintf(what, sizeof(what), "%s: dlerror names %s", label, missing);
+	test_result(what, e && strstr(e, missing) != NULL);
+	snprintf(what, sizeof(what), "%s: nothing left loaded", label);
+	test_result(what, after.objects == before.objects &&
+				  after.strays == 0);
+	if (h)
+		dlclose(h);
+}
+
+static void test_dlopen_missing_dependency(void)
+{
+	char dir[64], top[96];
+
+	printf("\n[TEST] dlopen of a library whose dependency is missing\n");
+	snprintf(dir, sizeof(dir), "/tmp/tl_dlmiss.%d", (int)getpid());
+	snprintf(top, sizeof(top), "%s/libdlmiss.so", dir);
+	if (mkdir(dir, 0755) != 0 ||
+	    dlmiss_make("/lib/libdlchain.so", top, "tmp/dlmid.so") != 0) {
+		printf("  [SKIP] could not build the test libraries\n");
+		rmdir(dir);
+		return;
+	}
+	unlink(DLMISS_MID);
+
+	/* libdlmiss -> tmp/dlmid.so, which does not exist. */
+	dlmiss_expect_fail("direct, 1st", top, "tmp/dlmid.so");
+	dlmiss_expect_fail("direct, 2nd", top, "tmp/dlmid.so");
+
+	/* libdlmiss -> tmp/dlmid.so -> libdlgone.so: the middle one loads,
+	 * and has to be thrown away again with its parent. */
+	if (dlmiss_make("/lib/libdlchain.so", DLMISS_MID, "libdlgone.so") ==
+	    0) {
+		dlmiss_expect_fail("two levels, 1st", top, "libdlgone.so");
+		dlmiss_expect_fail("two levels, 2nd", top, "libdlgone.so");
+	} else {
+		printf("  [SKIP] could not build %s\n", DLMISS_MID);
+	}
+
+	/* A library with nothing missing still loads. */
+	{
+		void *h = dlopen("/lib/libtestlib.so", RTLD_NOW);
+		int (*add)(int, int) =
+			h ? (int (*)(int, int))dlsym(h, "testlib_add") : NULL;
+
+		test_result("a good library loads after the failures",
+			    h != NULL && add && add(40, 2) == 42);
+		if (h)
+			dlclose(h);
+	}
+
+	/* The dependency appears: the same name now loads, and works. */
+	unlink(DLMISS_MID);
+	if (envl_copy("/lib/libdlbase.so", DLMISS_MID) == 0) {
+		void *h = dlopen(top, RTLD_NOW);
+		int (*call_dep)(void) =
+			h ? (int (*)(void))dlsym(h, "dlchain_call_dep") : NULL;
+
+		if (!h)
+			printf("  dlerror: %s\n", dlerror());
+		test_result("once the dependency exists, the same name loads",
+			    h != NULL);
+		test_result("... and calls into the dependency",
+			    call_dep && call_dep() == 0x5EED);
+		if (h) {
+			dlclose(h);
+			/* The dependency stays loaded after its parent; it
+			 * has the one reference it was loaded with, so a
+			 * handle to it closed twice unloads it. */
+			void *dep = dlopen("tmp/dlmid.so", RTLD_NOW);
+			if (dep) {
+				dlclose(dep);
+				dlclose(dep);
+			}
+		}
+	} else {
+		printf("  [SKIP] could not copy /lib/libdlbase.so\n");
+	}
+
+	unlink(DLMISS_MID);
+	unlink(top);
+	rmdir(dir);
+}
+
+/* posix_spawnp and posix_spawn start the child with the envp they are given,
+ * not with the caller's environment. */
+static int spawn_env_run(int use_path, const char *file, char *const envp[],
+			 char *out, size_t outsz)
+{
+	char *const av[] = { "sh", "-c", "printf '%s' \"$TL_SPAWN_VAR\"",
+			     NULL };
+	posix_spawn_file_actions_t fa;
+	int pfd[2], r, status = 0;
+	pid_t pid = -1;
+	size_t n = 0;
+	ssize_t k;
+
+	out[0] = '\0';
+	if (pipe(pfd) != 0)
+		return -1;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_adddup2(&fa, pfd[1], 1);
+	posix_spawn_file_actions_addclose(&fa, pfd[0]);
+	r = use_path ? posix_spawnp(&pid, file, &fa, NULL, av, envp) :
+		       posix_spawn(&pid, file, &fa, NULL, av, envp);
+	posix_spawn_file_actions_destroy(&fa);
+	close(pfd[1]);
+	if (r == 0) {
+		while (n < outsz - 1 &&
+		       (k = read(pfd[0], out + n, outsz - 1 - n)) > 0)
+			n += (size_t)k;
+		out[n] = '\0';
+		waitpid(pid, &status, 0);
+	}
+	close(pfd[0]);
+	return r;
+}
+
+static void test_posix_spawn_envp(void)
+{
+	char *const env[] = { "TL_SPAWN_VAR=from-envp", "PATH=/nonexistent",
+			      NULL };
+	char out[128];
+	int r;
+
+	printf("\n[TEST] posix_spawnp()/posix_spawn() pass the given envp\n");
+	setenv("TL_SPAWN_VAR", "from-environ", 1);
+
+	r = spawn_env_run(1, "sh", env, out, sizeof(out));
+	test_result("posix_spawnp() with envp returns 0", r == 0);
+	test_result("posix_spawnp() child sees the envp value",
+		    strcmp(out, "from-envp") == 0);
+	if (strcmp(out, "from-envp") != 0)
+		printf("    child printed \"%s\"\n", out);
+
+	r = spawn_env_run(0, "/bin/sh", env, out, sizeof(out));
+	test_result("posix_spawn() child sees the envp value",
+		    r == 0 && strcmp(out, "from-envp") == 0);
+
+	r = spawn_env_run(1, "sh", environ, out, sizeof(out));
+	test_result("posix_spawnp() with environ passes the environment",
+		    r == 0 && strcmp(out, "from-environ") == 0);
+
+	r = spawn_env_run(1, "tl-no-such-program", env, out, sizeof(out));
+	test_result("posix_spawnp() of a name found nowhere returns ENOENT",
+		    r == ENOENT);
+
+	unsetenv("TL_SPAWN_VAR");
+}
+
 static void test_jobctl_wait(void)
 {
 	printf("\n[TEST] waitpid job control (WUNTRACED/WCONTINUED)\n");
@@ -21493,6 +21741,313 @@ static void test_storage(int storage_only)
 	test_storage_write(target);
 }
 
+/*
+ * The environment and the loader with long values and deep paths.
+ *
+ * Environment values of thousands of bytes and more than 128 variables must
+ * come through whole, and a library loaded from a path of up to PATH_MAX
+ * bytes must be recorded by the loader with that whole path.
+ */
+
+/* Run `sh -c script' with `envp' (NULL: through execv, i.e. with environ)
+ * and return its exit status, or -1. */
+static int envl_sh(const char *script, char *const envp[])
+{
+	char *av[] = { (char *)"sh", (char *)"-c", (char *)script, NULL };
+	pid_t pid = fork();
+	int st = 0;
+
+	if (pid < 0)
+		return -1;
+	if (pid == 0) {
+		if (envp)
+			execve("/bin/sh", av, envp);
+		else
+			execv("/bin/sh", av);
+		_exit(127);
+	}
+	if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
+		return -1;
+	return WEXITSTATUS(st);
+}
+
+static int envl_copy(const char *src, const char *dst)
+{
+	char buf[4096];
+	int in = open(src, O_RDONLY), out;
+	ssize_t n;
+	int ok = 1;
+
+	if (in < 0)
+		return -1;
+	out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+	if (out < 0) {
+		close(in);
+		return -1;
+	}
+	while ((n = read(in, buf, sizeof(buf))) > 0)
+		if (write(out, buf, (size_t)n) != n) {
+			ok = 0;
+			break;
+		}
+	if (n < 0)
+		ok = 0;
+	close(in);
+	close(out);
+	return ok ? 0 : -1;
+}
+
+static void test_env_long_paths(void)
+{
+	extern char **environ;
+	enum { NCOMP = 14, CLEN = 220 };
+	static char deep[PATH_MAX];
+	static char lib[PATH_MAX], lib2[PATH_MAX], val[4096];
+	char *dirs[NCOMP + 1];
+	size_t dl;
+	int nd = 0;
+
+	printf("\n[TEST] environment and loader: long values, deep paths\n");
+
+	/* ---- values up to 4095 bytes, more than 128 variables ---- */
+	memset(val, 'v', 4095);
+	val[4095] = '\0';
+	test_result("setenv of a 4095-byte value",
+		    setenv("TL_BIGVAL", val, 1) == 0 && getenv("TL_BIGVAL") &&
+			    strlen(getenv("TL_BIGVAL")) == 4095);
+	unsetenv("TL_BIGVAL");
+	{
+		int ok = 1, seen = 0;
+		char nm[32];
+		for (int i = 0; i < 1000 && ok; i++) {
+			snprintf(nm, sizeof(nm), "TL_MANY_%d", i);
+			snprintf(val, sizeof(val), "%d", i * 7);
+			ok = setenv(nm, val, 1) == 0;
+		}
+		for (int i = 0; i < 1000 && ok; i++) {
+			snprintf(nm, sizeof(nm), "TL_MANY_%d", i);
+			const char *g = getenv(nm);
+			ok = g && atoi(g) == i * 7;
+		}
+		for (int i = 0; environ[i]; i++)
+			if (strncmp(environ[i], "TL_MANY_", 8) == 0)
+				seen++;
+		test_result("1000 variables set, read back, all in environ",
+			    ok && seen == 1000);
+		for (int i = 0; i < 1000; i++) {
+			snprintf(nm, sizeof(nm), "TL_MANY_%d", i);
+			unsetenv(nm);
+		}
+		seen = 0;
+		for (int i = 0; environ[i]; i++)
+			if (strncmp(environ[i], "TL_MANY_", 8) == 0)
+				seen++;
+		test_result("... and all removed again", seen == 0);
+	}
+
+	/* putenv keeps the caller's string; unsetenv removes duplicates */
+	{
+		static char pe[] = "TL_PUT=one";
+		int n = 0;
+		putenv(pe);
+		pe[7] = 'O';
+		test_result("putenv stores the caller's string",
+			    getenv("TL_PUT") &&
+				    strcmp(getenv("TL_PUT"), "One") == 0);
+		unsetenv("TL_PUT");
+		test_result("unsetenv after putenv", getenv("TL_PUT") == NULL);
+
+		/* A program may install an environment of its own. */
+		char **saved = environ;
+		static char d1[] = "TL_DUP=1", d2[] = "TL_DUP=2",
+			    k1[] = "TL_KEEP=k";
+		char *mine[] = { d1, k1, d2, NULL };
+		environ = mine;
+		test_result("getenv reads an environ the program installed",
+			    getenv("TL_DUP") &&
+				    strcmp(getenv("TL_DUP"), "1") == 0);
+		test_result("setenv into it grows it into a new array",
+			    setenv("TL_NEW", "n", 1) == 0 && environ != mine &&
+				    getenv("TL_KEEP") &&
+				    strcmp(getenv("TL_NEW"), "n") == 0);
+		unsetenv("TL_DUP");
+		for (int i = 0; environ[i]; i++)
+			if (strncmp(environ[i], "TL_DUP=", 7) == 0)
+				n++;
+		test_result("unsetenv removes every duplicate", n == 0);
+		environ = saved;
+	}
+
+	/* ---- a deep directory ---- */
+	dl = (size_t)snprintf(deep, sizeof(deep), "%s", tmpp("envdeep"));
+	if (mkdir(deep, 0755) != 0 && errno != EEXIST) {
+		test_fail("envdeep: mkdir of the top failed");
+		return;
+	}
+	dirs[nd++] = strdup(deep);
+	for (int i = 0; i < NCOMP; i++) {
+		deep[dl++] = '/';
+		for (int k = 0; k < CLEN; k++)
+			deep[dl++] = (char)('a' + (i + k) % 26);
+		deep[dl] = '\0';
+		if (mkdir(deep, 0755) != 0) {
+			test_fail("envdeep: mkdir failed");
+			goto out;
+		}
+		dirs[nd++] = strdup(deep);
+	}
+	printf("  deep directory: %zu bytes\n", dl);
+
+	/* PWD at depth: getcwd -> setenv -> getenv -> a child's $PWD */
+	{
+		char *before = getcwd(NULL, 0);
+		char *cwd = NULL;
+		int ok = chdir(deep) == 0 && (cwd = getcwd(NULL, 0)) != NULL;
+		test_result("chdir + getcwd at depth", ok && strcmp(cwd, deep) == 0);
+		if (ok) {
+			test_result("setenv PWD to the deep directory",
+				    setenv("PWD", cwd, 1) == 0 && getenv("PWD") &&
+					    strcmp(getenv("PWD"), deep) == 0);
+			char script[128];
+			snprintf(script, sizeof(script),
+				 "[ ${#PWD} -eq %zu ] && [ \"$PWD\" = \"$(pwd)\" ]",
+				 strlen(deep));
+			test_result("a child started with execv sees the whole PWD",
+				    envl_sh(script, NULL) == 0);
+		}
+		free(cwd);
+		if (before) {
+			if (chdir(before) == 0)
+				setenv("PWD", before, 1);
+			free(before);
+		}
+	}
+
+	/* execve with a 3000-byte value, explicitly and through environ */
+	{
+		static char big[3100];
+		memcpy(big, "TL_BIG=", 7);
+		memset(big + 7, 'x', 3000);
+		big[3007] = '\0';
+		char *ev[] = { big, (char *)"PATH=/bin:/usr/bin", NULL };
+		test_result("execve with a 3000-byte environment value",
+			    envl_sh("[ ${#TL_BIG} -eq 3000 ]", ev) == 0);
+		setenv("TL_BIG", big + 7, 1);
+		test_result("execv passes a 3000-byte setenv value on",
+			    envl_sh("[ ${#TL_BIG} -eq 3000 ]", NULL) == 0);
+		unsetenv("TL_BIG");
+	}
+
+	/* The kernel's exec limits: argv and envp share 128 KiB of strings
+	 * (ARG_MAX, the NULs included); more is E2BIG. */
+	{
+		char **ev = calloc(1001, sizeof(char *));
+		char *sv = calloc(1001, 16);
+		char *big = malloc(ARG_MAX + 1);
+		if (ev && sv && big) {
+			for (int i = 0; i < 1000; i++) {
+				ev[i] = sv + 16 * i;
+				snprintf(ev[i], 16, "TL_E%d=1", i);
+			}
+			char *av[] = { (char *)"true", NULL };
+			char *keep = ev[139];
+			ev[139] = NULL;
+			test_result("execve with 139 environment strings",
+				    exec_expect_errno("/bin/true", av, ev) == 0);
+			ev[139] = keep;
+			test_result("execve with 1000 environment strings",
+				    exec_expect_errno("/bin/true", av, ev) == 0);
+			/* argv[0] "true" (5) + one string filling the rest */
+			memset(big, 'x', ARG_MAX);
+			big[ARG_MAX - 5 - 1] = '\0';
+			char *av2[] = { (char *)"true", big, NULL };
+			char *noenv[] = { NULL };
+			test_result("execve with exactly ARG_MAX bytes of arguments",
+				    exec_expect_errno("/bin/true", av2, noenv) ==
+					    0);
+			big[ARG_MAX - 5 - 1] = 'x';
+			big[ARG_MAX - 5] = '\0';
+			test_result("execve with ARG_MAX + 1 bytes -> E2BIG",
+				    exec_expect_errno("/bin/true", av2, noenv) ==
+					    E2BIG);
+		}
+		free(ev);
+		free(sv);
+		free(big);
+	}
+
+	/* ---- dlopen of a library in the deep directory ---- */
+	snprintf(lib, sizeof(lib), "%s/libtestlib_deep.so", deep);
+	if (envl_copy("/lib/libtestlib.so", lib) != 0) {
+		printf("  [SKIP] /lib/libtestlib.so could not be copied\n");
+		goto out;
+	}
+	{
+		void *h = dlopen(lib, RTLD_NOW);
+		test_result("dlopen by a deep absolute path", h != NULL);
+		if (h) {
+			int (*add)(int, int) =
+				(int (*)(int, int))dlsym(h, "testlib_add");
+			Dl_info info;
+			test_result("dlsym in the deep library",
+				    add && add(40, 2) == 42);
+			test_result("dladdr names the whole deep path",
+				    add &&
+					    dladdr((const void *)(uintptr_t)add,
+						   &info) &&
+					    info.dli_fname &&
+					    strcmp(info.dli_fname, lib) == 0);
+			void *h2 = dlopen(lib, RTLD_NOW);
+			test_result("a second dlopen finds the same object",
+				    h2 == h);
+			if (h2)
+				dlclose(h2);
+			dlclose(h);
+		}
+	}
+
+	/* A long file name too (the loader keeps names inline only up to
+	 * 95 bytes). */
+	{
+		size_t l = (size_t)snprintf(lib2, sizeof(lib2), "%s/libtl_", deep);
+		for (int k = 0; k < 180; k++)
+			lib2[l++] = 'n';
+		memcpy(lib2 + l, ".so", 4);
+		if (envl_copy("/lib/libtestlib.so", lib2) == 0) {
+			void *h = dlopen(lib2, RTLD_NOW);
+			void *h2 = h ? dlopen(lib2, RTLD_NOW) : NULL;
+			test_result("dlopen of a library with a 190-byte name",
+				    h != NULL);
+			test_result("... found again under its whole name",
+				    h && h2 == h);
+			if (h2)
+				dlclose(h2);
+			if (h)
+				dlclose(h);
+			unlink(lib2);
+		}
+	}
+
+	/* dlerror names a missing deep library in full */
+	{
+		char missing[PATH_MAX];
+		snprintf(missing, sizeof(missing), "%s/libnothere.so", deep);
+		test_result("dlopen of a missing deep library fails",
+			    dlopen(missing, RTLD_NOW) == NULL);
+		const char *err = dlerror();
+		test_result("dlerror names the whole path",
+			    err && strstr(err, missing) != NULL);
+	}
+	unlink(lib);
+
+out:
+	while (nd > 0) {
+		nd--;
+		rmdir(dirs[nd]);
+		free(dirs[nd]);
+	}
+}
+
 int main(int argc, char **argv)
 {
 	g_ctor_saw_main_before = g_ctor_ran; /* constructors must precede main */
@@ -29257,6 +29812,8 @@ int main(int argc, char **argv)
 	test_ptrace_detach_releases_group();
 	test_fatal_signal_kills_group();
 	test_rtld_debug_rendezvous();
+	test_dlopen_missing_dependency();
+	test_posix_spawn_envp();
 	test_shm();
 	test_sysv_shm();
 	test_sysv_sem();
@@ -38541,6 +39098,7 @@ network_skip:;
 	}
 
 	test_loader_introspection();
+	test_env_long_paths();
 	test_exit_handlers();
 	test_math_classification();
 	test_hyperbolic();

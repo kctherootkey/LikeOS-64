@@ -355,6 +355,70 @@ static unsigned long pc_walk_chain(vfs_superblock_t *sb,
 }
 
 // ============================================================================
+// Delayed allocation at writeback (vfs_sb_ops_t.alloc_blocks)
+// ============================================================================
+
+/* Block `block_index' of `chain_id' has no disk location: no id, or an id
+ * whose LBA is 0.  Asked the way writeback maps a block (the walk, then the
+ * filesystem's direct map).  Caller holds lock_io(). */
+static int pc_wb_block_unplaced(vfs_superblock_t *sb, unsigned long chain_id,
+				unsigned long block_index)
+{
+	unsigned long blk = pc_walk_chain(sb, chain_id, block_index);
+
+	if (blk == 0)
+		blk = vfs_sb_map_block(sb, chain_id, block_index);
+	return blk == 0 || blk >= vfs_sb_end_of_chain(sb) ||
+	       vfs_sb_block_to_lba(sb, blk) == 0;
+}
+
+/* Ask the filesystem to place blocks [first, first + count) of `chain_id'.
+ * 0 when writeback may go on (placed, or nothing to place), < 0 when the
+ * data has nowhere to go yet and must stay dirty.  Caller holds lock_io(). */
+static int pc_wb_alloc(vfs_superblock_t *sb, unsigned long chain_id,
+		       unsigned long first, unsigned long count)
+{
+	int r = sb->ops->alloc_blocks(sb, chain_id, first, count);
+
+	if (r < 0) {
+		WARN_RATELIMIT(
+			1,
+			"pagecache: delayed allocation failed (%d) for file 0x%lx blocks %lu..%lu - the data stays dirty",
+			r, chain_id, first, first + count - 1);
+		return r;
+	}
+	WARN_ON_ONCE(r != 0 && r != VFS_SB_ALLOC_NONE);
+	return 0;
+}
+
+/* Before one dirty page is stored by the per-page writeback paths: when the
+ * filesystem allocates late and a block of the page has no location yet,
+ * have it placed.  0: store the page as usual; < 0: leave it dirty.
+ * Without an alloc_blocks hook this is always 0 and does nothing.  Caller
+ * holds lock_io() and has the page taken for writeback. */
+static int pc_wb_delalloc_page(vfs_superblock_t *sb, const pc_page_t *p)
+{
+	unsigned long bs, first, count;
+
+	if (!sb->ops->alloc_blocks)
+		return 0;
+	bs = vfs_sb_block_size(sb);
+	if (!bs)
+		return 0;
+	if (bs >= PAGE_SIZE) {
+		first = p->page_index / (bs / PAGE_SIZE);
+		count = 1;
+	} else {
+		count = PAGE_SIZE / bs;
+		first = p->page_index * count;
+	}
+	for (unsigned long i = 0; i < count; i++)
+		if (pc_wb_block_unplaced(sb, p->cluster_id, first + i))
+			return pc_wb_alloc(sb, p->cluster_id, first, count);
+	return 0;
+}
+
+// ============================================================================
 // Initialization
 // ============================================================================
 
@@ -432,6 +496,13 @@ pc_page_t *pagecache_lookup(struct vfs_superblock *sb, unsigned long cluster_id,
 	return pc_lookup(sb, cluster_id, page_index, 0);
 }
 
+pc_page_t *pagecache_lookup_held(struct vfs_superblock *sb,
+				 unsigned long cluster_id,
+				 unsigned long page_index)
+{
+	return pc_lookup(sb, cluster_id, page_index, 1);
+}
+
 // ============================================================================
 // Insert a page into the hash table + LRU
 // ============================================================================
@@ -490,6 +561,40 @@ static pc_page_t *pc_insert(pc_page_t *page, int hold)
 pc_page_t *pagecache_insert(pc_page_t *page)
 {
 	return pc_insert(page, 0);
+}
+
+/* A page the filesystem filled itself (see pagecache.h).  Filled completely
+ * before pc_insert() publishes it, so no lookup can see it half filled; a
+ * key cached meanwhile keeps its page and the new one is freed unseen. */
+pc_page_t *pagecache_install(struct vfs_superblock *sb,
+			     unsigned long cluster_id, unsigned long page_index,
+			     const void *src, unsigned long len, int hold)
+{
+	pc_page_t *pg, *r;
+
+	might_sleep();
+	VM_BUG_ON(sb == NULL);
+	if (!pc_initialized || !sb || cluster_id < 2)
+		return 0;
+	if (WARN_ON_ONCE(len > PAGE_SIZE || (len && !src)))
+		return 0;
+
+	pagecache_reclaim_if_needed();
+	pg = pc_page_alloc();
+	if (!pg)
+		return 0;
+	pg->cluster_id = cluster_id;
+	pg->sb = sb;
+	pg->page_index = page_index;
+	if (len)
+		mm_memcpy(pg->data, src, len);
+	if (len < PAGE_SIZE)
+		mm_memset(pg->data + len, 0, PAGE_SIZE - len);
+	pg->flags = PC_PAGE_VALID | PC_PAGE_REFERENCED;
+	r = pc_insert(pg, hold);
+	if (r != pg)
+		pc_page_free(pg);
+	return r;
 }
 
 // ============================================================================
@@ -603,7 +708,14 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
 				unsigned long secs_per_block = bs / ss;
 				unsigned long eoc = vfs_sb_end_of_chain(sb);
 				vfs_sb_lock_io(sb);
-				if (bs >= PAGE_SIZE) {
+				if (pc_flags(pg) & PC_PAGE_DEAD) {
+					/* Invalidated while this waited for
+					 * the I/O lock: its blocks are not its
+					 * own any more -- never stored. */
+				} else if (pc_wb_delalloc_page(sb, pg) < 0) {
+					/* Nowhere to store it yet: it
+					 * stays dirty (flush_ok 0). */
+				} else if (bs >= PAGE_SIZE) {
 					unsigned long ppb = bs / PAGE_SIZE;
 					if (ppb == 0)
 						ppb = 1;
@@ -622,33 +734,37 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
 					 * leave it dirty instead. */
 					if (dc >= 2 && dc < eoc && dc_lba != 0) {
 						unsigned long lba = dc_lba;
+						flush_ok = 1;
 						if (bs == PAGE_SIZE) {
-							pc_write_sectors(
-								bdev, lba,
-								secs_per_block,
-								pg->data);
+							if (pc_write_sectors(
+								    bdev, lba,
+								    secs_per_block,
+								    pg->data) != 0)
+								flush_ok = 0;
 						} else {
 							void *tmp = kalloc(bs);
-							if (tmp) {
-								pc_read_sectors(
-									bdev,
-									lba,
-									secs_per_block,
-									tmp);
+							if (!tmp ||
+							    pc_read_sectors(
+								    bdev, lba,
+								    secs_per_block,
+								    tmp) != 0) {
+								flush_ok = 0;
+							} else {
 								mm_memcpy(
 									(uint8_t *)tmp +
 										sp * PAGE_SIZE,
 									pg->data,
 									PAGE_SIZE);
-								pc_write_sectors(
-									bdev,
-									lba,
-									secs_per_block,
-									tmp);
-								kfree(tmp);
+								if (pc_write_sectors(
+									    bdev,
+									    lba,
+									    secs_per_block,
+									    tmp) != 0)
+									flush_ok = 0;
 							}
+							if (tmp)
+								kfree(tmp);
 						}
-						flush_ok = 1;
 					}
 				} else {
 					unsigned long bpp = PAGE_SIZE / bs;
@@ -667,11 +783,12 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
 								sb, cur);
 						/* Skip holes (lba 0): never
 						 * write over the superblock. */
-						if (lba != 0)
-							pc_write_sectors(
-								bdev, lba,
-								secs_per_block,
-								pg->data + off);
+						if (lba != 0 &&
+						    pc_write_sectors(
+							    bdev, lba,
+							    secs_per_block,
+							    pg->data + off) != 0)
+							flush_ok = 0;
 						off += bs;
 						if (c + 1 < bpp)
 							cur = vfs_sb_next_block(
@@ -851,7 +968,9 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 			unsigned long cl = pc_walk_chain(sb, start_cluster, ci);
 			if (!cl || cl >= eoc)
 				break;
-			page_lba = vfs_sb_block_to_lba(sb, cl) + sub * spp;
+			unsigned long cl_lba = vfs_sb_block_to_lba(sb, cl);
+			/* A hole stays a hole for every page of the block. */
+			page_lba = cl_lba ? cl_lba + sub * spp : 0;
 		} else {
 			unsigned long bpp = PAGE_SIZE / bs;
 			unsigned long fci = pi * bpp;
@@ -860,12 +979,33 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 			if (!fc || fc >= eoc)
 				break;
 			int ok = 1;
-			for (unsigned long c = 1; c < bpp; c++) {
+			/* Positional ids (block_at) are consecutive whatever
+			 * the disk layout is, so for them consecutive ids say
+			 * nothing: the blocks' LBAs must be consecutive too --
+			 * or all holes, which reads as a zero page.  Anything
+			 * else (fragmented, part hole) takes the per-block
+			 * read in pc_get(). */
+			unsigned long fc_lba = 0, spb = bs / ss;
+			if (sb->ops->block_at) {
+				fc_lba = vfs_sb_block_to_lba(sb, fc);
+				if (!spb)
+					ok = 0;
+			}
+			for (unsigned long c = 1; ok && c < bpp; c++) {
 				unsigned long nc = pc_walk_chain(
 					sb, start_cluster, fci + c);
 				if (nc != fc + c) {
 					ok = 0;
 					break;
+				}
+				if (sb->ops->block_at) {
+					unsigned long nl =
+						vfs_sb_block_to_lba(sb, nc);
+					if (fc_lba ? nl != fc_lba + c * spb :
+						     nl != 0) {
+						ok = 0;
+						break;
+					}
 				}
 			}
 			if (!ok) {
@@ -1267,6 +1407,50 @@ static void pc_wb_retire(pc_page_t *p)
 	pc_wb_release(p);
 }
 
+/* Delayed allocation for a sorted batch of one-block pages: each run of
+ * consecutive pages of one file whose blocks have no location yet goes to the
+ * filesystem in one alloc_blocks() call, so it can place them contiguously.
+ * The pages of a run it could not place are released (still dirty) and
+ * dropped from the batch; the rest stay, in order.  Returns the new count.
+ * Caller holds lock_io(); only called when the hook exists. */
+static int pc_wb_delalloc_batch(vfs_superblock_t *sb, pc_page_t **batch, int n)
+{
+	int out = 0;
+
+	for (int i = 0; i < n;) {
+		pc_page_t *p = batch[i];
+		int j;
+
+		/* Invalidated pages are the main loop's to let go of. */
+		if ((pc_flags(p) & PC_PAGE_DEAD) ||
+		    !pc_wb_block_unplaced(sb, p->cluster_id, p->page_index)) {
+			batch[out++] = p;
+			i++;
+			continue;
+		}
+		for (j = i + 1; j < n; j++) {
+			pc_page_t *q = batch[j];
+
+			if (q->cluster_id != p->cluster_id ||
+			    q->page_index != batch[j - 1]->page_index + 1 ||
+			    (pc_flags(q) & PC_PAGE_DEAD) ||
+			    !pc_wb_block_unplaced(sb, q->cluster_id,
+						  q->page_index))
+				break;
+		}
+		if (pc_wb_alloc(sb, p->cluster_id, p->page_index,
+				(unsigned long)(j - i)) < 0) {
+			for (int k = i; k < j; k++)
+				pc_wb_release(batch[k]);
+		} else {
+			for (int k = i; k < j; k++)
+				batch[out++] = batch[k];
+		}
+		i = j;
+	}
+	return out;
+}
+
 /*
  * Write a batch of locked, dirty pages, merging neighbours.
  *
@@ -1317,6 +1501,12 @@ static int pc_writeback_batch(vfs_superblock_t *sb, pc_page_t **batch, int n)
 		}
 		batch[j + 1] = key;
 	}
+
+	/* Late allocation first, so the loop below finds every page it may
+	 * store with a location -- and so a run of such pages is placed in
+	 * one piece. */
+	if (sb->ops->alloc_blocks)
+		n = pc_wb_delalloc_batch(sb, batch, n);
 
 	for (int i = 0; i <= n; i++) {
 		pc_page_t *p = (i < n) ? batch[i] : 0;
@@ -1409,6 +1599,12 @@ static int pc_writeback_batch(vfs_superblock_t *sb, pc_page_t **batch, int n)
 				/* LBA 0 is the boot block, used as the sentinel
 				 * for a hole -- never file data. */
 				if (lba == 0) {
+					/* With late allocation the hook was
+					 * asked to place it just now. */
+					WARN_RATELIMIT(
+						sb->ops->alloc_blocks != NULL,
+						"pagecache: dirty page (file 0x%lx, page %lu) still has no location after delayed allocation - stays dirty",
+						p->cluster_id, p->page_index);
 					pc_wb_release(p);
 					p = 0;
 				}
@@ -1738,6 +1934,23 @@ int pagecache_flush_file(struct vfs_superblock *sb, unsigned long cluster_id)
 
 		for (int i = 0; i < batch_count; i++) {
 			pc_page_t *p = batch[i];
+			int failed = 0;
+
+			/* Invalidated while taken (truncate, unlink, the
+			 * stream's id reused): its blocks are no longer its
+			 * own -- never stored, freed by this release.  Same
+			 * rule as pc_writeback_batch(). */
+			if (pc_flags(p) & PC_PAGE_DEAD) {
+				pc_wb_release(p);
+				continue;
+			}
+
+			/* Late allocation: nowhere to store it yet, so it
+			 * stays dirty. */
+			if (pc_wb_delalloc_page(sb, p) < 0) {
+				pc_wb_release(p);
+				continue;
+			}
 
 			if (bs >= PAGE_SIZE) {
 				unsigned long ppb = bs / PAGE_SIZE;
@@ -1777,25 +1990,31 @@ int pagecache_flush_file(struct vfs_superblock *sb, unsigned long cluster_id)
 					continue;
 				}
 				if (bs == PAGE_SIZE) {
-					pc_write_sectors(bdev, lba,
-							 secs_per_block,
-							 p->data);
+					if (pc_write_sectors(bdev, lba,
+							     secs_per_block,
+							     p->data) != 0)
+						failed = 1;
 				} else {
 					void *tmp = kalloc(bs);
-					if (tmp) {
-						pc_read_sectors(bdev, lba,
-								secs_per_block,
-								tmp);
+					if (!tmp ||
+					    pc_read_sectors(bdev, lba,
+							    secs_per_block,
+							    tmp) != 0) {
+						failed = 1;
+					} else {
 						mm_memcpy(
 							(uint8_t *)tmp +
 								sub_page *
 									PAGE_SIZE,
 							p->data, PAGE_SIZE);
-						pc_write_sectors(bdev, lba,
-								 secs_per_block,
-								 tmp);
-						kfree(tmp);
+						if (pc_write_sectors(
+							    bdev, lba,
+							    secs_per_block,
+							    tmp) != 0)
+							failed = 1;
 					}
+					if (tmp)
+						kfree(tmp);
 				}
 			} else {
 				unsigned long bpp = PAGE_SIZE / bs;
@@ -1812,10 +2031,11 @@ int pagecache_flush_file(struct vfs_superblock *sb, unsigned long cluster_id)
 						sb, cur_block);
 					/* Skip holes (lba 0) — never write the
 					 * superblock. */
-					if (lba != 0)
-						pc_write_sectors(bdev, lba,
-								 secs_per_block,
-								 p->data + offset);
+					if (lba != 0 &&
+					    pc_write_sectors(bdev, lba,
+							     secs_per_block,
+							     p->data + offset) != 0)
+						failed = 1;
 					offset += bs;
 					if (c + 1 < bpp)
 						cur_block = vfs_sb_next_block(
@@ -1823,8 +2043,15 @@ int pagecache_flush_file(struct vfs_superblock *sb, unsigned long cluster_id)
 				}
 			}
 
-			/* Clean, off the dirty list, and released: freed
-			 * here when it was detached while we wrote it. */
+			/* A failed write leaves the page dirty (it did not
+			 * reach the device, and forgetting that loses it) and
+			 * uncounted; else clean, off the dirty list, and
+			 * released: freed here when it was detached while we
+			 * wrote it. */
+			if (failed) {
+				pc_wb_release(p);
+				continue;
+			}
 			pc_wb_retire(p);
 			wrote++;
 		}
@@ -1963,6 +2190,23 @@ static int pagecache_flush_all_batch(uint32_t pass, vfs_superblock_t *only)
 
 		for (int i = 0; i < batch_count; i++) {
 			pc_page_t *p = batch[i];
+			int failed = 0;
+
+			/* Invalidated while taken (truncate, unlink, the
+			 * stream's id reused): its blocks are no longer its
+			 * own -- never stored, freed by this release.  Same
+			 * rule as pc_writeback_batch(). */
+			if (pc_flags(p) & PC_PAGE_DEAD) {
+				pc_wb_release(p);
+				continue;
+			}
+
+			/* Late allocation: nowhere to store it yet, so it
+			 * stays dirty. */
+			if (pc_wb_delalloc_page(sb, p) < 0) {
+				pc_wb_release(p);
+				continue;
+			}
 
 			if (bs >= PAGE_SIZE) {
 				unsigned long ppb = bs / PAGE_SIZE;
@@ -1997,25 +2241,31 @@ static int pagecache_flush_all_batch(uint32_t pass, vfs_superblock_t *only)
 					continue;
 				}
 				if (bs == PAGE_SIZE) {
-					pc_write_sectors(bdev, lba,
-							 secs_per_block,
-							 p->data);
+					if (pc_write_sectors(bdev, lba,
+							     secs_per_block,
+							     p->data) != 0)
+						failed = 1;
 				} else {
 					void *tmp = kalloc(bs);
-					if (tmp) {
-						pc_read_sectors(bdev, lba,
-								secs_per_block,
-								tmp);
+					if (!tmp ||
+					    pc_read_sectors(bdev, lba,
+							    secs_per_block,
+							    tmp) != 0) {
+						failed = 1;
+					} else {
 						mm_memcpy(
 							(uint8_t *)tmp +
 								sub_page *
 									PAGE_SIZE,
 							p->data, PAGE_SIZE);
-						pc_write_sectors(bdev, lba,
-								 secs_per_block,
-								 tmp);
-						kfree(tmp);
+						if (pc_write_sectors(
+							    bdev, lba,
+							    secs_per_block,
+							    tmp) != 0)
+							failed = 1;
 					}
+					if (tmp)
+						kfree(tmp);
 				}
 			} else {
 				unsigned long bpp = PAGE_SIZE / bs;
@@ -2032,10 +2282,11 @@ static int pagecache_flush_all_batch(uint32_t pass, vfs_superblock_t *only)
 						sb, cur_block);
 					/* Skip holes (lba 0) — never write the
 					 * superblock. */
-					if (lba != 0)
-						pc_write_sectors(bdev, lba,
-								 secs_per_block,
-								 p->data + offset);
+					if (lba != 0 &&
+					    pc_write_sectors(bdev, lba,
+							     secs_per_block,
+							     p->data + offset) != 0)
+						failed = 1;
 					offset += bs;
 					if (c + 1 < bpp)
 						cur_block = vfs_sb_next_block(
@@ -2043,8 +2294,15 @@ static int pagecache_flush_all_batch(uint32_t pass, vfs_superblock_t *only)
 				}
 			}
 
-			/* Clean, off the dirty list, and released: freed
-			 * here when it was detached while we wrote it. */
+			/* A failed write leaves the page dirty (it did not
+			 * reach the device, and forgetting that loses it) and
+			 * uncounted; else clean, off the dirty list, and
+			 * released: freed here when it was detached while we
+			 * wrote it. */
+			if (failed) {
+				pc_wb_release(p);
+				continue;
+			}
 			pc_wb_retire(p);
 			wrote++;
 		}

@@ -23,6 +23,7 @@
  */
 
 #include <kernel/fs/vfs.h>
+#include <kernel/fs/devfs.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
@@ -110,6 +111,25 @@ static int insert_lock(uint64_t dev, uint64_t ino, uint32_t pid, int type,
 }
 
 /* Turn an l_whence/l_start/l_len triple into an inclusive absolute range. */
+/* The identity (and size) a lock is keyed on.  Device nodes are not files
+ * of a filesystem with inode numbers: their device number names them, so
+ * every descriptor on /dev/sdb4 meets the same locks and no other node's.
+ * The inode values used for them are none a filesystem hands out. */
+static int frlock_stat(vfs_file_t *f, struct kstat *st)
+{
+	mm_memset(st, 0, sizeof(*st));
+	if (vfs_fstat(f, st) == ST_OK)
+		return 0;
+	mm_memset(st, 0, sizeof(*st));
+	if (devfs_fstat(f, st) != 0)
+		return -1;
+	if (S_ISBLK(st->st_mode) || S_ISCHR(st->st_mode)) {
+		st->st_dev = st->st_rdev;
+		st->st_ino = S_ISBLK(st->st_mode) ? ~0ULL : ~0ULL - 1;
+	}
+	return 0;
+}
+
 static int resolve_range(vfs_file_t *f, const k_flock_t *fl, int64_t *start,
 			 int64_t *end)
 {
@@ -121,7 +141,7 @@ static int resolve_range(vfs_file_t *f, const k_flock_t *fl, int64_t *start,
 		break;
 	case 2: { /* SEEK_END */
 		struct kstat st;
-		if (vfs_fstat(f, &st) != ST_OK)
+		if (frlock_stat(f, &st) != 0)
 			return -EINVAL;
 		base = (int64_t)st.st_size;
 		break;
@@ -174,7 +194,7 @@ int frlock_fcntl(vfs_file_t *f, int cmd, k_flock_t *flp, task_t *cur)
 	if (!f || !cur || !flp)
 		return -EBADF;
 	fl = *flp;
-	if (vfs_fstat(f, &st) != ST_OK)
+	if (frlock_stat(f, &st) != 0)
 		return -EBADF;
 
 	r = resolve_range(f, &fl, &start, &end);
@@ -269,7 +289,7 @@ void frlock_release_for_file(vfs_file_t *f, uint32_t pid)
 	struct kstat st;
 	uint64_t flags;
 
-	if (!f || vfs_fstat(f, &st) != ST_OK)
+	if (!f || frlock_stat(f, &st) != 0)
 		return;
 	spin_lock_irqsave(&g_lock, &flags);
 	for (int i = 0; i < FRLOCK_MAX; i++) {

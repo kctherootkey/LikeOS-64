@@ -1,0 +1,16 @@
+Patches applied to the pristine ntfs-3g_ntfsprogs-2026.9.28 tarball by
+../unpack.sh.
+
+They apply with `patch -p1` from inside src/, in filename order.  Each one
+starts with a few lines of prose saying what it does and why, then the diff.
+
+  0001-old-permission-bit-names.patch
+        S_IREAD, S_IWRITE and S_IEXEC are defined from the POSIX names
+        where the libc lacks them.
+
+  0002-operands-after-options.patch
+        mkntfs, ntfsfix and ntfsinfo find their device when getopt() stops
+        at the first operand (POSIX) instead of returning operands in
+        order.
+
+Copyright (C) 2026 The LikeOS Project

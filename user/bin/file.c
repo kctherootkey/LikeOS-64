@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <limits.h>
 
 #define PROGRAM_NAME "file"
 #define VERSION "1.0"
@@ -433,7 +434,7 @@ static void describe_elf(const unsigned char *buf, int len, const char *path,
 
 	/* Scan program headers for PT_INTERP and PT_DYNAMIC */
 	int has_interp = 0, has_dynamic = 0;
-	char interp_path[256];
+	char interp_path[PATH_MAX];
 	interp_path[0] = '\0';
 	elf_scan_phdr(buf, len, path, &has_interp, &has_dynamic, interp_path,
 		      (int)sizeof(interp_path));

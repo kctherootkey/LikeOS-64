@@ -1054,6 +1054,28 @@ int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 	int64_t ret;
 	struct mmap_prefill pre = { NULL, 0, NULL };
 
+	/* A mapping of /dev/zero is zero-filled memory of its own --
+	 * private or shared as asked, like MAP_ANONYMOUS -- never pages read
+	 * from the device.  The descriptor still has to be open for reading,
+	 * as for any mapping. */
+	if (!(flags & MAP_ANONYMOUS) && (int64_t)fd >= 0) {
+		task_t *cur = sched_current();
+		vfs_file_t *zf = cur ? fdget(cur, (int)fd) : NULL;
+
+		if (zf && devfs_is_zero(zf)) {
+			int readable = file_may_read(zf);
+
+			fdput(zf);
+			if (!readable)
+				return -EACCES;
+			flags |= MAP_ANONYMOUS;
+			fd = (uint64_t)-1;
+			offset = 0;
+		} else if (zf) {
+			fdput(zf);
+		}
+	}
+
 	if ((flags & MAP_SHARED) && !(flags & MAP_ANONYMOUS) &&
 	    (prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) && length &&
 	    length <= (1ULL << 30))

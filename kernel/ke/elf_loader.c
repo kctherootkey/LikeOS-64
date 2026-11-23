@@ -5,6 +5,7 @@
 //
 // Copyright (C) 2026 The LikeOS Project
 
+#include <kernel/ke/task_path.h>
 #include <kernel/ke/timer.h>
 #include <kernel/mm/rwsem.h>
 #include <kernel/fs/file.h>
@@ -119,18 +120,22 @@ static int elf_load_segments_ex(const Elf64_Ehdr *ehdr, const Elf64_Phdr *phdrs,
 			(const Elf64_Phdr *)((const uint8_t *)phdrs +
 					     (size_t)i * ehdr->e_phentsize);
 		if (ph->p_type == PT_INTERP && ph->p_filesz > 0 &&
-		    ph->p_filesz < 256 &&
 		    ph->p_offset + ph->p_filesz <= elf_size) {
 			size_t len = ph->p_filesz;
-			if (len > 255)
-				len = 255;
+			/* An interpreter name longer than interp_path holds
+			 * is refused: ignoring it would start a dynamic
+			 * program without its loader. */
+			if (len > sizeof(result->interp_path))
+				return -ENOEXEC;
 			if (elf_image_read(whole, file, ph->p_offset,
 					   result->interp_path, len) != 0)
 				continue;
-			result->interp_path[len] = '\0';
 			// Trim trailing NUL that the ELF may include in p_filesz
 			while (len > 0 && result->interp_path[len - 1] == '\0')
 				len--;
+			if (len >= sizeof(result->interp_path))
+				return -ENOEXEC;
+			result->interp_path[len] = '\0';
 			result->has_interp = 1;
 		}
 	}
@@ -464,6 +469,35 @@ static size_t elf_strlen(const char *s)
  * here would therefore describe the CALLER, not the program -- which is how
  * AT_SECURE came to be reported as 0 for every setuid exec.  NULL means "no
  * transition pending", i.e. the current task's credentials are the answer. */
+/* Copy `len' bytes to `va' in the address space `pml4', whose pages there
+ * are mapped (the new stack's eager part): page by page through the direct
+ * map.  0, or -1 for a page that is not there. */
+static int elf_stack_put(uint64_t *pml4, uint64_t va, const void *src,
+			 size_t len)
+{
+	const uint8_t *s = (const uint8_t *)src;
+
+	while (len) {
+		uint64_t page = va & ~(uint64_t)(PAGE_SIZE - 1);
+		size_t off = (size_t)(va - page);
+		size_t n = PAGE_SIZE - off;
+		uint64_t phys;
+
+		if (n > len)
+			n = len;
+		phys = mm_get_physical_address_from_pml4(pml4, page);
+		if (!phys)
+			return -1;
+		mm_memcpy((uint8_t *)phys_to_virt(phys & ~(uint64_t)(PAGE_SIZE - 1)) +
+				  off,
+			  s, n);
+		va += n;
+		s += n;
+		len -= n;
+	}
+	return 0;
+}
+
 static uint64_t elf_setup_stack(uint64_t *pml4, uint64_t stack_top,
 				uint64_t stack_size, char *const argv[],
 				char *const envp[], elf_load_result_t *mr,
@@ -479,17 +513,17 @@ static uint64_t elf_setup_stack(uint64_t *pml4, uint64_t stack_top,
 				       USER_STACK_EAGER_SIZE : stack_size))
 		return 0;
 
-	int argc = 0;
+	size_t argc = 0;
 	if (argv)
 		while (argv[argc])
 			argc++;
-	int envc = 0;
+	size_t envc = 0;
 	if (envp)
 		while (envp[envc])
 			envc++;
-	WARN_ON_ONCE(
-		argc > 127 ||
-		envc > 127); /* argc/envc exceeds av[128]/ev[128] stack buffer: execve with pathologically many args */
+	/* (execve bounds both: EXEC_ARG_COUNT_MAX, EXEC_ARG_MAX, elf.h) */
+	if (argc + envc > EXEC_ARG_COUNT_MAX + 16)
+		return 0;
 
 	// Auxiliary vector entries
 	typedef struct {
@@ -583,83 +617,80 @@ static uint64_t elf_setup_stack(uint64_t *pml4, uint64_t stack_top,
 
 	// Total string space
 	size_t str_total = 0;
-	for (int i = 0; i < argc; i++)
+	for (size_t i = 0; i < argc; i++)
 		str_total += elf_strlen(argv[i]) + 1;
-	for (int i = 0; i < envc; i++)
+	for (size_t i = 0; i < envc; i++)
 		str_total += elf_strlen(envp[i]) + 1;
 	str_total += sizeof(platform_str) + sizeof(random_bytes) +
 		     elf_strlen(execfn) + 1;
 
 	// Pointers area: argc + argv[] + NULL + envp[] + NULL + auxv
-	size_t ptrs = 8 + (argc + 1) * 8 + (envc + 1) * 8 + ac * 16;
-	size_t total = ptrs + ((str_total + 15) & ~15ULL);
-	total = (total + 15) & ~15ULL;
+	size_t ptrs = 8 + (argc + 1) * 8 + (envc + 1) * 8 + (size_t)ac * 16;
 
-	if (total > PAGE_SIZE)
-		return 0; // Won't fit in one-page model
+	/* The block -- strings at the top, packed downward in the order
+	 * below, the pointers under them, 16-byte aligned -- is written
+	 * straight into the new stack's pages, which are mapped (the eager
+	 * part, USER_STACK_EAGER_SIZE) and zeroed: no copy of it is built in
+	 * the kernel, whatever its size. */
+	uint64_t mapped = stack_size > USER_STACK_EAGER_SIZE ?
+				  USER_STACK_EAGER_SIZE :
+				  stack_size;
+	uint64_t sv = stack_top - str_total; /* lowest string byte */
+	uint64_t sp_va = (sv - ptrs) & ~15ULL;
+	if (str_total + ptrs > EXEC_STACK_BLOCK_MAX ||
+	    stack_top - sp_va + PAGE_SIZE > mapped)
+		return 0; /* (execve's budgets keep it far below) */
 
-	// Temp buffer for the top stack page
-	uint8_t *buf = (uint8_t *)kalloc(PAGE_SIZE);
-	if (!buf)
-		return 0;
-	mm_memset(buf, 0, PAGE_SIZE);
+	uint64_t argv_va = sp_va + 8;
+	uint64_t envp_va = argv_va + (argc + 1) * 8;
+	uint64_t auxv_va = envp_va + (envc + 1) * 8;
+	uint64_t w = stack_top; /* strings: from the top downward */
+	uint64_t v;
 
-	uint64_t top_page = stack_top - PAGE_SIZE;
+#define STACK_PUT(va, src, len)                                             \
+	do {                                                                \
+		if (elf_stack_put(pml4, (va), (src), (len)) != 0)           \
+			return 0;                                           \
+	} while (0)
 
-	// Strings: place from end of buffer downward
-	uint8_t *sw = buf + PAGE_SIZE;
-	uint64_t sv = stack_top;
-	uint64_t av[128], ev[128];
-
-	for (int i = argc - 1; i >= 0; i--) {
+	for (size_t i = argc; i-- > 0;) {
 		size_t l = elf_strlen(argv[i]) + 1;
-		sw -= l;
-		sv -= l;
-		mm_memcpy(sw, argv[i], l);
-		av[i] = sv;
+		w -= l;
+		STACK_PUT(w, argv[i], l);
+		v = w;
+		STACK_PUT(argv_va + i * 8, &v, 8);
 	}
-	for (int i = envc - 1; i >= 0; i--) {
+	for (size_t i = envc; i-- > 0;) {
 		size_t l = elf_strlen(envp[i]) + 1;
-		sw -= l;
-		sv -= l;
-		mm_memcpy(sw, envp[i], l);
-		ev[i] = sv;
+		w -= l;
+		STACK_PUT(w, envp[i], l);
+		v = w;
+		STACK_PUT(envp_va + i * 8, &v, 8);
 	}
 	{
 		size_t l = elf_strlen(execfn) + 1;
-		sw -= l;
-		sv -= l;
-		mm_memcpy(sw, execfn, l);
+		w -= l;
+		STACK_PUT(w, execfn, l);
 		ax[ac_execfn].t = AT_EXECFN;
-		ax[ac_execfn].v = sv;
+		ax[ac_execfn].v = w;
 
-		sw -= sizeof(random_bytes);
-		sv -= sizeof(random_bytes);
-		mm_memcpy(sw, random_bytes, sizeof(random_bytes));
+		w -= sizeof(random_bytes);
+		STACK_PUT(w, random_bytes, sizeof(random_bytes));
 		ax[ac_random].t = AT_RANDOM;
-		ax[ac_random].v = sv;
+		ax[ac_random].v = w;
 
-		sw -= sizeof(platform_str);
-		sv -= sizeof(platform_str);
-		mm_memcpy(sw, platform_str, sizeof(platform_str));
+		w -= sizeof(platform_str);
+		STACK_PUT(w, platform_str, sizeof(platform_str));
 		ax[ac_platform].t = AT_PLATFORM;
-		ax[ac_platform].v = sv;
+		ax[ac_platform].v = w;
 	}
+	WARN_ON(w != sv);
 
-	uint64_t sp_va = (sv - ptrs) & ~15ULL;
-	if (sp_va < top_page) {
-		kfree(buf);
-		return 0;
-	}
-
-	uint64_t *sp = (uint64_t *)(buf + (sp_va - top_page));
-	*sp++ = (uint64_t)argc;
-	for (int i = 0; i < argc; i++)
-		*sp++ = av[i];
-	*sp++ = 0;
-	for (int i = 0; i < envc; i++)
-		*sp++ = ev[i];
-	*sp++ = 0;
+	v = (uint64_t)argc;
+	STACK_PUT(sp_va, &v, 8);
+	v = 0;
+	STACK_PUT(argv_va + argc * 8, &v, 8); /* argv's NULL */
+	STACK_PUT(envp_va + envc * 8, &v, 8); /* envp's NULL */
 	/* Remember where the auxiliary vector landed.
 	 *
 	 * A debugger needs it, and needs it before it can read anything else
@@ -673,25 +704,14 @@ static uint64_t elf_setup_stack(uint64_t *pml4, uint64_t stack_top,
 	 * Recorded as an address and a length rather than copied: the block
 	 * belongs to the process, and ptrace hands it out from here. */
 	{
-		uint64_t auxv_va = sp_va + 8 + (uint64_t)(argc + 1) * 8 +
-				   (uint64_t)(envc + 1) * 8;
 		task_t *cur = sched_current();
 		if (cur) {
 			cur->auxv_addr = auxv_va;
 			cur->auxv_len = (uint64_t)ac * 16;
 		}
 	}
-
-	for (int i = 0; i < ac; i++) {
-		*sp++ = ax[i].t;
-		*sp++ = ax[i].v;
-	}
-
-	// Flush buffer to physical page
-	uint64_t phys = mm_get_physical_address_from_pml4(pml4, top_page);
-	if (phys)
-		mm_memcpy(phys_to_virt(phys), buf, PAGE_SIZE);
-	kfree(buf);
+	STACK_PUT(auxv_va, ax, (size_t)ac * 16);
+#undef STACK_PUT
 
 	return sp_va;
 }
@@ -880,16 +900,10 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
 		t->login_session = cur->login_session;
 		if (cur->ctty)
 			t->ctty = cur->ctty;
-		mm_memset(t->cwd, 0, sizeof(t->cwd));
-		if (cur->cwd[0]) {
-			size_t i = 0;
-			for (; cur->cwd[i] && i < sizeof(t->cwd) - 1; i++)
-				t->cwd[i] = cur->cwd[i];
-			t->cwd[i] = '\0';
-		} else {
-			t->cwd[0] = '/';
-			t->cwd[1] = '\0';
-		}
+		/* The working directory (only it, not the root
+		 * nor the executable) -- a reference to the same string. */
+		task_path_set(t, TASK_PATH_CWD,
+			      task_path_ref(cur, TASK_PATH_CWD));
 	}
 	// Set comm from basename of path
 	{

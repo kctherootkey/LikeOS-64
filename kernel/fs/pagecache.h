@@ -141,6 +141,31 @@ void pagecache_init(void);
 pc_page_t *pagecache_lookup(struct vfs_superblock *sb, unsigned long cluster_id,
 			    unsigned long page_index);
 
+/* pagecache_lookup(), but the page returned is HELD (a reference), taken
+ * under the hash-bucket lock, so reclaim cannot free it while the caller
+ * uses it.  NULL when not cached (no I/O is ever done).  Release with
+ * pagecache_put(). */
+pc_page_t *pagecache_lookup_held(struct vfs_superblock *sb,
+				 unsigned long cluster_id,
+				 unsigned long page_index);
+
+/* Put a page the FILESYSTEM filled into the cache, for data that does not
+ * come straight off the device (decompressed, inline in a metadata record,
+ * a partial block): a fresh page receives `len' bytes of `src' (len <=
+ * PAGE_SIZE; src may be NULL when len is 0) and zeros after them, is marked
+ * valid and clean, and only then becomes visible -- nobody can find it half
+ * filled.  When the key (sb, cluster_id, page_index) is cached already the
+ * cached page wins (it may be newer, even dirty): the new one is freed and
+ * the cached one returned.  With `hold' the page returned is held (as
+ * pagecache_get_held(); release with pagecache_put()), without it it is not
+ * (as pagecache_get()).  NULL when out of memory or len > PAGE_SIZE.
+ * May sleep (allocation); takes no filesystem lock and does no I/O, so it
+ * is callable under any filesystem lock a read may hold, never under a
+ * spinlock. */
+pc_page_t *pagecache_install(struct vfs_superblock *sb,
+			     unsigned long cluster_id, unsigned long page_index,
+			     const void *src, unsigned long len, int hold);
+
 // Fetch a page: lookup + read-from-disk on miss.
 // Caller provides the filesystem superblock (for block translation +
 // chain walking) and the file's first block_id (`start_cluster`).

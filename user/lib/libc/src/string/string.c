@@ -479,6 +479,8 @@ char *strerror(int errnum)
 		return "Operation now in progress";
 	case 116:
 		return "Stale file handle";
+	case 117:
+		return "Structure needs cleaning";
 	case 121:
 		return "Remote I/O error";
 	case 123:

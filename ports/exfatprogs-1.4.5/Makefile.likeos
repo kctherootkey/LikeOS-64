@@ -1,0 +1,127 @@
+# Makefile.likeos - build exfatprogs 1.4.5 (mkfs.exfat, fsck.exfat,
+# exfatlabel, tune.exfat) for LikeOS
+#
+# The tarball is unpacked and patched by unpack.sh into src/; configure is not
+# run.  The source lists are the release's Makefile.am files (lib, mkfs,
+# fsck, label, tune); config.h in this directory stands in for the config.h
+# configure would write and is force-included, as the release's AM_CFLAGS
+# do.  dump.exfat, exfat2img and lsdosattr/chdosattr are not built.
+#
+# mkfs.exfat probes the target for an existing file system or partition
+# table with libblkid: that comes from the util-linux port
+# (ports/util-linux-2.42.4, built first by the top-level ports-exfatprogs
+# target) as a static archive, like e2fsprogs links it.
+#
+# Library (static archive in build/, linked into the programs):
+#   libexfat   the release's lib/ (boot region, FAT, bitmap, directories)
+#
+# Programs (build/), installed to /sbin:
+#   mkfs.exfat  fsck.exfat  exfatlabel  tune.exfat
+#
+# Copyright (C) 2026 The LikeOS Project
+
+CC = gcc
+LD = ld
+AR = ar
+
+LIBC_DIR = ../../user/lib/libc
+RTLD_DIR = ../../user/lib/rtld
+UL_DIR = ../util-linux-2.42.4
+
+SRC_STAMP := .likeos-unpacked
+PATCHES := $(wildcard patches/*.patch)
+S := src
+B := build
+G := $(B)/gen
+O := $(B)/obj
+
+VERSION := 1.4.5
+
+GCC_INC := $(shell $(CC) -print-file-name=include)
+
+# -nostdinc: only the LikeOS libc headers and gcc's own (stddef.h, stdarg.h
+# ...) are visible, so a header the libc lacks fails here instead of being
+# taken silently from the build host.  $(G) holds util-linux's blkid.h.
+CFLAGS = -O2 -nostdlib -nostdinc -fno-builtin -fstack-protector-strong \
+         -mno-red-zone -ffreestanding -fPIE -fno-common \
+         -D__LIKEOS__ \
+         -isystem $(LIBC_DIR)/include -isystem $(GCC_INC) \
+         -include config.h -I$(S)/include -I$(G)
+# A function the libc does not declare is an error, not a guess at its type.
+CFLAGS += -Werror=implicit-function-declaration -Werror=implicit-int
+# The release's AM_CFLAGS.
+CFLAGS += -Wall
+
+LDFLAGS = -pie -nostdlib -T ../../user/bin/user_dyn.lds --hash-style=gnu \
+          -z now -z relro -rpath /lib -dynamic-linker /lib/ld-likeos.so \
+          -L$(LIBC_DIR) -L$(RTLD_DIR)
+CRT1 = $(LIBC_DIR)/crt1.o
+LIBGCC := $(shell $(CC) -print-libgcc-file-name)
+LIBS = -lc -l:ld-likeos.so $(LIBGCC)
+
+obj = $(addprefix $(O)/,$(1:.c=.o))
+
+LIBEXFAT_OBJ = $(call obj,lib/libexfat.c lib/exfat_fs.c lib/exfat_dir.c \
+	lib/utils.c lib/crc.c)
+MKFS_OBJ  = $(call obj,mkfs/mkfs.c mkfs/upcase.c)
+FSCK_OBJ  = $(call obj,fsck/fsck.c fsck/repair.c)
+LABEL_OBJ = $(call obj,label/label.c)
+TUNE_OBJ  = $(call obj,tune/tune.c)
+
+LIBEXFAT = $(B)/libexfat.a
+# util-linux's libblkid and the helpers it is built on.
+UL_LIBS = $(UL_DIR)/build/libblkid.a $(UL_DIR)/build/libcommon.a
+
+PROGS = mkfs.exfat fsck.exfat exfatlabel tune.exfat
+TARGETS = $(addprefix $(B)/,$(PROGS))
+
+.SUFFIXES:
+
+all: $(SRC_STAMP)
+	$(MAKE) -f Makefile.likeos programs
+
+programs: $(TARGETS)
+
+# Re-unpack whenever the tarball or a patch changes.
+$(SRC_STAMP): exfatprogs-$(VERSION).tar.xz $(PATCHES) unpack.sh
+	$(SHELL) ./unpack.sh --force
+	@touch $@
+
+# util-linux's public libblkid header, where mkfs.c includes it from.
+$(G)/blkid.h: $(UL_DIR)/build/gen/blkid.h
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+# Every object depends on every header: there are few of them.
+HDRS = config.h $(G)/blkid.h $(wildcard $(S)/include/*.h $(S)/fsck/*.h \
+	$(S)/mkfs/*.h)
+
+$(O)/%.o: $(S)/%.c $(SRC_STAMP) $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(LIBEXFAT): $(LIBEXFAT_OBJ)
+	rm -f $@
+	$(AR) rcs $@ $^
+
+LINK = $(LD) $(LDFLAGS) $(CRT1) $(filter-out $(CRT1),$^) $(LIBS) -o $@
+
+$(B)/mkfs.exfat: $(MKFS_OBJ) $(LIBEXFAT) $(UL_LIBS) $(CRT1)
+	$(LINK)
+$(B)/fsck.exfat: $(FSCK_OBJ) $(LIBEXFAT) $(CRT1)
+	$(LINK)
+$(B)/exfatlabel: $(LABEL_OBJ) $(LIBEXFAT) $(CRT1)
+	$(LINK)
+$(B)/tune.exfat: $(TUNE_OBJ) $(LIBEXFAT) $(CRT1)
+	$(LINK)
+
+unpack: $(SRC_STAMP)
+
+clean:
+	rm -rf $(B)
+
+distclean: clean
+	rm -rf src $(SRC_STAMP)
+
+.PHONY: all programs unpack clean distclean
+.SECONDARY:

@@ -1,0 +1,57 @@
+[k] pagecache: initialized (4096 hash buckets)
+[k] FAT32: mounted sdz1 base=0 root=2
+[k] FAT32: FSInfo free clusters = 252439
+BUG: condition (start_cluster < 2) true at kernel/fs/pagecache.c:1192 in pc_get()!
+
+FATAL: BUG (pc_get)
+    #0 0x72654b50b5a7 in __sanitizer_print_stack_trace ../../../../src/libsanitizer/asan/asan_stack.cpp:87
+    #1 0x558cf0fc7d58 in host_print_stack host/test-fs-bdev.c:615
+    #2 0x558cf0fa29cd in test_fatal host/test-fs-stubs.c:41
+    #3 0x558cf0fa2c48 in test_bug host/test-fs-stubs.c:67
+    #4 0x558cf0f706de in pc_get kernel/fs/pagecache.c:1192
+    #5 0x558cf0f72d15 in pagecache_get kernel/fs/pagecache.c:1331
+    #6 0x558cf0f576f0 in fat32_read_impl kernel/fs/fat32.c:4369
+    #7 0x558cf0f576f0 in fat32_read kernel/fs/fat32.c:3268
+    #8 0x558cf0fa65ef in op_pread host/test-fs-main.c:740
+    #9 0x558cf0fab6c4 in read_all host/test-fs-main.c:999
+    #10 0x558cf0fb2517 in manifest_one host/test-fs-main.c:1281
+    #11 0x558cf0fb4339 in walk_tree host/test-fs-main.c:1413
+    #12 0x558cf0fbc44a in run_cmd host/test-fs-main.c:2510
+    #13 0x558cf0fbc44a in run_line host/test-fs-main.c:3224
+    #14 0x558cf0fc42e5 in run_script_text host/test-fs-main.c:3253
+    #15 0x558cf0fc42e5 in main host/test-fs-main.c:3347
+    #16 0x72654a82a1c9 in __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58
+    #17 0x72654a82a28a in __libc_start_main_impl ../csu/libc-start.c:360
+    #18 0x558cf0f3ab84 in _start (/tmp/claude-1000/-home-kcope-Dokumente-LikeOS-64/4f1902d5-5d27-41e5-9420-2138ed60e472/scratchpad/pathreview/tfs/build-fat32/test-fs-fat32+0xb7b84) (BuildId: a38617f0ed7c9790aaca48aaa261355fd6671f91)
+
+FAIL fatal BUG (pc_get)
+AddressSanitizer:DEADLYSIGNAL
+=================================================================
+==1035709==ERROR: AddressSanitizer: ABRT on unknown address 0x03e8000fcdbd (pc 0x72654a89ebec bp 0x7ffdd0dae0b0 sp 0x7ffdd0dae070 T0)
+    #0 0x72654a89ebec in __pthread_kill_implementation nptl/pthread_kill.c:44
+    #1 0x72654a89ebec in __pthread_kill_internal nptl/pthread_kill.c:78
+    #2 0x72654a89ebec in __GI___pthread_kill nptl/pthread_kill.c:89
+    #3 0x72654a84527d in __GI_raise ../sysdeps/posix/raise.c:26
+    #4 0x72654a8288fe in __GI_abort stdlib/abort.c:79
+    #5 0x558cf0fc85b4 in h_abort host/test-fs-bdev.c:736
+    #6 0x558cf0fa29f3 in test_fatal host/test-fs-stubs.c:44
+    #7 0x558cf0fa2c48 in test_bug host/test-fs-stubs.c:67
+    #8 0x558cf0f706de in pc_get kernel/fs/pagecache.c:1192
+    #9 0x558cf0f72d15 in pagecache_get kernel/fs/pagecache.c:1331
+    #10 0x558cf0f576f0 in fat32_read_impl kernel/fs/fat32.c:4369
+    #11 0x558cf0f576f0 in fat32_read kernel/fs/fat32.c:3268
+    #12 0x558cf0fa65ef in op_pread host/test-fs-main.c:740
+    #13 0x558cf0fab6c4 in read_all host/test-fs-main.c:999
+    #14 0x558cf0fb2517 in manifest_one host/test-fs-main.c:1281
+    #15 0x558cf0fb4339 in walk_tree host/test-fs-main.c:1413
+    #16 0x558cf0fbc44a in run_cmd host/test-fs-main.c:2510
+    #17 0x558cf0fbc44a in run_line host/test-fs-main.c:3224
+    #18 0x558cf0fc42e5 in run_script_text host/test-fs-main.c:3253
+    #19 0x558cf0fc42e5 in main host/test-fs-main.c:3347
+    #20 0x72654a82a1c9 in __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58
+    #21 0x72654a82a28a in __libc_start_main_impl ../csu/libc-start.c:360
+    #22 0x558cf0f3ab84 in _start (/tmp/claude-1000/-home-kcope-Dokumente-LikeOS-64/4f1902d5-5d27-41e5-9420-2138ed60e472/scratchpad/pathreview/tfs/build-fat32/test-fs-fat32+0xb7b84) (BuildId: a38617f0ed7c9790aaca48aaa261355fd6671f91)
+
+AddressSanitizer can not provide additional info.
+SUMMARY: AddressSanitizer: ABRT nptl/pthread_kill.c:44 in __pthread_kill_implementation
+==1035709==ABORTING

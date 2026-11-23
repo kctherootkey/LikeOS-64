@@ -1,0 +1,14 @@
+Patches applied to the pristine exfatprogs-1.4.5 tarball by ../unpack.sh.
+
+They apply with `patch -p1` from inside src/, in filename order.  Each one
+starts with a few lines of prose saying what it does and why, then the diff.
+
+  0001-no-kernel-version-check.patch
+        The device is opened without a kernel version test on the uname()
+        release (which is the LikeOS version here).
+
+  0002-no-o-direct-ebadfd.patch
+        The read-back check of mkfs.exfat -C reads without O_DIRECT, and
+        EBADF stands in for EBADFD: the LikeOS libc has neither.
+
+Copyright (C) 2026 The LikeOS Project

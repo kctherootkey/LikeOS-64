@@ -1,0 +1,79 @@
+mkntfs, ntfsfix and ntfsinfo pass getopt_long() an option string that
+starts with '-', the request to have every operand returned in order as
+option 1, and pick up the device only there.  The LikeOS getopt() follows
+POSIX instead: it stops at the first operand.  Without this change none of
+the three would find its device ("You must specify a device").
+
+Each tool now also takes the operands that are left after the option loop,
+in the order and with the meaning option 1 gives them (mkntfs: device, then
+number of sectors; ntfsfix and ntfsinfo: the device).  Where getopt()
+returns operands in order nothing is left after the loop and nothing
+changes.  ntfslabel already does this.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/ntfsprogs/mkntfs.c	2026-09-18 14:47:54.000000000 +0200
++++ b/ntfsprogs/mkntfs.c	2026-11-20 16:06:26.933817812 +0100
+@@ -747,6 +747,20 @@
+ 		}
+ 	}
+ 
++	/*
++	 * Operands left after the options, where getopt() stops at the first
++	 * one instead of returning each of them in order: the device, then
++	 * the number of sectors.
++	 */
++	for (; optind < argc; optind++) {
++		if (!opts2->dev_name)
++			opts2->dev_name = argv[optind];
++		else if (!mkntfs_parse_llong(argv[optind],
++				"number of sectors",
++				&opts2->num_sectors))
++			err++;
++	}
++
+ 	if (!err && !help && !ver && !lic) {
+ 		if (opts2->dev_name == NULL) {
+ 			if (argc > 1)
+--- a/ntfsprogs/ntfsfix.c	2026-09-18 14:47:54.000000000 +0200
++++ b/ntfsprogs/ntfsfix.c	2026-11-20 16:06:26.934125536 +0100
+@@ -210,6 +210,19 @@
+ 		}
+ 	}
+ 
++	/*
++	 * Operands left after the options, where getopt() stops at the first
++	 * one instead of returning each of them in order.
++	 */
++	for (; optind < argc; optind++) {
++		if (!opt.volume)
++			opt.volume = argv[optind];
++		else {
++			ntfs_log_info("ERROR: Too many arguments.\n");
++			usage(1);
++		}
++	}
++
+ 	if (opt.volume == NULL) {
+ 		ntfs_log_info("ERROR: You must specify a device.\n");
+ 		usage(1);
+--- a/ntfsprogs/ntfsinfo.c	2026-09-18 14:47:54.000000000 +0200
++++ b/ntfsprogs/ntfsinfo.c	2026-11-20 16:06:26.934280560 +0100
+@@ -261,6 +261,17 @@
+ 		}
+ 	}
+ 
++	/*
++	 * Operands left after the options, where getopt() stops at the first
++	 * one instead of returning each of them in order.
++	 */
++	for (; optind < argc; optind++) {
++		if (!opts.device)
++			opts.device = argv[optind];
++		else
++			err++;
++	}
++
+ 	/* Make sure we're in sync with the log levels */
+ 	levels = ntfs_log_get_levels();
+ 	if (levels & NTFS_LOG_LEVEL_VERBOSE)

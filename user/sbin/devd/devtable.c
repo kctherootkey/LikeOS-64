@@ -1,7 +1,9 @@
 // devd: the device table.
 //
 // Built from /sys/block (one directory per disk, one subdirectory per
-// partition), /dev/disk/by-id (usb-* links name USB storage) and the mount
+// partition; device/type 5 names an optical drive, ro a write-protected
+// medium), /dev/disk/by-id (usb-* links name USB storage), the partition
+// tables of built-in disks (firmware and recovery partitions) and the mount
 // table.  A rescan builds a complete new table, carries over what is known
 // about devices that did not change (probe results, the ejected mark),
 // probes the rest, and sends ADDED / REMOVED / CHANGED events for every
@@ -49,11 +51,6 @@ int dev_is_volume(const struct dev *d)
 	return d->kind == DEV_PART || d->nparts == 0;
 }
 
-int dev_policy_ok(const struct dev *d)
-{
-	return d->removable && d->usb && !d->system;
-}
-
 static const char *state_name(int s)
 {
 	return s == DS_FORMATTING ? "formatting" : s == DS_BUSY ? "busy" :
@@ -81,6 +78,11 @@ long dev_format_line(struct devp_line *l, const char *prefix,
 	devp_line_kv_int(l, "mountuid", d->devd_mount ? d->mountuid : -1);
 	devp_line_kv_int(l, "ejected", d->ejected ? 1 : 0);
 	devp_line_kv(l, "state", state_name(d->state));
+	/* added later: at the end, so older clients read the rest as
+	 * before */
+	devp_line_kv_int(l, "readonly", d->readonly ? 1 : 0);
+	devp_line_kv_int(l, "optical", d->optical ? 1 : 0);
+	devp_line_kv_int(l, "internal", d->internal ? 1 : 0);
 	return devp_line_end(l);
 }
 
@@ -236,8 +238,13 @@ struct part_tmp {
 	char name[DEVD_NAME_MAX];
 	uint32_t maj, min;
 	uint64_t size;
+	uint64_t start;
 	int partno;
+	int ro;
 };
+
+/* SCSI peripheral device type of a CD/DVD drive */
+#define SCSI_TYPE_ROM 5
 
 static int part_cmp(const void *a, const void *b)
 {
@@ -255,8 +262,11 @@ static void scan_disk(const char *name, const char *force, int all)
 	uint64_t sectors, v;
 	DIR *dir;
 	struct dirent *e;
-	int reprobe;
+	int reprobe, optical, disk_ro;
+	uint64_t lbs = 512;
+	struct pt_reserved pt;
 
+	memset(&pt, 0, sizeof(pt));
 	if (g_new.n >= DEVD_MAX_DEVS)
 		return;
 	d = &g_new.d[g_new.n];
@@ -278,6 +288,14 @@ static void scan_disk(const char *name, const char *force, int all)
 	snprintf(path, sizeof(path), "/sys/block/%s/diskseq", name);
 	if (sys_u64(path, &d->diskseq))
 		d->diskseq = 0;
+	snprintf(path, sizeof(path), "/sys/block/%s/ro", name);
+	disk_ro = sys_u64(path, &v) == 0 && v != 0;
+	snprintf(path, sizeof(path), "/sys/block/%s/device/type", name);
+	optical = sys_u64(path, &v) == 0 && v == SCSI_TYPE_ROM;
+	snprintf(path, sizeof(path), "/sys/block/%s/queue/logical_block_size",
+		 name);
+	if (sys_u64(path, &lbs) || lbs < 512 || lbs > 4096)
+		lbs = 512;
 	snprintf(path, sizeof(path), "/sys/block/%s/device/vendor", name);
 	sys_ident(path, d->vendor, sizeof(d->vendor));
 	snprintf(path, sizeof(path), "/sys/block/%s/device/model", name);
@@ -310,6 +328,13 @@ static void scan_disk(const char *name, const char *force, int all)
 		if (sys_u64(path, &v) || v > (UINT64_MAX >> 9))
 			continue;
 		p->size = v << 9;
+		snprintf(path, sizeof(path), "/sys/block/%s/%s/start", name,
+			 e->d_name);
+		if (sys_u64(path, &p->start))
+			p->start = 0;
+		snprintf(path, sizeof(path), "/sys/block/%s/%s/ro", name,
+			 e->d_name);
+		p->ro = sys_u64(path, &v) == 0 && v != 0;
 		np++;
 	}
 	closedir(dir);
@@ -339,6 +364,17 @@ static void scan_disk(const char *name, const char *force, int all)
 	for (int i = 0; i < np; i++)
 		if (usb_link_has(parts[i].name))
 			d->usb = 1;
+	dev_classify(d, d->usb, optical, disk_ro, 0);
+	/* the firmware's and the installed systems' partitions of a
+	 * built-in disk, from its partition table (read again whenever the
+	 * disk is probed again) */
+	if (d->internal && np > 0 && reprobe) {
+		snprintf(path, sizeof(path), "/dev/%s", name);
+		if (dev_node_ok(d) &&
+		    pt_reserved_device(path, (uint32_t)lbs, d->size, &pt) < 0)
+			log_debug("cannot read the partition table of %s",
+				  name);
+	}
 	if (format_busy(name) && od) {
 		d->pr = od->pr;
 		d->probed = 1;
@@ -365,7 +401,12 @@ static void scan_disk(const char *name, const char *force, int all)
 		p->partno = parts[i].partno;
 		p->diskseq = d->diskseq;
 		p->removable = d->removable;
-		p->usb = d->usb;
+		p->start = parts[i].start;
+		dev_classify(p, d->usb, d->optical, disk_ro, parts[i].ro);
+		if (d->internal)
+			p->reserved = reprobe || !op ?
+					      pt_reserved_has(&pt, p->start) :
+					      op->reserved;
 		p->ejected = d->ejected;
 		p->mountuid = -1;
 		strlcpy_d(p->vendor, d->vendor, sizeof(p->vendor));
@@ -550,26 +591,44 @@ static void assign_mounts(struct devtab *t, const struct mnt_ent *m, int nm)
 	}
 }
 
-static void compute_flags(struct devtab *t)
+/* The device "/" is on (0:0 when unknown) and whether the mount table
+ * could be read: without it nothing tells which built-in disk the system
+ * uses, so all of them count as the system's. */
+struct sys_view {
+	uint32_t root_major, root_minor;
+	int mounts_known;
+};
+
+static void compute_flags(struct devtab *t, const struct sys_view *sv)
 {
 	for (int i = 0; i < t->n; i++) {
 		struct dev *disk = &t->d[i];
-		int sys;
+		int sys = 0;
 
 		if (disk->kind != DEV_DISK)
 			continue;
-		sys = !(disk->removable && disk->usb);
-		for (int k = 0; k < t->n; k++)
-			if (strcmp(t->d[k].disk, disk->name) == 0 &&
-			    t->d[k].foreign_mount)
+		for (int k = 0; k < t->n; k++) {
+			const struct dev *e = &t->d[k];
+
+			if (strcmp(e->disk, disk->name) != 0)
+				continue;
+			if (e->foreign_mount)
 				sys = 1;
+			if ((sv->root_major || sv->root_minor) &&
+			    e->major == sv->root_major &&
+			    e->minor == sv->root_minor)
+				sys = 1;
+		}
+		if (!sv->mounts_known && disk->internal)
+			sys = 1;
 		for (int k = 0; k < t->n; k++) {
 			struct dev *d = &t->d[k];
 
 			if (strcmp(d->disk, disk->name) != 0)
 				continue;
-			d->system = sys;
-			d->usb = disk->usb;
+			/* a firmware or recovery partition is reported as
+			 * the system's: nobody is offered it */
+			d->system = sys || d->reserved;
 			d->supported = dev_is_volume(d) && fs_supported(&d->pr);
 			if (format_busy(d->name))
 				d->state = DS_FORMATTING;
@@ -608,6 +667,8 @@ void tab_rescan(const char *force, int all)
 	int nm;
 	char names[DEVD_MAX_DEVS][DEVD_NAME_MAX];
 	int nn = 0;
+	struct sys_view sv;
+	struct stat rst;
 
 	dir = opendir("/sys/block");
 	if (!dir) {
@@ -649,14 +710,39 @@ void tab_rescan(const char *force, int all)
 		if (!found && g_tab.d[i].devd_mount)
 			detach_removed(&g_tab.d[i]);
 	}
+	/* and what is still there but holds another medium, or none: the
+	 * mount is of a disc or a card that went (a new one is probed and
+	 * mounted afresh) */
+	for (int i = 0; i < g_tab.n; i++) {
+		const struct dev *o = &g_tab.d[i];
 
+		if (!o->devd_mount)
+			continue;
+		for (int k = 0; k < g_new.n; k++) {
+			if (!same_ent(o, &g_new.d[k]))
+				continue;
+			if (dev_medium_changed(o, &g_new.d[k])) {
+				log_info("%s: the medium changed", o->name);
+				detach_removed(o);
+			}
+			break;
+		}
+	}
+
+	memset(&sv, 0, sizeof(sv));
+	if (stat("/", &rst) == 0) {
+		sv.root_major = major(rst.st_dev);
+		sv.root_minor = minor(rst.st_dev);
+	}
 	nm = mnt_read(g_mnts, MAX_MOUNTS);
 	if (nm < 0) {
 		log_warn("cannot read the mount table");
 		nm = 0;
+	} else {
+		sv.mounts_known = 1;
 	}
 	assign_mounts(&g_new, g_mnts, nm);
-	compute_flags(&g_new);
+	compute_flags(&g_new, &sv);
 
 	/* events: removals (partitions first), additions (disks first),
 	 * changes */

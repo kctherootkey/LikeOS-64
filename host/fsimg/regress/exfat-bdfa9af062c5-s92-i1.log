@@ -1,0 +1,12 @@
+[k] pagecache: initialized (4096 hash buckets)
+[k] WARNING (ratelimit 1/10): at kernel/fs/exfat.c:2229 exfat_chain_decode(): exfat: corrupt volume: chain from 6290 holds FAT value 0x0 at cluster 6290
+[k] exfat: /dev/sdz1: ERROR: corrupt metadata (at 6290)
+[k] exfat: sdz1: mounted read-only: main boot region invalid, mounted from the backup boot region
+readall 42 files 70072 bytes
+readall 42 files 70072 bytes
+test-fs: note: 1 heap block(s) and 0 page(s) kept after the first unmount (one-time allocations); later cycles must not add to them
+[k] WARNING (ratelimit 2/10): at kernel/fs/exfat.c:2229 exfat_chain_decode(): exfat: corrupt volume: chain from 6290 holds FAT value 0x0 at cluster 6290
+[k] exfat: /dev/sdz1: ERROR: corrupt metadata (at 6290)
+readall 42 files 70072 bytes
+FAIL line 13:  ?umount: unmount left 1 heap blocks (128 bytes live)
+test-fs: FAILED reads=104 writes=0 discards=0 flushes=2 warnings=2 io_errors=0 heap_peak=318864 pages_peak=63 failures=1

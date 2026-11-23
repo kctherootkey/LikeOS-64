@@ -21,6 +21,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <security/pam_appl.h>
 
 #define MAX_TRIES 3
@@ -139,7 +140,9 @@ static int login_conv(int num_msg, const struct pam_message **msg,
 
 static void setup_environment(const struct passwd *pw, char *envp[], int *n)
 {
-	static char home[256], user[128], logname[128], shell[256], term[64];
+	/* HOME and SHELL hold whole paths. */
+	static char home[sizeof("HOME=") + PATH_MAX], user[128], logname[128];
+	static char shell[sizeof("SHELL=") + PATH_MAX], term[64];
 	static char langv[64];
 	const char *t = getenv("TERM");
 	const char *lang = getenv("LANG");

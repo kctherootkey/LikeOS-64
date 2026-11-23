@@ -21,6 +21,7 @@
 #include <kernel/net/net.h>
 #include <kernel/ke/uaccess.h>
 #include <kernel/ke/syscalls.h>
+#include <kernel/ke/task_path.h>
 
 // Minimal uname struct (kernel-side)
 typedef struct {
@@ -415,6 +416,7 @@ int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 		 * space itself (sys_getprocmaps), so one user cannot take them
 		 * from another. */
 		int may_read = (task_may_access(t, ACCESS_READ) == 0);
+		struct task_path *cwd_ref = NULL; /* dropped after the lock */
 
 		procinfo_t *p = &kbuf[count];
 		p->pid = t->id;
@@ -541,13 +543,21 @@ int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 				p->environ[i] = t->environ[i];
 			p->environ[2047] = '\0';
 
-			// Copy cwd
-			for (int i = 0; i < 255 && t->cwd[i]; i++)
-				p->cwd[i] = t->cwd[i];
+			// Copy cwd (a reference: the task may chdir meanwhile)
+			struct task_path *cp = task_path_ref(t, TASK_PATH_CWD);
+			const char *cs = cp ? cp->s : "/";
+			int i = 0;
+			for (; i < 255 && cs[i]; i++)
+				p->cwd[i] = cs[i];
+			p->cwd[i] = '\0';
 			p->cwd[255] = '\0';
+			cwd_ref = cp;
 		}
 
 		spin_unlock_irqrestore(&g_task_list_lock, flags);
+		/* Dropped with the lock and the interrupt flag given back:
+		 * the last reference frees the string (kfree). */
+		task_path_put(cwd_ref);
 		count++;
 	}
 

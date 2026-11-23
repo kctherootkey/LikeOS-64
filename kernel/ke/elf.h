@@ -5,6 +5,18 @@
 #ifndef _KERNEL_ELF_H_
 #define _KERNEL_ELF_H_
 
+/* What one execve() may hand the new program (argv and envp together, one
+ * budget for both, as ARG_MAX in the C library's limits.h says):
+ *   EXEC_ARG_MAX        bytes of strings, each NUL included; one string may
+ *                       take all of it
+ *   EXEC_ARG_COUNT_MAX  strings (the pointer arrays are counted apart)
+ * More is E2BIG.  The initial stack block built from them (strings, the two
+ * pointer arrays, the auxiliary vector) is at most EXEC_STACK_BLOCK_MAX,
+ * well inside the part of the user stack mapped at exec. */
+#define EXEC_ARG_MAX 131072
+#define EXEC_ARG_COUNT_MAX 32768
+#define EXEC_STACK_BLOCK_MAX (1024 * 1024)
+
 #include <kernel/uapi/types.h>
 #include <kernel/ke/cred.h> /* cred_t (AT_SECURE / AT_*ID reporting) */
 
