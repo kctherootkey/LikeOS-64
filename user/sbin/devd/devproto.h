@@ -64,6 +64,10 @@ long devp_line_end(struct devp_line *l);
  * or -1 when it is neither. */
 int devp_mount_parse(char *const *tok, int n, int *recover);
 
+/* A CANCEL request, split: "CANCEL <name>" (stop the format of the volume
+ * <name>).  0, or -1 when it is not one. */
+int devp_cancel_parse(char *const *tok, int n);
+
 /* The conventional name of an errno value ("EPERM"), "EIO" when unknown. */
 const char *devp_errname(int err);
 

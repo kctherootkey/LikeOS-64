@@ -417,6 +417,31 @@ static void req_format(struct client *c, char **tok, int ntok)
 	}
 }
 
+/* CANCEL: stop the format of a volume -- for the user at the console (or
+ * root), and only the format that user started.  The reply comes when the
+ * job has stopped and the volume is safe (format_cancel()). */
+static void req_cancel(struct client *c, const char *name)
+{
+	/* the name is echoed only when it is one */
+	const char *n = devname_ok(name) ? name : NULL;
+	const char *msg = "";
+	int r;
+
+	if (!format_busy(name)) {
+		client_err(c, "CANCEL", n, ENOENT,
+			   "no format of this drive is running");
+		return;
+	}
+	if (!auth_may_modify(c->uid, c->pid)) {
+		client_err(c, "CANCEL", n, EPERM,
+			   "only the user logged in at the console may do this");
+		return;
+	}
+	r = format_cancel(c, name, &msg);
+	if (r < 0)
+		client_err(c, "CANCEL", n, -r, msg);
+}
+
 static void handle_line(struct client *c, char *line)
 {
 	char *tok[DEVP_MAX_TOKENS];
@@ -455,6 +480,10 @@ static void handle_line(struct client *c, char *line)
 		req_format(c, tok, n);
 	} else if (strcmp(tok[0], "FORMAT") == 0 && n == 2) {
 		client_err(c, "FORMAT", tok[1], EINVAL, "bad arguments");
+	} else if (devp_cancel_parse(tok, n) == 0) {
+		req_cancel(c, tok[1]);
+	} else if (strcmp(tok[0], "CANCEL") == 0) {
+		client_err(c, "CANCEL", NULL, EINVAL, "bad arguments");
 	} else {
 		client_err(c, tok[0], NULL, EINVAL, "unknown request");
 	}

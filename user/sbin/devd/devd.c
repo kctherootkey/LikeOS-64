@@ -11,7 +11,8 @@
 //
 // One poll loop: device events, the listening socket, the connections and
 // the pipes of running formats.  Requests are handled one after another in
-// the loop; only formatting runs in a child process.
+// the loop; only formatting (and clearing a volume whose format was
+// cancelled) runs in a child process.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -193,6 +194,13 @@ int main(int argc, char **argv)
 			if (g_child)
 				timeout = 0;
 		}
+		{
+			/* a cancelled format's grace period */
+			int ft = format_timeout(now);
+
+			if (ft >= 0 && ft < timeout)
+				timeout = ft;
+		}
 
 		if (poll(pfd, (nfds_t)n, timeout) < 0 && errno != EINTR) {
 			log_err("poll: %s", strerror(errno));
@@ -203,6 +211,7 @@ int main(int argc, char **argv)
 		/* SIGCHLD may have come just before poll(): always look */
 		g_child = 0;
 		format_reap();
+		format_tick(now_ms());
 		if (i_ev >= 0 && (pfd[i_ev].revents & (POLLERR | POLLNVAL))) {
 			log_warn(DEVD_EVENTS_PATH " failed; looking at "
 				 "/sys/block every %d s instead",

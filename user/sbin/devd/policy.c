@@ -20,7 +20,8 @@
 // reserved, recovery, BIOS boot): they hold boot code, not people's files.
 //
 // The same rules hold for every caller, root included; who may ask at all
-// (root or the user at the console) is auth.c's question.  Pure functions:
+// (root or the user at the console) is auth.c's question.  Also here: what
+// a cancelled format leaves and who may cancel one.  Pure functions:
 // tested on the build machine.
 //
 // Copyright (C) 2026 The LikeOS Project
@@ -94,4 +95,44 @@ int dev_medium_changed(const struct dev *old, const struct dev *cur)
 	if (cur->size == 0)
 		return 1;
 	return old->diskseq != cur->diskseq;
+}
+
+/* ---- cancelling a format ------------------------------------------------- */
+
+int format_mark_parse(const char *line, int *pct)
+{
+	uint64_t v;
+
+	if (line[0] == 'P' && devp_parse_u64(line + 1, 99, &v) == 0) {
+		*pct = (int)v;
+		return FMARK_PROGRESS;
+	}
+	if (strcmp(line, "W") == 0)
+		return FMARK_WRITE;
+	if (strcmp(line, "M") == 0)
+		return FMARK_MKFS;
+	return FMARK_NONE;
+}
+
+int format_mark_writes(int mark)
+{
+	/* The child says so before it writes, so a job stopped in between
+	 * counts as written: the safe side. */
+	return mark == FMARK_WRITE || mark == FMARK_MKFS;
+}
+
+int format_cancel_allowed(uint32_t uid, uint32_t owner)
+{
+	return uid == 0 || uid == owner;
+}
+
+const char *format_cancel_message(int written, int cleared)
+{
+	if (!written)
+		return "Formatting was cancelled. The drive was not changed.";
+	if (cleared)
+		return "Formatting was cancelled. The drive must be formatted "
+		       "before it can be used.";
+	return "Formatting was cancelled. The drive could not be cleared; it "
+	       "must be formatted before it can be used.";
 }

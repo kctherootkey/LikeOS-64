@@ -9,13 +9,19 @@
 //   devctl unmount <name>
 //   devctl eject <disk>
 //   devctl format <name> <fs> [--label L] [--full] [--cluster N]
+//   devctl cancel <name>                stop the format of a volume
 //
 // For testing devd without a desktop.  Mounting, ejecting and formatting
 // are allowed for root and for the user logged in at the console.
+// Ctrl-C (SIGINT) or SIGTERM during a format cancels it: CANCEL goes out
+// on a second connection (devd takes nothing more on the format's own
+// until it replies), and the format's final reply is printed.
 //
 // Copyright (C) 2026 The LikeOS Project
 
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,10 +32,18 @@
 
 #include "devproto.h"
 
-static int g_fd = -1;
-static char g_in[DEVP_LINE_MAX * 2];
-static size_t g_inlen;
+struct conn {
+	int fd;
+	char in[DEVP_LINE_MAX * 2];
+	size_t inlen;
+};
+
+static struct conn g_main = { .fd = -1 };
 static char g_errname[32]; /* of the last ERR line */
+/* SIGINT and SIGTERM during a format: the handler writes a byte here, and
+ * recv_line() calls g_on_signal (once it is set). */
+static int g_sigpipe[2] = { -1, -1 };
+static void (*g_on_signal)(void);
 
 static void die(const char *msg)
 {
@@ -37,29 +51,36 @@ static void die(const char *msg)
 	exit(1);
 }
 
-static void connect_devd(void)
+/* 0, or -1 with the reason printed */
+static int connect_devd(struct conn *k)
 {
 	struct sockaddr_un sa;
 
-	g_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-	if (g_fd < 0)
-		die("socket failed");
+	k->inlen = 0;
+	k->fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (k->fd < 0) {
+		fprintf(stderr, "devctl: socket failed\n");
+		return -1;
+	}
 	memset(&sa, 0, sizeof(sa));
 	sa.sun_family = AF_UNIX;
 	strcpy(sa.sun_path, DEVP_SOCKET_PATH);
-	if (connect(g_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+	if (connect(k->fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
 		fprintf(stderr, "devctl: cannot reach devd at %s: %s\n",
 			DEVP_SOCKET_PATH, strerror(errno));
-		exit(1);
+		close(k->fd);
+		k->fd = -1;
+		return -1;
 	}
+	return 0;
 }
 
-static void send_line(const char *s)
+static void send_line(struct conn *k, const char *s)
 {
 	size_t n = strlen(s), off = 0;
 
 	while (off < n) {
-		ssize_t w = write(g_fd, s + off, n - off);
+		ssize_t w = write(k->fd, s + off, n - off);
 		if (w < 0 && errno == EINTR)
 			continue;
 		if (w <= 0)
@@ -69,30 +90,56 @@ static void send_line(const char *s)
 }
 
 /* The next line from devd (no '\n'), in `out'. */
-static void recv_line(char *out, size_t cap)
+static void recv_line(struct conn *k, char *out, size_t cap)
 {
 	for (;;) {
-		char *nl = memchr(g_in, '\n', g_inlen);
+		char *nl = memchr(k->in, '\n', k->inlen);
 		ssize_t n;
 
 		if (nl) {
-			size_t len = (size_t)(nl - g_in);
+			size_t len = (size_t)(nl - k->in);
 			if (len >= cap)
 				die("reply line too long");
-			memcpy(out, g_in, len);
+			memcpy(out, k->in, len);
 			out[len] = '\0';
-			memmove(g_in, nl + 1, g_inlen - len - 1);
-			g_inlen -= len + 1;
+			memmove(k->in, nl + 1, k->inlen - len - 1);
+			k->inlen -= len + 1;
 			return;
 		}
-		if (g_inlen == sizeof(g_in))
+		if (k->inlen == sizeof(k->in))
 			die("reply line too long");
-		n = read(g_fd, g_in + g_inlen, sizeof(g_in) - g_inlen);
+		if (g_sigpipe[0] >= 0) {
+			struct pollfd p[2];
+
+			p[0].fd = k->fd;
+			p[0].events = POLLIN;
+			p[1].fd = g_sigpipe[0];
+			p[1].events = POLLIN;
+			p[0].revents = p[1].revents = 0;
+			if (poll(p, 2, -1) < 0) {
+				if (errno == EINTR)
+					continue;
+				die("poll failed");
+			}
+			if (p[1].revents & POLLIN) {
+				char b[16];
+				void (*fn)(void) = g_on_signal;
+
+				while (read(g_sigpipe[0], b, sizeof(b)) > 0)
+					;
+				if (fn)
+					fn();
+				continue;
+			}
+			if (!p[0].revents)
+				continue;
+		}
+		n = read(k->fd, k->in + k->inlen, sizeof(k->in) - k->inlen);
 		if (n < 0 && errno == EINTR)
 			continue;
 		if (n <= 0)
 			die("devd closed the connection");
-		g_inlen += (size_t)n;
+		k->inlen += (size_t)n;
 	}
 }
 
@@ -170,7 +217,7 @@ static int cmd_list(void)
 {
 	char line[DEVP_LINE_MAX];
 
-	send_line("LIST\n");
+	send_line(&g_main, "LIST\n");
 	printf("%-10s %-9s %8s %-8s %-5s %-3s %-3s %-3s %-16s %s\n", "NAME",
 	       "KIND", "SIZE", "FSTYPE", "CLASS", "RO", "SYS", "MNT", "LABEL",
 	       "MOUNTED");
@@ -181,7 +228,7 @@ static int cmd_list(void)
 		uint64_t size = 0;
 		int n;
 
-		recv_line(line, sizeof(line));
+		recv_line(&g_main, line, sizeof(line));
 		n = devp_split(line, tok, DEVP_MAX_TOKENS);
 		if (n <= 0)
 			continue;
@@ -225,12 +272,12 @@ static int cmd_simple(const char *req, int print_all)
 {
 	char line[DEVP_LINE_MAX];
 
-	send_line(req);
+	send_line(&g_main, req);
 	for (;;) {
 		char *tok[DEVP_MAX_TOKENS];
 		int n;
 
-		recv_line(line, sizeof(line));
+		recv_line(&g_main, line, sizeof(line));
 		n = devp_split(line, tok, DEVP_MAX_TOKENS);
 		if (n <= 0)
 			continue;
@@ -256,12 +303,12 @@ static int cmd_monitor(void)
 {
 	char line[DEVP_LINE_MAX];
 
-	send_line("SUBSCRIBE\n");
+	send_line(&g_main, "SUBSCRIBE\n");
 	for (;;) {
 		char *tok[DEVP_MAX_TOKENS];
 		int n;
 
-		recv_line(line, sizeof(line));
+		recv_line(&g_main, line, sizeof(line));
 		n = devp_split(line, tok, DEVP_MAX_TOKENS);
 		if (n <= 0)
 			continue;
@@ -275,6 +322,72 @@ static int cmd_monitor(void)
 		printf("\n");
 		fflush(stdout);
 	}
+}
+
+/* "CANCEL <name>\n" for the format running */
+static char g_cancel_req[300];
+
+static void on_stop_signal(int sig)
+{
+	int e = errno;
+	ssize_t w = write(g_sigpipe[1], "x", 1);
+
+	(void)w;
+	(void)sig;
+	errno = e;
+}
+
+static void stop_signals(void (*handler)(int))
+{
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = handler;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+}
+
+/* Ctrl-C or SIGTERM during a format: CANCEL on a second connection, then
+ * back to the format's, whose final reply says how it ended.  When the
+ * cancel is refused, the next signal ends devctl (the format goes on). */
+static void cancel_format(void)
+{
+	static struct conn side;
+	char line[DEVP_LINE_MAX];
+
+	g_on_signal = NULL; /* once */
+	fprintf(stderr, "\ndevctl: stopping the format...\n");
+	if (connect_devd(&side) < 0) {
+		stop_signals(SIG_DFL);
+		return;
+	}
+	send_line(&side, "HELLO 1\n");
+	recv_line(&side, line, sizeof(line));
+	if (strcmp(line, "OK HELLO 1") != 0) {
+		fprintf(stderr, "devctl: devd refused: %.200s\n", line);
+		close(side.fd);
+		stop_signals(SIG_DFL);
+		return;
+	}
+	send_line(&side, g_cancel_req);
+	for (;;) {
+		char *tok[DEVP_MAX_TOKENS];
+		int n;
+
+		recv_line(&side, line, sizeof(line));
+		n = devp_split(line, tok, DEVP_MAX_TOKENS);
+		if (n <= 0 || !is_final(tok[0]))
+			continue;
+		/* ENOENT: the format has just finished; its reply says how */
+		if (strcmp(tok[0], "ERR") == 0 &&
+		    !(n >= 4 && strcmp(tok[n - 2], "ENOENT") == 0)) {
+			final_line(tok, n);
+			stop_signals(SIG_DFL);
+		}
+		break;
+	}
+	close(side.fd);
 }
 
 static int cmd_format(int argc, char **argv)
@@ -310,13 +423,19 @@ static int cmd_format(int argc, char **argv)
 		snprintf(req, sizeof(req),
 			 "FORMAT %s fs=%s label=%s quick=%d cluster=%s\n", n1,
 			 n2, enc, quick, n3);
+		snprintf(g_cancel_req, sizeof(g_cancel_req), "CANCEL %s\n",
+			 n1);
 	}
-	send_line(req);
+	if (pipe2(g_sigpipe, O_CLOEXEC | O_NONBLOCK) < 0)
+		die("pipe failed");
+	g_on_signal = cancel_format;
+	stop_signals(on_stop_signal);
+	send_line(&g_main, req);
 	for (;;) {
 		char *tok[DEVP_MAX_TOKENS];
 		int n;
 
-		recv_line(line, sizeof(line));
+		recv_line(&g_main, line, sizeof(line));
 		n = devp_split(line, tok, DEVP_MAX_TOKENS);
 		if (n <= 0)
 			continue;
@@ -346,7 +465,8 @@ static void usage(void)
 		"       devctl mount [--recover] <name> | unmount <name> | "
 		"eject <disk>\n"
 		"       devctl format <name> <fs> [--label L] [--full] "
-		"[--cluster N]\n");
+		"[--cluster N]\n"
+		"       devctl cancel <name>\n");
 	exit(2);
 }
 
@@ -358,9 +478,10 @@ int main(int argc, char **argv)
 	signal(SIGPIPE, SIG_IGN);
 	if (argc < 2)
 		usage();
-	connect_devd();
-	send_line("HELLO 1\n");
-	recv_line(line, sizeof(line));
+	if (connect_devd(&g_main) < 0)
+		return 1;
+	send_line(&g_main, "HELLO 1\n");
+	recv_line(&g_main, line, sizeof(line));
 	if (strcmp(line, "OK HELLO 1") != 0) {
 		fprintf(stderr, "devctl: devd refused: %.200s\n", line);
 		return 1;
@@ -380,11 +501,13 @@ int main(int argc, char **argv)
 		r = cmd_simple(req, 0);
 	} else if ((strcmp(argv[1], "mount") == 0 ||
 		    strcmp(argv[1], "unmount") == 0 ||
-		    strcmp(argv[1], "eject") == 0) &&
+		    strcmp(argv[1], "eject") == 0 ||
+		    strcmp(argv[1], "cancel") == 0) &&
 		   argc == 3) {
 		const char *verb = argv[1][0] == 'm' ? "MOUNT" :
 				   argv[1][0] == 'u' ? "UNMOUNT" :
-						       "EJECT";
+				   argv[1][0] == 'e' ? "EJECT" :
+						       "CANCEL";
 		if (devp_encode(enc, sizeof(enc), argv[2], strlen(argv[2])) >=
 		    sizeof(enc))
 			usage();
@@ -403,6 +526,6 @@ int main(int argc, char **argv)
 		usage();
 		r = 2;
 	}
-	close(g_fd);
+	close(g_main.fd);
 	return r;
 }

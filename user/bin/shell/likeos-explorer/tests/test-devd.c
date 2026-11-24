@@ -5,8 +5,9 @@
 // client against a stand-in service on a socket of its own (in a fresh
 // directory under $TMPDIR): the first requests, the table of devices and
 // filesystems, events, a mount, a mount refused until its journal is
-// replayed and asked for again with recovery, a refused eject, lines to
-// drop, the connection lost and found again.  Needs neither the real
+// replayed and asked for again with recovery, a refused eject, a format
+// cancelled (and a cancel for a format that had already finished), lines
+// to drop, the connection lost and found again.  Needs neither the real
 // service nor a display.
 //
 //     explorer-devd-test
@@ -330,6 +331,39 @@ static void test_errors(void)
 	CHECK("journal error code",
 	      ex_devd_error_code("EUCLEAN") == EX_DEVD_ERROR_UNCLEAN &&
 		      *ex_devd_error_explain(EX_DEVD_ERROR_UNCLEAN));
+	CHECK("cancelled error code",
+	      ex_devd_error_code("ECANCELED") == EX_DEVD_ERROR_CANCELED &&
+		      *ex_devd_error_explain(EX_DEVD_ERROR_CANCELED));
+	l = parse("ERR FORMAT sdb1 ECANCELED Formatting%20was%20cancelled.%20The"
+		  "%20drive%20was%20not%20changed.");
+	CHECK("ERR FORMAT ECANCELED parsed",
+	      l && ex_devd_parse_err(l, &verb, &name, &errname, &msg));
+	if (l) {
+		CHECK("ERR FORMAT ECANCELED: fields and code",
+		      !strcmp(verb, "FORMAT") && name && !strcmp(name, "sdb1") &&
+			      ex_devd_error_code(errname) == EX_DEVD_ERROR_CANCELED &&
+			      !strcmp(msg, "Formatting was cancelled. The drive was "
+					   "not changed."));
+		g_free(verb);
+		g_free(name);
+		g_free(errname);
+		g_free(msg);
+	}
+	ex_devd_line_free(l);
+	l = parse("ERR CANCEL sdb1 ENOENT no%20format%20of%20this%20drive%20is"
+		  "%20running");
+	CHECK("ERR CANCEL ENOENT parsed",
+	      l && ex_devd_parse_err(l, &verb, &name, &errname, &msg));
+	if (l) {
+		CHECK("ERR CANCEL ENOENT: fields and code",
+		      !strcmp(verb, "CANCEL") && name && !strcmp(name, "sdb1") &&
+			      ex_devd_error_code(errname) == EX_DEVD_ERROR_NOENT);
+		g_free(verb);
+		g_free(name);
+		g_free(errname);
+		g_free(msg);
+	}
+	ex_devd_line_free(l);
 }
 
 /* ---- the client against a stand-in service ----------------------------------- */
@@ -438,6 +472,14 @@ static gpointer server_main(gpointer data)
 	if (!expect(s, in, "EJECT sdb"))
 		goto done;
 	say(out, "ERR EJECT EBUSY The%20drive%20is%20busy");
+	/* A format stopped, then a cancel that comes too late. */
+	if (!expect(s, in, "CANCEL sdb1"))
+		goto done;
+	say(out, "OK CANCEL sdb1");
+	if (!expect(s, in, "CANCEL sdb1"))
+		goto done;
+	say(out, "ERR CANCEL sdb1 ENOENT no%20format%20of%20this%20drive%20is"
+		 "%20running");
 	/* Lines to drop, the connection kept. */
 	say(out, "OK");
 	say(out, "OK UNMOUNT sdz");
@@ -529,6 +571,14 @@ static void unmounted(GObject *src, GAsyncResult *res, gpointer data)
 	Result *r = data;
 
 	r->ok = ex_devd_unmount_finish(EX_DEVD(src), res, &r->error);
+	r->done = TRUE;
+}
+
+static void cancelled(GObject *src, GAsyncResult *res, gpointer data)
+{
+	Result *r = data;
+
+	r->ok = ex_devd_cancel_format_finish(EX_DEVD(src), res, &r->error);
 	r->done = TRUE;
 }
 
@@ -640,6 +690,25 @@ static void test_client(void)
 	CHECK("eject refused with the service's message",
 	      !r.ok && g_error_matches(r.error, EX_DEVD_ERROR, EX_DEVD_ERROR_BUSY) &&
 		      !strcmp(r.error->message, "The drive is busy"));
+	g_clear_error(&r.error);
+
+	memset(&r, 0, sizeof(r));
+	ex_devd_cancel_format_async(d, "sdb1", NULL, cancelled, &r);
+	CHECK("cancel answered", RUN_UNTIL(r.done, 5000));
+	CHECK("cancel done", r.ok && !r.error);
+	g_clear_error(&r.error);
+	memset(&r, 0, sizeof(r));
+	ex_devd_cancel_format_async(d, "sdb1", NULL, cancelled, &r);
+	CHECK("late cancel answered", RUN_UNTIL(r.done, 5000));
+	CHECK("late cancel: no format running",
+	      !r.ok && g_error_matches(r.error, EX_DEVD_ERROR, EX_DEVD_ERROR_NOENT) &&
+		      !strcmp(r.error->message, "no format of this drive is running"));
+	g_clear_error(&r.error);
+	memset(&r, 0, sizeof(r));
+	ex_devd_cancel_format_async(d, "../etc", NULL, cancelled, &r);
+	CHECK("cancel: bad name refused at once",
+	      RUN_UNTIL(r.done, 1000) &&
+		      g_error_matches(r.error, EX_DEVD_ERROR, EX_DEVD_ERROR_NOENT));
 	g_clear_error(&r.error);
 
 	memset(&r, 0, sizeof(r));

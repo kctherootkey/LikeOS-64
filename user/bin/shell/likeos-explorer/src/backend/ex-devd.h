@@ -23,7 +23,11 @@
 // Signals of ExDevdFormat:
 //   "progress"  (int percent)  -- -1: a step without progress of its own
 //                                 (writing the file system) has started
-//   "finished"  (GError *error)  -- NULL when the drive was formatted
+//   "finished"  (GError *error)  -- NULL when the drive was formatted;
+//                                 EX_DEVD_ERROR_CANCELED after a cancel
+//                                 (ex_devd_cancel_format_async()), with
+//                                 the service's message saying whether
+//                                 the drive was changed
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -79,6 +83,16 @@ gboolean ex_devd_unmount_finish(ExDevd *d, GAsyncResult *res, GError **error);
 void ex_devd_eject_async(ExDevd *d, const char *disk, GCancellable *cancel,
 			 GAsyncReadyCallback done, gpointer user_data);
 gboolean ex_devd_eject_finish(ExDevd *d, GAsyncResult *res, GError **error);
+/* CANCEL: stop the format of volume `name' (sent on this connection: the
+ * format's own takes nothing until its job ends).  Answered once the job
+ * has stopped; the job's "finished" then carries EX_DEVD_ERROR_CANCELED.
+ * EX_DEVD_ERROR_NOENT when no format of it runs -- it may have just
+ * finished, with its own "finished". */
+void ex_devd_cancel_format_async(ExDevd *d, const char *name,
+				 GCancellable *cancel, GAsyncReadyCallback done,
+				 gpointer user_data);
+gboolean ex_devd_cancel_format_finish(ExDevd *d, GAsyncResult *res,
+				      GError **error);
 
 #define EX_TYPE_DEVD_FORMAT (ex_devd_format_get_type())
 G_DECLARE_FINAL_TYPE(ExDevdFormat, ex_devd_format, EX, DEVD_FORMAT, GObject)

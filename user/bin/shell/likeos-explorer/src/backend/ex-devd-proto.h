@@ -49,6 +49,8 @@ typedef enum {
 	EX_DEVD_ERROR_UNCLEAN, /* EUCLEAN: the file system's journal must be
 				  replayed before it is mounted (ask the
 				  user, then mount with recovery) */
+	EX_DEVD_ERROR_CANCELED, /* ECANCELED: the format was cancelled (the
+				   message says whether the drive changed) */
 } ExDevdErrorCode;
 
 /* The code for an error name ("EBUSY"). */

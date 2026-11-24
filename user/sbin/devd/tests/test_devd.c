@@ -1,7 +1,8 @@
 // devd host unit tests: protocol encoding, names, filesystem probes (with
 // the exFAT, NTFS and Joliet labels), partition tables, the filesystem
-// table, the device rules (policy.c), the volume agent's automount rule
-// and the authorization decision.
+// table, the device rules (policy.c), the volume agent's automount rule,
+// the authorization decision and cancelling a format (the request, the
+// replies, who may, and whether the volume was written to).
 //
 // usage: test_devd <scratch directory for images>
 //
@@ -175,6 +176,132 @@ static void test_proto(void)
 	CHECK(devp_parse_u64("101", 100, &v) < 0);
 	CHECK(devp_parse_u64("18446744073709551616", UINT64_MAX, &v) < 0);
 	CHECK(devp_parse_u64("1 ", 100, &v) < 0);
+}
+
+/* ---- cancelling a format ------------------------------------------------------------ */
+
+/* The marks a formatting child sends, in order, fed to the same decision
+ * devd makes: was the volume written to when the job was stopped? */
+static int written_after(const char *const *marks, int n)
+{
+	int written = 0;
+
+	for (int i = 0; i < n; i++) {
+		int pct = -1;
+
+		if (format_mark_writes(format_mark_parse(marks[i], &pct)))
+			written = 1;
+	}
+	return written;
+}
+
+static void test_cancel(void)
+{
+	char line[256], *tok[DEVP_MAX_TOKENS];
+	struct devp_line l;
+	int n, pct = -1;
+
+	/* the request */
+	strcpy(line, "CANCEL sdb1");
+	n = devp_split(line, tok, DEVP_MAX_TOKENS);
+	CHECK(n == 2 && devp_cancel_parse(tok, n) == 0 &&
+	      strcmp(tok[1], "sdb1") == 0);
+	strcpy(line, "CANCEL");
+	n = devp_split(line, tok, DEVP_MAX_TOKENS);
+	CHECK(devp_cancel_parse(tok, n) < 0);
+	strcpy(line, "CANCEL sdb1 now");
+	n = devp_split(line, tok, DEVP_MAX_TOKENS);
+	CHECK(devp_cancel_parse(tok, n) < 0);
+	strcpy(line, "FORMAT sdb1");
+	n = devp_split(line, tok, DEVP_MAX_TOKENS);
+	CHECK(devp_cancel_parse(tok, n) < 0);
+	strcpy(line, "cancel sdb1");
+	n = devp_split(line, tok, DEVP_MAX_TOKENS);
+	CHECK(devp_cancel_parse(tok, n) < 0);
+
+	/* the replies, as devd writes them */
+	devp_line_begin(&l, "OK");
+	devp_line_word(&l, "CANCEL");
+	devp_line_enc(&l, "sdb1");
+	CHECK(devp_line_end(&l) > 0 && l.len == 15 &&
+	      memcmp(l.buf, "OK CANCEL sdb1\n", 15) == 0);
+	CHECK_STR(devp_errname(ECANCELED), "ECANCELED");
+	devp_line_begin(&l, "ERR");
+	devp_line_enc(&l, "FORMAT");
+	devp_line_enc(&l, "sdb1");
+	devp_line_word(&l, devp_errname(ECANCELED));
+	devp_line_enc(&l, format_cancel_message(0, 0));
+	{
+		static const char want[] =
+			"ERR FORMAT sdb1 ECANCELED Formatting%20was%20"
+			"cancelled.%20The%20drive%20was%20not%20changed.\n";
+
+		CHECK(devp_line_end(&l) == (long)strlen(want) &&
+		      memcmp(l.buf, want, strlen(want)) == 0);
+	}
+	devp_line_begin(&l, "ERR");
+	devp_line_enc(&l, "CANCEL");
+	devp_line_enc(&l, "sdb1");
+	devp_line_word(&l, devp_errname(ENOENT));
+	devp_line_enc(&l, "no format of this drive is running");
+	CHECK(devp_line_end(&l) > 0 &&
+	      memcmp(l.buf, "ERR CANCEL sdb1 ENOENT no%20format", 34) == 0);
+
+	/* who may */
+	CHECK(format_cancel_allowed(1000, 1000));
+	CHECK(format_cancel_allowed(0, 1000));
+	CHECK(format_cancel_allowed(0, 0));
+	CHECK(!format_cancel_allowed(1001, 1000));
+	CHECK(!format_cancel_allowed(1000, 0));
+
+	/* the child's marks */
+	CHECK(format_mark_parse("P42", &pct) == FMARK_PROGRESS && pct == 42);
+	CHECK(format_mark_parse("P0", &pct) == FMARK_PROGRESS && pct == 0);
+	CHECK(format_mark_parse("P100", &pct) == FMARK_NONE);
+	CHECK(format_mark_parse("P", &pct) == FMARK_NONE);
+	CHECK(format_mark_parse("P-1", &pct) == FMARK_NONE);
+	CHECK(format_mark_parse("W", &pct) == FMARK_WRITE);
+	CHECK(format_mark_parse("M", &pct) == FMARK_MKFS);
+	CHECK(format_mark_parse("WM", &pct) == FMARK_NONE);
+	CHECK(format_mark_parse("", &pct) == FMARK_NONE);
+	CHECK(!format_mark_writes(FMARK_PROGRESS) &&
+	      !format_mark_writes(FMARK_NONE) &&
+	      format_mark_writes(FMARK_WRITE) && format_mark_writes(FMARK_MKFS));
+
+	/* written or not, in every phase */
+	{
+		/* stopped before the child said anything */
+		CHECK(!written_after(NULL, 0));
+		/* a quick format of a partition: nothing until mkfs */
+		static const char *const quick_pre[] = { "P5" };
+		static const char *const quick_mkfs[] = { "P5", "M" };
+		/* a quick format of a whole drive: its ends wiped first */
+		static const char *const whole_wipe[] = { "W" };
+		static const char *const whole_mkfs[] = { "W", "P5", "M" };
+		/* a full format: zeros from the start */
+		static const char *const full_zero[] = { "W", "P1", "P2" };
+		static const char *const full_mkfs[] = { "W", "P1", "P89",
+							 "P90", "M" };
+
+		CHECK(!written_after(quick_pre, 1));
+		CHECK(written_after(quick_mkfs, 2));
+		CHECK(written_after(whole_wipe, 1));
+		CHECK(written_after(whole_mkfs, 3));
+		CHECK(written_after(full_zero, 1));
+		CHECK(written_after(full_zero, 3));
+		CHECK(written_after(full_mkfs, 5));
+	}
+
+	/* the messages */
+	CHECK_STR(format_cancel_message(0, 0),
+		  "Formatting was cancelled. The drive was not changed.");
+	CHECK_STR(format_cancel_message(0, 1),
+		  "Formatting was cancelled. The drive was not changed.");
+	CHECK_STR(format_cancel_message(1, 1),
+		  "Formatting was cancelled. The drive must be formatted "
+		  "before it can be used.");
+	CHECK(strstr(format_cancel_message(1, 0), "must be formatted") &&
+	      strstr(format_cancel_message(1, 0), "could not be cleared"));
 }
 
 /* ---- names ----------------------------------------------------------------------- */
@@ -1656,6 +1783,7 @@ int main(int argc, char **argv)
 	test_fstab();
 	test_auth();
 	test_policy();
+	test_cancel();
 	test_probe_crafted();
 	test_probe_labels();
 	test_partition_tables();

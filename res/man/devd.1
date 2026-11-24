@@ -69,6 +69,20 @@ DESCRIPTION
        UTF-16 code units, without control characters or the characters
        the file system reserves.
 
+       A format can be stopped at any moment with "CANCEL <name>" on
+       another connection, by the user who started it or by root.  devd
+       sends SIGTERM to the formatting process group, and SIGKILL when it
+       has not ended two seconds later.  If nothing had been written to
+       the volume yet (a quick format of a partition before mkfs starts),
+       it is left as it was.  Otherwise it holds a half-made file system,
+       so devd overwrites its first and last megabyte with zeros (the
+       volume claimed with O_EXCL, as for formatting) and it shows as
+       unformatted.  Then the format's client gets "ERR FORMAT <name>
+       ECANCELED" with a message saying which of the two happened, and
+       the cancelling client "OK CANCEL <name>".  "ERR CANCEL <name>
+       ENOENT" means no format of the volume is running (it may have just
+       finished, with its own reply).
+
 OPTIONS
        -f     Stay in the foreground and log to standard error.  This is how
               init(1) starts it, from /etc/inittab: respawn /usr/sbin/devd -f .

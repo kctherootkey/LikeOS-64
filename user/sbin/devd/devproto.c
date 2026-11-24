@@ -262,6 +262,13 @@ int devp_mount_parse(char *const *tok, int n, int *recover)
 	return 0;
 }
 
+int devp_cancel_parse(char *const *tok, int n)
+{
+	if (n != 2 || strcmp(tok[0], "CANCEL") != 0)
+		return -1;
+	return 0;
+}
+
 int devp_parse_u64(const char *s, uint64_t max, uint64_t *out)
 {
 	uint64_t v = 0;

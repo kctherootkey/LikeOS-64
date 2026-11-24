@@ -245,18 +245,19 @@ typedef enum {
 	R_MOUNT,
 	R_UNMOUNT,
 	R_EJECT,
+	R_CANCEL,
 } ReqKind;
 
 static const char *const verbs[] = {
 	[R_HELLO] = "HELLO",	 [R_SUBSCRIBE] = "SUBSCRIBE",
 	[R_LIST] = "LIST",	 [R_FSTYPES] = "FSTYPES",
 	[R_MOUNT] = "MOUNT",	 [R_UNMOUNT] = "UNMOUNT",
-	[R_EJECT] = "EJECT",
+	[R_EJECT] = "EJECT",	 [R_CANCEL] = "CANCEL",
 };
 
 typedef struct {
 	ReqKind kind;
-	char *name; /* MOUNT, UNMOUNT, EJECT */
+	char *name; /* MOUNT, UNMOUNT, EJECT, CANCEL */
 	gboolean recover; /* MOUNT <name> recover */
 	GTask *task; /* the caller's, or NULL */
 } Req;
@@ -581,6 +582,7 @@ static void answer(ExDevd *d, const ExDevdLine *l, gboolean ok)
 		break;
 	case R_UNMOUNT:
 	case R_EJECT:
+	case R_CANCEL:
 		if (r->task)
 			g_task_return_boolean(r->task, TRUE);
 		break;
@@ -804,6 +806,20 @@ void ex_devd_eject_async(ExDevd *d, const char *disk, GCancellable *cancel,
 }
 
 gboolean ex_devd_eject_finish(ExDevd *d, GAsyncResult *res, GError **error)
+{
+	return g_task_propagate_boolean(G_TASK(res), error);
+}
+
+void ex_devd_cancel_format_async(ExDevd *d, const char *name,
+				 GCancellable *cancel, GAsyncReadyCallback done,
+				 gpointer user_data)
+{
+	request(d, R_CANCEL, name, FALSE, cancel, done, user_data,
+		ex_devd_cancel_format_async);
+}
+
+gboolean ex_devd_cancel_format_finish(ExDevd *d, GAsyncResult *res,
+				      GError **error)
 {
 	return g_task_propagate_boolean(G_TASK(res), error);
 }

@@ -35,6 +35,7 @@ ExDevdErrorCode ex_devd_error_code(const char *errname)
 		{ "ENOTSUP", EX_DEVD_ERROR_NOTSUP }, { "EOPNOTSUPP", EX_DEVD_ERROR_NOTSUP },
 		{ "ENOSYS", EX_DEVD_ERROR_NOTSUP },  { "EROFS", EX_DEVD_ERROR_ROFS },
 		{ "EUCLEAN", EX_DEVD_ERROR_UNCLEAN },
+		{ "ECANCELED", EX_DEVD_ERROR_CANCELED },
 	};
 
 	for (gsize i = 0; errname && i < G_N_ELEMENTS(map); i++)
@@ -74,6 +75,8 @@ const char *ex_devd_error_explain(ExDevdErrorCode code)
 	case EX_DEVD_ERROR_UNCLEAN:
 		return "The drive's file system was not closed properly; its "
 		       "journal must be replayed before it can be opened.";
+	case EX_DEVD_ERROR_CANCELED:
+		return "Formatting was cancelled.";
 	case EX_DEVD_ERROR_FAILED:
 	default:
 		return "Something went wrong.";

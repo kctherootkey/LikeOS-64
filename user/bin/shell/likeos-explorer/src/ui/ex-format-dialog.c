@@ -11,7 +11,7 @@
 
 #include <string.h>
 
-enum { R_START = 1 };
+enum { R_START = 1, R_STOP = 2 };
 
 typedef struct {
 	ExWindow *win;
@@ -20,8 +20,13 @@ typedef struct {
 	char *name; /* "USB Drive", when the window opened */
 	GtkWidget *capacity, *fs, *cluster, *label, *restore, *quick;
 	GtkWidget *bar, *status, *start, *close;
+	GtkWidget *stop; /* "Cancel": stops the format running */
 	GtkWidget *label_note; /* why the label does not suit, under it */
+	GtkWidget *ask_stop; /* the question before stopping, while open */
 	ExDevdFormat *job; /* while formatting */
+	gboolean stopping; /* the service was asked to stop it */
+	gboolean busy; /* writing the file system: the bar pulses */
+	char *note; /* how the last format ended, when it was cancelled */
 	guint pulse_id; /* the bar moves while mkfs runs */
 	gboolean filling; /* the combos are being refilled */
 	gboolean present; /* the drive is there */
@@ -54,6 +59,7 @@ static void fmt_free(Fmt *f)
 	g_object_unref(f->win);
 	g_free(f->device);
 	g_free(f->name);
+	g_free(f->note);
 	g_free(f);
 }
 
@@ -299,6 +305,7 @@ static void sync_sensitive(Fmt *f)
 	gtk_widget_set_sensitive(f->quick, idle);
 	gtk_widget_set_sensitive(f->start, can);
 	gtk_widget_set_sensitive(f->close, idle);
+	gtk_widget_set_sensitive(f->stop, !idle && !f->stopping);
 	gtk_window_set_deletable(GTK_WINDOW(f->dialog), idle);
 }
 
@@ -387,7 +394,9 @@ static void volumes_changed(ExVolumes *v, Fmt *f)
 			"The drive is no longer connected.") == 0 ||
 		 strcmp(gtk_label_get_text(GTK_LABEL(f->status)),
 			"The drive is being formatted.") == 0)
-		gtk_label_set_text(GTK_LABEL(f->status), "");
+		/* After a cancel the drive may still have been "being
+		 * formatted" here a moment: how it ended comes back. */
+		gtk_label_set_text(GTK_LABEL(f->status), f->note ? f->note : "");
 	sync_sensitive(f);
 }
 
@@ -428,6 +437,9 @@ static void job_progress(ExDevdFormat *job, int pct, Fmt *f)
 {
 	char *s;
 
+	if (f->stopping)
+		return; /* "Cancelling…" stays */
+	f->busy = pct < 0;
 	if (pct < 0) {
 		/* Writing the file system reports no progress: the bar
 		 * moves instead of standing at a number. */
@@ -463,7 +475,23 @@ static void job_finished(ExDevdFormat *job, GError *e, Fmt *f)
 	g_signal_handlers_disconnect_by_data(job, f);
 	g_clear_object(&f->job);
 	pulse_stop(f);
-	if (e) {
+	f->stopping = FALSE;
+	/* Nothing left to stop: the question goes. */
+	if (f->ask_stop) {
+		GtkWidget *q = f->ask_stop;
+
+		f->ask_stop = NULL;
+		gtk_widget_destroy(q);
+	}
+	if (e && g_error_matches(e, EX_DEVD_ERROR, EX_DEVD_ERROR_CANCELED)) {
+		/* Stopped as asked: the service says whether the drive was
+		 * changed.  Nothing to report beyond that, and nothing to
+		 * mount. */
+		g_free(f->note);
+		f->note = g_strdup(e->message);
+		gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(f->bar), 0);
+		gtk_label_set_text(GTK_LABEL(f->status), f->note);
+	} else if (e) {
 		char *what = g_strdup_printf("%s could not be formatted", f->name);
 
 		gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(f->bar), 0);
@@ -495,6 +523,9 @@ static void start_format(Fmt *f)
 		g_ascii_string_to_unsigned(cl, 10, 0, G_MAXUINT64, &cluster, NULL);
 	/* Tabs showing the drive leave it: the service unmounts it first. */
 	ex_volumes_release(vols, vol);
+	g_clear_pointer(&f->note, g_free);
+	f->stopping = FALSE;
+	f->busy = FALSE;
 	f->job = ex_devd_format_start(
 		f->device, fs->id, gtk_entry_get_text(GTK_ENTRY(f->label)),
 		gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(f->quick)), cluster);
@@ -536,11 +567,104 @@ static void ask_first(Fmt *f)
 	gtk_widget_show(d);
 }
 
+/* The Fmt of the window formatting `device', if it is still open. */
+static Fmt *fmt_for(const char *device)
+{
+	GtkWidget *w = g_open ? g_hash_table_lookup(g_open, device) : NULL;
+
+	return w ? g_object_get_data(G_OBJECT(w), "ex-format") : NULL;
+}
+
+static void stop_answered(GObject *src, GAsyncResult *res, gpointer data)
+{
+	char *device = data;
+	GError *e = NULL;
+	Fmt *f;
+
+	if (ex_devd_cancel_format_finish(EX_DEVD(src), res, &e) ||
+	    g_error_matches(e, EX_DEVD_ERROR, EX_DEVD_ERROR_NOENT)) {
+		/* Stopped, or it had just finished: "finished" says how it
+		 * ended, whichever came first. */
+		g_clear_error(&e);
+		g_free(device);
+		return;
+	}
+	f = fmt_for(device);
+	g_free(device);
+	if (f && f->job && f->stopping) {
+		/* Not stopped: it goes on, and can be stopped again. */
+		f->stopping = FALSE;
+		if (f->busy)
+			job_progress(f->job, -1, f);
+		else
+			gtk_label_set_text(GTK_LABEL(f->status), "Formatting…");
+		sync_sensitive(f);
+		error_box(f, "Formatting could not be stopped", e->message);
+	}
+	g_error_free(e);
+}
+
+static void stop_format(Fmt *f)
+{
+	f->stopping = TRUE;
+	/* The bar stops where it is. */
+	pulse_stop(f);
+	gtk_label_set_text(GTK_LABEL(f->status), "Cancelling…");
+	sync_sensitive(f);
+	/* On the main connection: the job's own takes nothing more until
+	 * it ends.  The window may be gone when the answer comes. */
+	ex_devd_cancel_format_async(ex_devd_get_default(), f->device, NULL,
+				    stop_answered, g_strdup(f->device));
+}
+
+static void stop_response(GtkDialog *d, int r, Fmt *f)
+{
+	f->ask_stop = NULL;
+	gtk_widget_destroy(GTK_WIDGET(d));
+	if (r == GTK_RESPONSE_ACCEPT && f->job && !f->stopping)
+		stop_format(f);
+}
+
+/* Cancel: stopping may leave the drive unusable until it is formatted,
+ * so it asks first. */
+static void ask_stop(Fmt *f)
+{
+	GtkWidget *d;
+
+	if (f->ask_stop) {
+		gtk_window_present(GTK_WINDOW(f->ask_stop));
+		return;
+	}
+	d = gtk_message_dialog_new(GTK_WINDOW(f->dialog),
+				   GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+				   GTK_MESSAGE_QUESTION, GTK_BUTTONS_NONE,
+				   "Stop formatting “%s”?", f->name);
+	gtk_message_dialog_format_secondary_text(
+		GTK_MESSAGE_DIALOG(d),
+		"If the drive has already been written to, it will have to be "
+		"formatted before it can be used again.");
+	gtk_window_set_title(GTK_WINDOW(d), "Format");
+	gtk_dialog_add_buttons(GTK_DIALOG(d), "_Continue Formatting",
+			       GTK_RESPONSE_CANCEL, "_Stop Formatting",
+			       GTK_RESPONSE_ACCEPT, NULL);
+	/* Going on is what a stray Enter does. */
+	gtk_dialog_set_default_response(GTK_DIALOG(d), GTK_RESPONSE_CANCEL);
+	g_signal_connect(d, "response", G_CALLBACK(stop_response), f);
+	f->ask_stop = d;
+	ex_style_fixed_dialog(d);
+	gtk_widget_show(d);
+}
+
 static void response(GtkDialog *d, int r, Fmt *f)
 {
 	if (r == R_START) {
 		if (!f->job)
 			ask_first(f);
+		return;
+	}
+	if (r == R_STOP) {
+		if (f->job && !f->stopping)
+			ask_stop(f);
 		return;
 	}
 	/* Close, Escape, the window's close button: not while formatting. */
@@ -629,6 +753,9 @@ void ex_format_dialog_show(ExWindow *w, const char *device)
 	g_free(title);
 	f->close = gtk_dialog_add_button(GTK_DIALOG(f->dialog), "_Close",
 					 GTK_RESPONSE_CLOSE);
+	/* Only while formatting (sync_sensitive()). */
+	f->stop = gtk_dialog_add_button(GTK_DIALOG(f->dialog), "Ca_ncel", R_STOP);
+	gtk_widget_set_sensitive(f->stop, FALSE);
 	f->start = gtk_dialog_add_button(GTK_DIALOG(f->dialog), "_Start", R_START);
 	ex_style_add(f->start, "suggested-action");
 	gtk_box_set_spacing(GTK_BOX(gtk_dialog_get_content_area(

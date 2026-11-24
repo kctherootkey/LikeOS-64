@@ -28,6 +28,8 @@
 #define DEVD_MAX_PER_UID 8
 #define DEVD_MAX_DEVS 128
 #define DEVD_MAX_JOBS 4           /* formats at the same time */
+#define DEVD_MAX_CANCELS 4        /* CANCEL requests waiting for one job */
+#define DEVD_CANCEL_GRACE_MS 2000 /* SIGTERM, then SIGKILL after this */
 #define DEVD_LINES_PER_ROUND 16   /* requests taken from one client per loop */
 
 #define DEVD_NAME_MAX 32          /* device names, NUL included */
@@ -230,6 +232,23 @@ unsigned long dev_mount_flags(const struct dev *d, const struct fs_type *t);
  * the device as it was, `cur' as it is now (the same name and number). */
 int dev_medium_changed(const struct dev *old, const struct dev *cur);
 
+/* Formatting, the pure parts of a cancel.  The formatting child writes
+ * these lines on its progress pipe: "P<n>" (n percent, 0..99), "W" before
+ * it first writes to the volume (the zero fill of a full format, the wipe
+ * of a whole drive's ends) and "M" just before mkfs starts. */
+enum format_mark { FMARK_NONE = 0, FMARK_PROGRESS, FMARK_WRITE, FMARK_MKFS };
+/* The mark of one line (without its newline); *pct for FMARK_PROGRESS. */
+int format_mark_parse(const char *line, int *pct);
+/* Does the mark mean the volume may have been written to from now on? */
+int format_mark_writes(int mark);
+/* May a client of `uid' cancel a format that `owner' started?  Root, or
+ * the same user (who must also pass auth_may_modify()). */
+int format_cancel_allowed(uint32_t uid, uint32_t owner);
+/* The message of a cancelled format: `written' -- the volume may have
+ * been written to; `cleared' -- its start and end were overwritten with
+ * zeros afterwards, so it probes as unformatted. */
+const char *format_cancel_message(int written, int cleared);
+
 /* ---- mount table --------------------------------------------------------- */
 
 struct mnt_ent {
@@ -274,10 +293,20 @@ int format_start(struct client *c, struct dev *d, char *const *tok, int ntok,
 		 const char **msg);
 int format_busy(const char *name);     /* formatting this volume? */
 int format_disk_busy(const char *disk);
+/* CANCEL for client `c' (allowed to modify, auth_may_modify()): the
+ * format of volume `name' is stopped.  0 when it is being stopped (the
+ * reply comes when it has stopped and the volume is safe), else -errno and
+ * *msg: -ENOENT when no format of it runs (or it has just finished),
+ * -EPERM when another user started it. */
+int format_cancel(struct client *c, const char *name, const char **msg);
 struct pollfd;
 int format_pollfds(struct pollfd *pfd, int max);
 void format_handle(struct pollfd *pfd, int n);
 void format_reap(void);
+/* Milliseconds until format_tick() has something to do (-1: nothing). */
+int format_timeout(uint64_t now);
+/* A cancelled job that has not stopped within the grace period: killed. */
+void format_tick(uint64_t now);
 void format_kill_all(void);
 void format_client_gone(int client_id);
 
@@ -299,7 +328,8 @@ struct client {
 	int32_t pid;
 	int subscribed;
 	int dead;
-	int waiting;             /* a FORMAT is pending: take no more requests */
+	int waiting;             /* a FORMAT or a CANCEL is pending: take no
+				    more requests */
 	int eof;                 /* the peer sends no more */
 	char in[DEVP_LINE_MAX];
 	size_t inlen;

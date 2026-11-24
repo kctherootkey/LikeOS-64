@@ -14,6 +14,21 @@
 // ERR FORMAT; it sends nothing else meanwhile (devd reads its next request
 // only after that reply), so replies stay in order.
 //
+// CANCEL <name>, on another connection, stops a format in any phase.  The
+// child runs in a session of its own: its whole process group gets
+// SIGTERM, and SIGKILL when it has not ended DEVD_CANCEL_GRACE_MS later
+// (a deadline in the main loop's poll, devd never waits).  The child says
+// "W" on the progress pipe before it first writes to the volume and "M"
+// before mkfs starts; a quick format of a partition writes nothing before
+// mkfs.  When nothing was written the volume is left as it was.  Else it
+// holds a half-made file system that must never pass for a valid one: once
+// the child is gone, a second child claims the volume the same way (O_EXCL)
+// and overwrites its first and last ZERO_CHUNK with zeros, so it probes as
+// unformatted.  Then the table is scanned again, the client that formatted
+// gets ERR FORMAT <name> ECANCELED and every client that cancelled gets OK
+// CANCEL <name>; they too wait for that reply.  A cancel after the child
+// has ended on its own gets ENOENT, and the format its normal reply.
+//
 // Copyright (C) 2026 The LikeOS Project
 
 #include <errno.h>
@@ -26,6 +41,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -36,16 +53,30 @@
 #define EXIT_EXEC 127
 #define ZERO_CHUNK (1024 * 1024)
 #define TAIL_MAX 240
+#define WIPE_TRIES 50          /* claiming the volume after a cancel, */
+#define WIPE_RETRY_US 100000   /* while what is left of the job lets go */
+
+enum { JOB_RUN = 0, JOB_WIPE = 1 };
 
 struct job {
 	int used;
-	pid_t pid;
-	int reaped;
+	pid_t pid;               /* the format, then the wipe after a cancel */
+	int reaped;              /* ended, found by format_cancel() */
 	int status;
 	int prog_fd, out_fd;
 	int client_id;
 	int whole_disk;
 	int last_pct;
+	uid_t uid;               /* who started it */
+	uint32_t major, minor;   /* the volume, as it was at the start */
+	uint64_t diskseq;
+	int phase;               /* JOB_RUN, JOB_WIPE */
+	int written;             /* the volume may have been written to */
+	int cancelling;
+	int cleared;             /* the wipe after the cancel succeeded */
+	uint64_t kill_at;        /* SIGKILL at this time (ms); 0: none */
+	int cancel_ids[DEVD_MAX_CANCELS]; /* the clients that cancelled */
+	int ncancel;
 	char name[DEVD_NAME_MAX];
 	char disk[DEVD_NAME_MAX];
 	char tool[32];
@@ -81,6 +112,13 @@ static void child_progress(int fd, int pct)
 	char b[16];
 	int n = snprintf(b, sizeof(b), "P%d\n", pct);
 	ssize_t w = write(fd, b, (size_t)n);
+	(void)w;
+}
+
+/* "W" or "M" (format_mark_parse()), before what it announces */
+static void child_mark(int fd, const char *mark)
+{
+	ssize_t w = write(fd, mark, strlen(mark));
 	(void)w;
 }
 
@@ -142,11 +180,15 @@ child_run(const char *dev, char **argv, int quick, int whole_disk, int pfd,
 	if (ioctl(fd, BLKGETSIZE64, &size) < 0)
 		size = 0;
 	if (!quick) {
-		if (!size || write_zeros(fd, 0, size, pfd, size, 0, &last) < 0)
+		if (!size)
+			_exit(EXIT_IO);
+		child_mark(pfd, "W\n");
+		if (write_zeros(fd, 0, size, pfd, size, 0, &last) < 0)
 			_exit(EXIT_IO);
 	} else if (whole_disk && size >= 4 * ZERO_CHUNK) {
 		/* an old partition table at either end must not outlive
 		 * the new filesystem */
+		child_mark(pfd, "W\n");
 		if (write_zeros(fd, 0, ZERO_CHUNK, -1, 0, 0, &last) < 0 ||
 		    write_zeros(fd, size - ZERO_CHUNK, ZERO_CHUNK, -1, 0, 0,
 				&last) < 0)
@@ -156,8 +198,55 @@ child_run(const char *dev, char **argv, int quick, int whole_disk, int pfd,
 		_exit(EXIT_IO);
 	close(fd);
 	child_progress(pfd, quick ? 5 : 90);
+	child_mark(pfd, "M\n");
 	execve(argv[0], argv, envp);
 	_exit(EXIT_EXEC);
+}
+
+/* After a cancel: the first and the last ZERO_CHUNK of the volume
+ * overwritten with zeros, so that what the format left there is never
+ * taken for a file system.  `want' is the device number the volume had. */
+static __attribute__((noreturn)) void wipe_run(const char *dev, dev_t want)
+{
+	struct stat st;
+	uint64_t size = 0, head;
+	int maxfd, fd = -1, err = EIO, last = 0;
+
+	for (int s = 1; s < 32; s++)
+		signal(s, SIG_DFL);
+	setsid();
+	maxfd = getdtablesize();
+	if (maxfd <= 0 || maxfd > 65536)
+		maxfd = 4096;
+	for (int i = 3; i < maxfd; i++)
+		close(i);
+	/* the same claim as the format's; what is left of the stopped job
+	 * may hold the volume a moment longer */
+	for (int i = 0; i < WIPE_TRIES; i++) {
+		fd = open(dev, O_WRONLY | O_EXCL | O_CLOEXEC | O_NOFOLLOW);
+		if (fd >= 0)
+			break;
+		err = errno;
+		if (err != EBUSY)
+			break;
+		usleep(WIPE_RETRY_US);
+	}
+	if (fd < 0)
+		_exit(err == EBUSY ? EXIT_BUSY : EXIT_IO);
+	if (fstat(fd, &st) < 0 || !S_ISBLK(st.st_mode) || st.st_rdev != want)
+		_exit(EXIT_IO);
+	if (ioctl(fd, BLKGETSIZE64, &size) < 0 || !size)
+		_exit(EXIT_IO);
+	head = size < ZERO_CHUNK ? size : ZERO_CHUNK;
+	if (write_zeros(fd, 0, head, -1, 0, 0, &last) < 0)
+		_exit(EXIT_IO);
+	if (size > ZERO_CHUNK &&
+	    write_zeros(fd, size - ZERO_CHUNK, ZERO_CHUNK, -1, 0, 0, &last) < 0)
+		_exit(EXIT_IO);
+	if (fsync(fd) < 0)
+		_exit(EXIT_IO);
+	close(fd);
+	_exit(0);
 }
 
 /* ---- starting --------------------------------------------------------------------- */
@@ -179,7 +268,7 @@ static void send_progress(struct job *j, int pct)
 	struct devp_line l;
 	char num[8];
 
-	if (pct <= j->last_pct)
+	if (pct <= j->last_pct || j->cancelling)
 		return;
 	j->last_pct = pct;
 	if (!c)
@@ -200,7 +289,8 @@ static void send_busy(struct job *j)
 	struct devp_line l;
 	char num[8];
 
-	if (!c)
+	/* a cancelled child's pipe closes too: no mkfs is starting */
+	if (!c || j->cancelling)
 		return;
 	snprintf(num, sizeof(num), "%d", j->last_pct > 0 ? j->last_pct : 0);
 	devp_line_begin(&l, "PROGRESS");
@@ -396,6 +486,11 @@ int format_start(struct client *c, struct dev *d, char *const *tok, int ntok,
 	j->client_id = c->id;
 	j->whole_disk = d->kind == DEV_DISK;
 	j->last_pct = -1;
+	j->uid = uid;
+	j->major = d->major;
+	j->minor = d->minor;
+	j->diskseq = d->diskseq;
+	j->phase = JOB_RUN;
 	strlcpy_d(j->name, d->name, sizeof(j->name));
 	strlcpy_d(j->disk, d->disk, sizeof(j->disk));
 	{
@@ -465,10 +560,14 @@ static int read_progress(struct job *j)
 				continue;
 			}
 			j->pbuf[j->plen] = '\0';
-			if (j->pbuf[0] == 'P') {
-				uint64_t v;
-				if (devp_parse_u64(j->pbuf + 1, 99, &v) == 0)
-					send_progress(j, (int)v);
+			{
+				int pct = 0;
+				int m = format_mark_parse(j->pbuf, &pct);
+
+				if (m == FMARK_PROGRESS)
+					send_progress(j, pct);
+				else if (format_mark_writes(m))
+					j->written = 1;
 			}
 			j->plen = 0;
 		}
@@ -532,27 +631,35 @@ void format_handle(struct pollfd *pfd, int n)
 	}
 }
 
+/* SIGTERM, SIGKILL: the child's process group (it calls setsid() at once;
+ * before that there is no group of that number) and the child itself. */
+static void signal_job(struct job *j, int sig)
+{
+	if (j->reaped || j->pid <= 0)
+		return;
+	kill(-j->pid, sig);
+	kill(j->pid, sig);
+}
+
 static void finish(struct job *j)
 {
 	struct client *c;
 	char disk[DEVD_NAME_MAX], name[DEVD_NAME_MAX], msg[320];
-	int ok = 0, err = EIO, code = -1;
-
-	if (j->prog_fd >= 0)
-		read_progress(j);
-	if (j->out_fd >= 0)
-		read_output(j);
-	if (j->prog_fd >= 0)
-		close(j->prog_fd);
-	if (j->out_fd >= 0)
-		close(j->out_fd);
-	j->prog_fd = j->out_fd = -1;
+	int cancel_ids[DEVD_MAX_CANCELS];
+	int ok = 0, err = EIO, code = -1, cancelled, ncancel;
 
 	if (WIFEXITED(j->status)) {
 		code = WEXITSTATUS(j->status);
 		ok = code == 0;
 	}
-	if (ok) {
+	cancelled = j->cancelling;
+	if (cancelled) {
+		/* whatever the child got to: never OK after a cancel */
+		ok = 0;
+		err = ECANCELED;
+		snprintf(msg, sizeof(msg), "%s",
+			 format_cancel_message(j->written, j->cleared));
+	} else if (ok) {
 		msg[0] = '\0';
 	} else if (code == EXIT_BUSY) {
 		err = EBUSY;
@@ -569,7 +676,7 @@ static void finish(struct job *j)
 		snprintf(msg, sizeof(msg), "%s failed%s%s", j->tool,
 			 j->tlen ? ": " : "", j->tail);
 	}
-	if (ok && j->whole_disk) {
+	if ((ok || (cancelled && j->cleared)) && j->whole_disk) {
 		char dev[DEVD_PATH_MAX];
 		int fd;
 
@@ -586,12 +693,19 @@ static void finish(struct job *j)
 	}
 	strlcpy_d(disk, j->disk, sizeof(disk));
 	strlcpy_d(name, j->name, sizeof(name));
+	ncancel = j->ncancel;
+	memcpy(cancel_ids, j->cancel_ids, sizeof(cancel_ids));
 	c = client_by_id(j->client_id);
 	if (ok)
 		send_progress(j, 100);
 	j->used = 0;
 	if (ok)
 		log_info("%s formatted", name);
+	else if (cancelled)
+		log_info("formatting %s cancelled: %s", name,
+			 !j->written ? "nothing was written" :
+			 j->cleared  ? "the volume was cleared" :
+				       "the volume could not be cleared");
 	else
 		log_warn("formatting %s failed: %s", name, msg);
 	/* probe it again; CHANGED goes out before the reply */
@@ -608,12 +722,101 @@ static void finish(struct job *j)
 			client_err(c, "FORMAT", name, err, msg);
 		}
 		c->waiting = 0;
-		client_process(c);
 	}
+	for (int i = 0; i < ncancel; i++) {
+		struct client *k = client_by_id(cancel_ids[i]);
+		struct devp_line l;
+
+		if (!k)
+			continue;
+		devp_line_begin(&l, "OK CANCEL");
+		devp_line_enc(&l, name);
+		if (devp_line_end(&l) > 0)
+			client_send_line(k, &l);
+		k->waiting = 0;
+	}
+	/* the job's slot is free: what these clients ask next may take it */
+	if (c)
+		client_process(c);
+	for (int i = 0; i < ncancel; i++) {
+		struct client *k = client_by_id(cancel_ids[i]);
+
+		if (k)
+			client_process(k);
+	}
+}
+
+/* After a cancel of a job that wrote to the volume: the wipe child.  0
+ * when it runs, -1 when the volume cannot be cleared (it went, or is
+ * another one now). */
+static int wipe_start(struct job *j)
+{
+	struct dev *d = tab_find(j->name);
+	char dev[DEVD_PATH_MAX];
+	pid_t pid;
+
+	if (!d || d->major != j->major || d->minor != j->minor ||
+	    d->diskseq != j->diskseq || !dev_node_ok(d)) {
+		log_warn("%s went or changed; it is not cleared", j->name);
+		return -1;
+	}
+	snprintf(dev, sizeof(dev), "/dev/%s", j->name);
+	pid = fork();
+	if (pid < 0) {
+		log_warn("cannot clear %s: %s", j->name, strerror(errno));
+		return -1;
+	}
+	if (pid == 0)
+		wipe_run(dev, makedev(j->major, j->minor));
+	j->pid = pid;
+	j->phase = JOB_WIPE;
+	j->status = 0;
+	log_info("clearing the start and the end of %s", j->name);
+	return 0;
+}
+
+/* The job's child ended (its status in j->status). */
+static void job_exited(struct job *j)
+{
+	if (j->phase == JOB_WIPE) {
+		j->cleared = WIFEXITED(j->status) &&
+			     WEXITSTATUS(j->status) == 0;
+		finish(j);
+		return;
+	}
+	/* everything the child said, the marks included */
+	if (j->prog_fd >= 0)
+		read_progress(j);
+	if (j->out_fd >= 0)
+		read_output(j);
+	if (j->prog_fd >= 0)
+		close(j->prog_fd);
+	if (j->out_fd >= 0)
+		close(j->out_fd);
+	j->prog_fd = j->out_fd = -1;
+	if (j->cancelling) {
+		j->kill_at = 0;
+		/* what is left of its process group (mkfs's own children):
+		 * the group outlives its leader only while it has members,
+		 * so this number is still theirs */
+		kill(-j->pid, SIGKILL);
+		if (j->written && wipe_start(j) == 0)
+			return;
+	}
+	finish(j);
 }
 
 void format_reap(void)
 {
+	/* ended before a cancel could stop them (format_cancel()) */
+	for (int i = 0; i < DEVD_MAX_JOBS; i++) {
+		struct job *j = &g_jobs[i];
+
+		if (j->used && j->reaped) {
+			j->reaped = 0;
+			job_exited(j);
+		}
+	}
 	for (;;) {
 		int status = 0;
 		pid_t pid = waitpid(-1, &status, WNOHANG);
@@ -625,11 +828,97 @@ void format_reap(void)
 		for (int i = 0; i < DEVD_MAX_JOBS; i++) {
 			struct job *j = &g_jobs[i];
 
-			if (j->used && j->pid == pid) {
+			if (j->used && !j->reaped && j->pid == pid) {
 				j->status = status;
-				finish(j);
+				job_exited(j);
+				break;
 			}
 		}
+	}
+}
+
+int format_cancel(struct client *c, const char *name, const char **msg)
+{
+	struct job *j = NULL;
+
+	for (int i = 0; i < DEVD_MAX_JOBS; i++)
+		if (g_jobs[i].used && strcmp(g_jobs[i].name, name) == 0) {
+			j = &g_jobs[i];
+			break;
+		}
+	if (!j) {
+		*msg = "no format of this drive is running";
+		return -ENOENT;
+	}
+	if (!format_cancel_allowed(c->uid, (uint32_t)j->uid)) {
+		*msg = "the format was started by another user";
+		return -EPERM;
+	}
+	if (!j->cancelling && !j->reaped) {
+		int st = 0;
+
+		/* it may have ended just now: then it finished, and keeps
+		 * its own result */
+		if (waitpid(j->pid, &st, WNOHANG) == j->pid) {
+			j->status = st;
+			j->reaped = 1;
+		}
+	}
+	if (!j->cancelling && j->reaped) {
+		*msg = "the format has already finished";
+		return -ENOENT;
+	}
+	if (j->ncancel >= DEVD_MAX_CANCELS) {
+		*msg = "the format is already being cancelled";
+		return -EBUSY;
+	}
+	j->cancel_ids[j->ncancel++] = c->id;
+	c->waiting = 1;
+	if (!j->cancelling) {
+		j->cancelling = 1;
+		log_info("cancelling the format of %s for uid %u", j->name,
+			 (unsigned)c->uid);
+		if (j->phase == JOB_RUN) {
+			signal_job(j, SIGTERM);
+			j->kill_at = now_ms() + DEVD_CANCEL_GRACE_MS;
+		}
+	}
+	return 0;
+}
+
+int format_timeout(uint64_t now)
+{
+	int t = -1;
+
+	for (int i = 0; i < DEVD_MAX_JOBS; i++) {
+		struct job *j = &g_jobs[i];
+		int ms;
+
+		if (!j->used)
+			continue;
+		if (j->reaped)
+			return 0;
+		if (!j->kill_at)
+			continue;
+		ms = j->kill_at > now ? (int)(j->kill_at - now) : 0;
+		if (t < 0 || ms < t)
+			t = ms;
+	}
+	return t;
+}
+
+void format_tick(uint64_t now)
+{
+	for (int i = 0; i < DEVD_MAX_JOBS; i++) {
+		struct job *j = &g_jobs[i];
+
+		if (!j->used || !j->kill_at || now < j->kill_at)
+			continue;
+		j->kill_at = 0;
+		if (j->phase != JOB_RUN || j->reaped)
+			continue;
+		log_warn("formatting %s did not stop; killed", j->name);
+		signal_job(j, SIGKILL);
 	}
 }
 
@@ -648,9 +937,12 @@ void format_kill_all(void)
 
 		if (!j->used)
 			continue;
-		kill(j->pid, SIGKILL);
-		while (waitpid(j->pid, &st, 0) < 0 && errno == EINTR)
-			;
+		if (!j->reaped) {
+			kill(-j->pid, SIGKILL);
+			kill(j->pid, SIGKILL);
+			while (waitpid(j->pid, &st, 0) < 0 && errno == EINTR)
+				;
+		}
 		if (j->prog_fd >= 0)
 			close(j->prog_fd);
 		if (j->out_fd >= 0)

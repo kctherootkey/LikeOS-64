@@ -11,6 +11,7 @@ SYNOPSIS
        devctl unmount name
        devctl eject disk
        devctl format name fs [--label label] [--full] [--cluster bytes]
+       devctl cancel name
 
 DESCRIPTION
        devctl talks to devd(1), for testing it without a desktop.
@@ -46,6 +47,22 @@ DESCRIPTION
                  over the whole volume first.  --cluster sets the allocation
                  unit size, one of those devctl fstypes lists for the file
                  system.  Everything on the volume is lost.
+
+                 Ctrl-C (SIGINT) or SIGTERM stops the format: devctl asks
+                 devd to cancel it, waits until it has stopped, prints
+                 devd's message and exits with 1.  When nothing had been
+                 written yet the volume is unchanged; otherwise devd clears
+                 its first and last megabyte, and the volume must be
+                 formatted before it can be used.  If the format finished
+                 just before, its result is printed instead.  When the
+                 cancel is refused, the next Ctrl-C ends devctl and the
+                 format goes on.
+
+       cancel    stop the format of a volume that another devctl or the
+                 file manager started, the same way.  Allowed for root and
+                 for the user who started it, while logged in at the
+                 console.  Fails with ENOENT when no format of the volume
+                 is running.
 
        mount, unmount, eject and format are allowed for root and for the
        user logged in at the console: on USB drives all four (format not
