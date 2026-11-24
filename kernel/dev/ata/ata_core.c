@@ -2197,6 +2197,9 @@ static int ata_worker_ensure(void)
 	}
 	g_ata_worker = sched_add_task(ata_worker_main, NULL, g_ata_worker_stack,
 				      sizeof(g_ata_worker_stack));
+	if (g_ata_worker)
+		ksnprintf(g_ata_worker->comm, sizeof(g_ata_worker->comm),
+			  "ata_worker");
 	if (!g_ata_worker) {
 		g_ata_worker_state = 0;
 		kprintf("[ata] could not start the registration worker\n");

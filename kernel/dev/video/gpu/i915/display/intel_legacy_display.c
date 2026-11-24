@@ -2302,6 +2302,9 @@ int intel_legacy_hpd_start(struct i915_device *i915)
 	if (!have)
 		return 0;
 	d->hpd_worker = sched_add_task(hpd_worker, d, g_hpd_stack, sizeof(g_hpd_stack));
+	if (d->hpd_worker)
+		ksnprintf(d->hpd_worker->comm, sizeof(d->hpd_worker->comm),
+			  "i915_hotplug");
 	return d->hpd_worker ? 0 : -ENOMEM;
 }
 

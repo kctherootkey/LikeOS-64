@@ -24,6 +24,9 @@
 // the order they last had the focus; letting go of Alt switches to the one
 // selected.
 //
+// Ctrl+Shift+Esc opens Task Viewer (likeos-taskviewer), as do the load
+// monitor, the panel's menu and the Control Center's footer.
+//
 // It replaces ctwm's icon manager (which was the task list) and ctwm's
 // workspace manager (which was the workspace switcher -- now the Workspaces
 // flyout).  Both are switched off in system.ctwmrc -- ctwm still manages
@@ -899,6 +902,10 @@ static GdkPixbuf *app_icon(const struct app *a, int size)
 	return pb ? pb : icon_load("application-x-executable", size);
 }
 
+/* Task Viewer, the system's view of what runs.  It keeps one window per
+ * session: started again, it brings the running window forward. */
+#define TASKVIEWER "likeos-taskviewer"
+
 /* Start a program the way its entry says.  A Terminal=true entry runs in the
  * terminal this desktop uses for that. */
 static void spawn_command(const char *cmd)
@@ -1194,8 +1201,8 @@ static const char *button_title(const struct button *b)
  *
  * It is a vertical list: the volume row at the top, then one row per thing
  * this system can set from here (the network's details, the display, the
- * keyboard layout, the workspaces), and a footer with Settings and the
- * system monitor.  The
+ * keyboard layout, the workspaces), and a footer with Settings and Task
+ * Viewer.  The
  * session's own buttons are the launcher's, not this.  The sizes are the shell's: 380 pixels wide, rows of 56, corners of 14. */
 #define FLY_W 380	  /* the panel, its 1-pixel border included */
 #define FLY_PAD 8	  /* rows' inset from the border */
@@ -1233,7 +1240,7 @@ static const char *button_title(const struct button *b)
 #define FH_ROW 4	  /* 4..7: network, display, keyboard, workspaces */
 #define FH_OUTPUTS 8	  /* the chevron that lists the outputs */
 #define FH_BACK 9	  /* back from that list */
-#define FH_MONITOR 10	  /* the footer's System monitor button */
+#define FH_MONITOR 10	  /* the footer's Task Viewer button */
 #define FH_OUT 20	  /* 20..: a row of the outputs page; 20 is "Automatic" */
 
 static struct {
@@ -3108,7 +3115,7 @@ static GtkWidget *menu_row_key(GtkWidget *img, const char *label,
 }
 
 /* A right-click on the panel itself, away from its buttons: the desktop and
- * the workspaces, the system monitor and the display settings. */
+ * the workspaces, Task Viewer and the display settings. */
 static void show_panel_menu(double x)
 {
 	GtkWidget *menu = gtk_menu_new();
@@ -3129,9 +3136,9 @@ static void show_panel_menu(double x)
 	gtk_menu_shell_append(GTK_MENU_SHELL(menu),
 			      gtk_separator_menu_item_new());
 
-	item = menu_row(glyph_image(GL_ACTIVITY, 16, PANEL_TEXT),
-			"System monitor");
-	g_object_set_data(G_OBJECT(item), "cmd", (gpointer) "xterm -e top");
+	item = menu_row_key(glyph_image(GL_ACTIVITY, 16, PANEL_TEXT),
+			    "Task Viewer", "Ctrl+Shift+Esc");
+	g_object_set_data(G_OBJECT(item), "cmd", (gpointer)TASKVIEWER);
 	g_signal_connect(item, "activate", G_CALLBACK(on_row_command), NULL);
 	gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
 
@@ -3151,7 +3158,7 @@ static void show_panel_menu(double x)
  * slider, the level, and a chevron to the list of outputs when there is a
  * choice -- then the network (its state, and its details when the row is
  * opened), the display, the keyboard layout and the workspaces, and a
- * footer with Settings and the system monitor.
+ * footer with Settings and Task Viewer.
  *
  * Drawn by hand like the panel, and for the same reason: the slider wanted is
  * a specific one -- a six-pixel track, a light thumb that gathers a soft
@@ -3614,7 +3621,7 @@ static void fly_draw_outputs(cairo_t *cr, const struct fly_layout *L)
 }
 
 /* The footer: a strip a shade lighter than the body, with Settings at its
- * left and the system monitor at its right, each a glyph and its name. */
+ * left and Task Viewer at its right, each a glyph and its name. */
 static void fly_draw_footer(cairo_t *cr, const struct fly_layout *L)
 {
 	static const struct {
@@ -3623,7 +3630,7 @@ static void fly_draw_footer(cairo_t *cr, const struct fly_layout *L)
 		const char *name;
 	} btn[] = {
 		{ FH_SETTINGS, GL_SETTINGS, "Settings" },
-		{ FH_MONITOR, GL_ACTIVITY, "System monitor" },
+		{ FH_MONITOR, GL_ACTIVITY, "Task Viewer" },
 	};
 	GdkRectangle r;
 
@@ -4215,7 +4222,7 @@ static gboolean on_fly_button_release(GtkWidget *w, GdkEventButton *ev,
 		return TRUE;
 	} else if (hit == was && hit == FH_MONITOR) {
 		fly_close();
-		spawn_command("xterm -e top");
+		spawn_command(TASKVIEWER);
 		return TRUE;
 	} else if (hit == was && hit == FH_OUTPUTS) {
 		F.page = 1;
@@ -6159,13 +6166,48 @@ static void sw_grab(void)
 	gdk_x11_display_error_trap_pop_ignored(disp);
 }
 
+/* Ctrl+Shift+Esc opens Task Viewer from anywhere: grabbed on the root window
+ * like Alt+Tab, whatever the lock keys. */
+static KeyCode g_escape;
+
+static void taskviewer_grab(void)
+{
+	GdkDisplay *disp = gdk_display_get_default();
+	unsigned int locks[] = { 0, LockMask, Mod2Mask, LockMask | Mod2Mask };
+
+	g_escape = XKeysymToKeycode(g_dpy, XK_Escape);
+	if (!g_escape)
+		return;
+	gdk_x11_display_error_trap_push(disp);
+	for (guint i = 0; i < G_N_ELEMENTS(locks); i++)
+		XGrabKey(g_dpy, g_escape, ControlMask | ShiftMask | locks[i],
+			 g_root, False, GrabModeAsync, GrabModeAsync);
+	gdk_x11_display_error_trap_pop_ignored(disp);
+}
+
+/* TRUE when the key was Ctrl+Shift+Esc (its release too). */
+static gboolean taskviewer_key(XKeyEvent *k, gboolean press)
+{
+	unsigned int mods =
+		k->state & (ControlMask | ShiftMask | Mod1Mask | Mod4Mask);
+
+	if (!g_escape || k->keycode != g_escape ||
+	    mods != (ControlMask | ShiftMask))
+		return FALSE;
+	if (press) {
+		popups_close();
+		spawn_command(TASKVIEWER);
+	}
+	return TRUE;
+}
+
 /* --- the overflow button ---------------------------------------------------------- */
 
 /* When the application buttons need the room, the load monitor leaves the
  * panel and this button takes its place.  Its flyout holds the tray's
  * extras: the processor and memory monitor (whose numbers are its tooltip,
- * and which opens top), the display settings, and the sound -- the Control
- * Center, as the tray on the panel opens it. */
+ * and which opens Task Viewer), the display settings, and the sound -- the
+ * Control Center, as the tray on the panel opens it. */
 #define OV_CELL 40
 #define OV_PAD 6
 #define OV_N 3
@@ -6231,7 +6273,7 @@ static void ov_click(int hit)
 {
 	pop_close();
 	if (hit == 0)
-		spawn_command("xterm -e top");
+		spawn_command(TASKVIEWER);
 	else if (hit == 1)
 		app_launch(app_by_id("likeos-display-settings.desktop"));
 	else
@@ -8379,7 +8421,7 @@ static void bar_activate(int hit)
 		return;
 	case HIT_LOAD:
 		popups_close();
-		spawn_command("xterm -e top");
+		spawn_command(TASKVIEWER);
 		return;
 	case HIT_TRAY:
 		/* Normally the flyout's grab takes this click and closes it
@@ -8948,6 +8990,8 @@ static GdkFilterReturn event_filter(GdkXEvent *xev, GdkEvent *ev, gpointer data)
 		gboolean press = e->type == KeyPress;
 
 		if (sw_key(&e->xkey, press))
+			return GDK_FILTER_REMOVE;
+		if (taskviewer_key(&e->xkey, press))
 			return GDK_FILTER_REMOVE;
 		return super_key(&e->xkey, press) ? GDK_FILTER_REMOVE :
 						    GDK_FILTER_CONTINUE;
@@ -9603,6 +9647,7 @@ int main(int argc, char **argv)
 	mru_touch(g_active);
 	super_grab();
 	sw_grab();
+	taskviewer_grab();
 	net_poll(NULL);
 	g_timeout_add_seconds(NET_POLL_SECS, net_poll, NULL);
 	kbd_watch();

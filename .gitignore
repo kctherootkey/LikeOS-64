@@ -196,13 +196,14 @@
 !/user/bin/shell/*.c
 !/user/bin/shell/*.h
 #     The shell's meson programs (file manager, image viewer, media player,
-#     GStreamer audio sink), each a source tree of its own.  The Makefile
-#     configures each inside its tree, so the build directory is ignored again
-#     one level down.
+#     Task Viewer, GStreamer audio sink), each a source tree of its own.  The
+#     Makefile configures each inside its tree, so the build directory is
+#     ignored again one level down.
 !/user/bin/shell/gst-likeos-audio/
 !/user/bin/shell/likeos-explorer/
 !/user/bin/shell/likeos-imageviewer/
 !/user/bin/shell/likeos-mediaplayer/
+!/user/bin/shell/likeos-taskviewer/
 /user/bin/shell/*/.likeos-build/
 #     The installer (backend, front ends, tools, its makefile); its own
 #     .gitignore files name the build outputs inside it.

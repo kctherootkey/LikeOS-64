@@ -516,6 +516,9 @@ void drm_console_start_worker(void)
 	if (!g_con.worker)
 		kprintf("[drm] console push thread not started; "
 			"pushing inline\n");
+	else
+		ksnprintf(g_con.worker->comm, sizeof(g_con.worker->comm),
+			  "drm_console");
 }
 
 /* ---- handing the screen to a master and taking it back ---------------- */

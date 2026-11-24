@@ -588,6 +588,8 @@ int intel_hpd_start(struct i915_device *i915)
 	d->hpd_worker = sched_add_task(hpd_worker, i915, g_hpd_stack, sizeof(g_hpd_stack));
 	if (!d->hpd_worker)
 		return -ENOMEM;
+	ksnprintf(d->hpd_worker->comm, sizeof(d->hpd_worker->comm),
+		  "i915_hotplug");
 	i915_dbg("[drm] i915: hotplug detection on (south %08x, north %08x, port %08x)\n",
 		 d->hpd_irq_mask, d->hpd_irq_mask_de, d->hpd_irq_mask_port);
 	return 0;

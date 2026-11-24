@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<!-- LikeOS Task Viewer: the application icon, master drawing (32 pixels
+     and up).  A slate tile in the LikeOS app tile shape with three load
+     bars on a base line.  Rasterized by data/render-icons.py.
+     Copyright (C) 2026 The LikeOS Project -->
+<defs><filter id="f1" x="-25%" y="-25%" width="150%" height="150%"><feGaussianBlur stdDeviation="1.3"/></filter><linearGradient id="tile" gradientUnits="userSpaceOnUse" x1="4" y1="4" x2="36" y2="60"><stop offset="0" stop-color="#3a4a6b"/><stop offset="1" stop-color="#18203a"/></linearGradient><linearGradient id="rim" gradientUnits="userSpaceOnUse" x1="0" y1="4" x2="0" y2="60"><stop offset="0" stop-color="#ffffff" stop-opacity="0.45"/><stop offset="0.5" stop-color="#ffffff" stop-opacity="0.08"/><stop offset="1" stop-color="#000000" stop-opacity="0.12"/></linearGradient><linearGradient id="b1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7fe0f0"/><stop offset="1" stop-color="#33b5d1"/></linearGradient><linearGradient id="b2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#8fb4ff"/><stop offset="1" stop-color="#3b74f0"/></linearGradient><linearGradient id="b3" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd27a"/><stop offset="1" stop-color="#eaa12b"/></linearGradient></defs>
+<path d="M17 4H47A13 13 0 0 1 60 17V47A13 13 0 0 1 47 60H17A13 13 0 0 1 4 47V17A13 13 0 0 1 17 4Z" fill="#0b1730" opacity="0.28" transform="translate(0 1.4)" filter="url(#f1)"/>
+<path d="M17 4H47A13 13 0 0 1 60 17V47A13 13 0 0 1 47 60H17A13 13 0 0 1 4 47V17A13 13 0 0 1 17 4Z" fill="url(#tile)"/>
+<path d="M17 4.5H47A12.5 12.5 0 0 1 59.5 17V47A12.5 12.5 0 0 1 47 59.5H17A12.5 12.5 0 0 1 4.5 47V17A12.5 12.5 0 0 1 17 4.5Z" fill="none" stroke="url(#rim)" stroke-width="1"/>
+<path d="M17 4H47A13 13 0 0 1 60 17V26C44 22 20 32 4 30V17A13 13 0 0 1 17 4Z" fill="#ffffff" opacity="0.08"/>
+<rect x="15" y="28" width="8" height="18" rx="2.5" fill="url(#b1)"/>
+<rect x="28" y="16" width="8" height="30" rx="2.5" fill="url(#b2)"/>
+<rect x="41" y="34" width="8" height="12" rx="2.5" fill="url(#b3)"/>
+<path d="M12 50.5H52" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" opacity="0.9"/>
+</svg>

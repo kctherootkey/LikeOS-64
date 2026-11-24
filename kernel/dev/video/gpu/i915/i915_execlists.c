@@ -582,5 +582,8 @@ int i915_gt_workers_start(struct i915_device *i915)
 		return 0;
 	wq_head_init(&i915->gt_wq, "i915_gt");
 	i915->gt_worker = sched_add_task(gt_worker, i915, g_gt_stack, sizeof(g_gt_stack));
+	if (i915->gt_worker)
+		ksnprintf(i915->gt_worker->comm, sizeof(i915->gt_worker->comm),
+			  "i915_gt");
 	return i915->gt_worker ? 0 : -ENOMEM;
 }

@@ -888,8 +888,9 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 # PCManFM, then LikeOS Explorer, and is now luakit, the last package of
 # gtk3/packages.list -- a sentinel left at an earlier package would go on
 # being satisfied by a port that stopped before the packages added after it.
-# (Explorer, the media player, the image viewer and the GStreamer audio sink
-# are the shell's own programs, built after the port: SHELL_MESON_PROGS.)
+# (Explorer, the media player, the image viewer, Task Viewer and the
+# GStreamer audio sink are the shell's own programs, built after the port:
+# SHELL_MESON_PROGS.)
 GTK3_SENTINEL = $(BUILD_DIR)/xorg-sysroot/usr/bin/luakit
 GTK3_TESTCXX = $(BUILD_DIR)/testcxx
 # The desktop bar widgets; built like testcxx, against the GTK3 sysroot.
@@ -900,7 +901,7 @@ GTK3_BAR_PROGS = $(BUILD_DIR)/datetime $(BUILD_DIR)/load $(BUILD_DIR)/taskbar \
 # The shell's meson programs (user/bin/shell/<name>/), built like the bar
 # widgets against the GTK3 sysroot and installed into it; see their rule.
 SHELL_MESON_PROGS = gst-likeos-audio likeos-mediaplayer likeos-imageviewer \
-	likeos-explorer
+	likeos-explorer likeos-taskviewer
 SHELL_MESON_STAMPS = $(patsubst %,$(BUILD_DIR)/shell-meson/%.installed,$(SHELL_MESON_PROGS))
 
 GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS)) \
@@ -2816,6 +2817,8 @@ $(BUILD_DIR)/shell-meson/likeos-imageviewer.installed: \
 	$(call shell_meson_srcs,likeos-imageviewer)
 $(BUILD_DIR)/shell-meson/likeos-explorer.installed: \
 	$(call shell_meson_srcs,likeos-explorer)
+$(BUILD_DIR)/shell-meson/likeos-taskviewer.installed: \
+	$(call shell_meson_srcs,likeos-taskviewer)
 
 $(BUILD_DIR)/shell-meson/%.installed: $(GTK3_SENTINEL) | $(BUILD_DIR)
 	@mkdir -p $(@D)

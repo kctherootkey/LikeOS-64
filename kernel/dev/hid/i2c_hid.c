@@ -4732,7 +4732,13 @@ int i2c_hid_init(void)
 			continue;
 		}
 		ctrl->worker_running = 1;
-		sched_add_task(i2c_hid_worker_thread, ctrl, stack, 16384);
+		{
+			task_t *wt = sched_add_task(i2c_hid_worker_thread, ctrl,
+						    stack, 16384);
+			if (wt)
+				ksnprintf(wt->comm, sizeof(wt->comm),
+					  "i2c_hid/%d", ctrl->bus_id);
+		}
 		kprintf("[I2C-HID] Worker thread created for I2C%d\n",
 			ctrl->bus_id);
 	}

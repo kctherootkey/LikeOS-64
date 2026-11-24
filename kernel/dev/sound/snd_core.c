@@ -1731,8 +1731,10 @@ void snd_late_init(void)
 					sizeof(g_ksnd_stack));
 		if (!g_ksnd)
 			kprintf("[snd] core: cannot start the ksnd thread; deferred work will not run\n");
-		else
+		else {
+			ksnprintf(g_ksnd->comm, sizeof(g_ksnd->comm), "ksnd");
 			wq_wake_all(&g_work_wq); /* anything queued during probe */
+		}
 	}
 	hda_late_init();
 	sof_late_init();

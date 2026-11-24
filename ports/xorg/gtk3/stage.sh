@@ -310,6 +310,15 @@ for b in likeos-explorer explorer-backend-test; do
 	staged=$((staged + 1))
 done
 
+# Task Viewer (user/bin/shell/likeos-taskviewer, installed into the sysroot
+# like Explorer): the running apps and processes, performance, users,
+# services and startup programs.  Its desktop entry arrives with everyone
+# else's below, its icon with the hicolor theme.
+if [ -f "$SYSROOT/usr/bin/likeos-taskviewer" ]; then
+	cp "$SYSROOT/usr/bin/likeos-taskviewer" "$DEST/usr/bin/likeos-taskviewer"
+	staged=$((staged + 1))
+fi
+
 # The web browser, the language it embeds (interpreter and compiler both --
 # luakit's configuration IS Lua, so the tools belong beside it), and the
 # database shell for the storage everything above keeps in SQLite.

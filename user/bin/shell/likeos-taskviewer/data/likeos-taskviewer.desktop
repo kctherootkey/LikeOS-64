@@ -1,0 +1,19 @@
+[Desktop Entry]
+# LikeOS Task Viewer, the system's own view of the programs and processes
+# that run and what they take of the computer (user/bin/shell/
+# likeos-taskviewer).  One window per session: starting it again brings the
+# running window forward.
+#
+# Copyright (C) 2026 The LikeOS Project
+Type=Application
+Version=1.0
+Name=Task Viewer
+GenericName=System Monitor
+Comment=See and end the running programs and processes, and how much of the computer they use
+Exec=likeos-taskviewer
+TryExec=likeos-taskviewer
+Icon=likeos-taskviewer
+Terminal=false
+StartupNotify=false
+Categories=System;Monitor;GTK;
+Keywords=task;process;processes;cpu;memory;performance;kill;end;monitor;services;startup;

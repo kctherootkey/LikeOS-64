@@ -882,6 +882,9 @@ int intel_power_async_start(struct i915_device *i915)
 	}
 	wq_head_init(&d->pw_wq, "i915_power");
 	d->pw_worker = sched_add_task(power_async_worker, i915, g_pw_stack, sizeof(g_pw_stack));
+	if (d->pw_worker)
+		ksnprintf(d->pw_worker->comm, sizeof(d->pw_worker->comm),
+			  "i915_power");
 	if (!d->pw_worker) {
 		d->pw_async_state = -1;
 		intel_power_flush_async(i915);
