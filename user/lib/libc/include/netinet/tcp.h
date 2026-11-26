@@ -18,12 +18,15 @@ extern "C" {
 #define TCP_KEEPINTVL   5
 #define TCP_KEEPCNT     6
 #define TCP_INFO        11
+#define TCP_CONGESTION  13      // char[TCP_CA_NAME_MAX]: "cubic", "reno"
+#define TCP_CA_NAME_MAX 16
 
 // tcpi_options bits
 #define TCPI_OPT_TIMESTAMPS  1
 #define TCPI_OPT_SACK        2
 #define TCPI_OPT_WSCALE      4
 #define TCPI_OPT_ECN         8
+#define TCPI_OPT_ECN_SEEN    16
 
 // Connection state values (tcpi_state).
 #define TCP_ESTABLISHED   1
@@ -71,6 +74,33 @@ struct tcp_info {
     uint32_t tcpi_rcv_rtt;
     uint32_t tcpi_rcv_space;
     uint32_t tcpi_total_retrans;
+    uint64_t tcpi_pacing_rate;      // bytes per second
+    uint64_t tcpi_max_pacing_rate;
+    uint64_t tcpi_bytes_acked;
+    uint64_t tcpi_bytes_received;
+    uint32_t tcpi_segs_out;
+    uint32_t tcpi_segs_in;
+    uint32_t tcpi_notsent_bytes;
+    uint32_t tcpi_min_rtt;
+    uint32_t tcpi_data_segs_in;
+    uint32_t tcpi_data_segs_out;
+    uint64_t tcpi_delivery_rate;
+    uint64_t tcpi_busy_time;
+    uint64_t tcpi_rwnd_limited;
+    uint64_t tcpi_sndbuf_limited;
+    uint32_t tcpi_delivered;
+    uint32_t tcpi_delivered_ce;
+    uint64_t tcpi_bytes_sent;
+    uint64_t tcpi_bytes_retrans;
+    uint32_t tcpi_dsack_dups;
+    uint32_t tcpi_reord_seen;
+    uint32_t tcpi_rcv_ooopack;
+    uint32_t tcpi_snd_wnd;
+    uint32_t tcpi_rcv_wnd;
+    uint32_t tcpi_rehash;
+    uint16_t tcpi_total_rto;
+    uint16_t tcpi_total_rto_recoveries;
+    uint32_t tcpi_total_rto_time;
 };
 
 #ifdef __cplusplus

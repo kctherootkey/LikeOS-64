@@ -1,0 +1,5 @@
+# A SYN to a port nobody listens on is answered with RST|ACK, seq 0,
+# acknowledging the SYN.
+# Copyright (C) 2026 The LikeOS Project
+0.100 < S 0:0(0) win 65535 <mss 1460>
+0.100 > R. 0:0(0) ack 1 win 0

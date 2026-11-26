@@ -34,6 +34,14 @@ enum {
 	 * handler on -- one handler per vector, and registering twice warns
 	 * and loses one of them. */
 	SOFTIRQ_UNIX = 4,
+	/* Network housekeeping that must not run in the hard timer
+	 * interrupt: the DHCP lease timer (it builds and sends packets) and
+	 * the NIC link watchdogs.  Raised on CPU 0 only (net.c). */
+	SOFTIRQ_NET_HOUSEKEEPING = 5,
+	/* The network timer wheel (kernel/net/net_timer.c): neighbour
+	 * state timers, device watchdogs and the like.  Raised on CPU 0
+	 * from the timer tick. */
+	SOFTIRQ_NET_TIMER = 6,
 	NR_SOFTIRQ = 32
 };
 
@@ -46,15 +54,31 @@ void softirq_register(uint32_t nr, softirq_fn_t fn);
 // thread is waiting) wake it.  Safe from any context, including hard IRQ.
 void softirq_raise(uint32_t nr);
 
+// The same for a caller that already runs with interrupts disabled.
+static inline void softirq_raise_irqoff(uint32_t nr)
+{
+	softirq_raise(nr);
+}
+
 // Mark vector `nr` as pending on a specific CPU (used for cross-CPU
 // notifications, e.g. completing an RX queue we wrote to from another CPU).
 void softirq_raise_on(uint32_t cpu, uint32_t nr);
 
-// Drain all pending vectors on the current CPU.  Called from the IRQ tail
-// (with interrupts about to be re-enabled by iret), from ksoftirqd, and
-// from explicit polling sites.  Re-enables interrupts while running each
-// handler; restores the caller's IF state on return.
+// Run the pending vectors of the current CPU.  From a context with
+// interrupts disabled (the IRQ tail) it only wakes the CPU's ksoftirqd;
+// with interrupts enabled (ksoftirqd) it runs the vectors with interrupts
+// enabled, at most MAX_SOFTIRQ_RESTART passes and MAX_SOFTIRQ_TIME_NS
+// (kernel/net/softirq_core.h), and leaves the rest to ksoftirqd, which
+// yields the processor before it goes on.  Restores the caller's interrupt
+// state on return.  Not re-entered: a run already in progress on this CPU
+// picks up whatever is raised meanwhile.
 void softirq_drain(void);
+
+// Diagnostics: pending mask, ksoftirqd state and per-vector run counts.
+uint32_t softirq_pending_get(uint32_t cpu);
+int ksoftirqd_state_get(uint32_t cpu);
+uint64_t softirq_count_get(uint32_t cpu, uint32_t nr);
+uint64_t softirq_limit_hits_get(uint32_t cpu);
 
 // Spawn one ksoftirqd kernel thread per online CPU.  Must be called after
 // the scheduler and SMP are up.

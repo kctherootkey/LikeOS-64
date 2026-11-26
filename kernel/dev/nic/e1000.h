@@ -13,6 +13,7 @@
 #include <kernel/uapi/types.h>
 #include <kernel/hal/pci.h>
 #include <kernel/net/net.h>
+#include <kernel/net/netdevice.h>
 #include <kernel/ke/sched.h>
 
 // ============================================================================
@@ -54,6 +55,28 @@
 #define E1000_MTA 0x5200 // Multicast Table Array (128 entries)
 #define E1000_TIPG 0x0410 // Transmit Inter-Packet Gap
 
+// Interrupt moderation
+#define E1000_ITR 0x00C4 // Interrupt Throttling (interval, 256 ns units)
+#define E1000_RDTR 0x2820 // RX Delay Timer
+#define E1000_RADV 0x282C // RX Interrupt Absolute Delay
+#define E1000_TIDV_REG 0x3820 // TX Interrupt Delay Value
+#define E1000_TADV_REG 0x382C // TX Interrupt Absolute Delay
+
+// Statistics (clear on read)
+#define E1000_ST_CRCERRS 0x4000
+#define E1000_ST_ALGNERRC 0x4004
+#define E1000_ST_SYMERRS 0x4008
+#define E1000_ST_RXERRC 0x400C
+#define E1000_ST_MPC 0x4010
+#define E1000_ST_ECOL 0x4018
+#define E1000_ST_LATECOL 0x4020
+#define E1000_ST_COLC 0x4028
+#define E1000_ST_TNCRS 0x4034
+#define E1000_ST_RLEC 0x4040
+#define E1000_ST_RNBC 0x40A0
+#define E1000_ST_RUC 0x40A4
+#define E1000_ST_ROC 0x40AC
+
 // Extended descriptor registers
 #define E1000_RXDCTL 0x2828 // RX Descriptor Control
 #define E1000_TXDCTL 0x3828 // TX Descriptor Control
@@ -81,6 +104,7 @@
 #define E1000_STATUS_SPEED_10 (0 << 6)
 #define E1000_STATUS_SPEED_100 (1 << 6)
 #define E1000_STATUS_SPEED_1000 (2 << 6)
+#define E1000_STATUS_TXOFF (1 << 4) // transmission paused (flow control)
 
 // ============================================================================
 // EERD Register Bits
@@ -103,6 +127,10 @@
 #define E1000_RCTL_BSIZE_2048 (0 << 16) // Buffer Size 2048
 #define E1000_RCTL_BSIZE_256 (3 << 16) // Buffer Size 256
 #define E1000_RCTL_SECRC (1 << 26) // Strip Ethernet CRC
+
+// RXCSUM bits
+#define E1000_RXCSUM_IPOFL (1 << 8) // IP header checksum offload
+#define E1000_RXCSUM_TUOFL (1 << 9) // TCP/UDP checksum offload
 #define E1000_RCTL_BSEX (1 << 25) // Buffer Size Extension
 
 // ============================================================================
@@ -166,7 +194,10 @@ typedef struct __attribute__((packed)) {
 #define E1000_TXD_CMD_EOP (1 << 0) // End of Packet
 #define E1000_TXD_CMD_IFCS (1 << 1) // Insert FCS
 #define E1000_TXD_CMD_RS (1 << 3) // Report Status
+#define E1000_TXD_CMD_IDE (1 << 7) // Interrupt Delay Enable (TIDV/TADV)
 #define E1000_TXD_STAT_DD (1 << 0) // Descriptor Done
+#define E1000_TXD_STAT_EC (1 << 1) // Excess collisions (frame dropped)
+#define E1000_TXD_STAT_LC (1 << 2) // Late collision
 
 // ============================================================================
 // Extended RX Descriptor (Read format) — e1000e-class parts only
@@ -258,27 +289,50 @@ typedef struct {
 	uint64_t mmio_phys; // Physical address of BAR0
 	uint32_t mmio_size; // Size of MMIO region
 
-	// RX ring (legacy descriptors — compatible with all e1000 variants)
+	// RX ring (legacy descriptors — compatible with all e1000 variants).
+	// rx_tail: the last descriptor handed to the hardware (RDT); only
+	// the NAPI poll touches the ring.
 	e1000_rx_desc_legacy_t *rx_descs; // RX descriptor ring (DMA)
 	uint64_t rx_descs_phys; // Physical address of RX ring
 	uint8_t *rx_bufs[E1000_NUM_RX_DESC]; // RX packet buffers
 	uint64_t rx_bufs_phys[E1000_NUM_RX_DESC];
 	uint16_t rx_tail; // Software RX tail
+	int rx_discarding; // inside a frame larger than one buffer
 
-	// TX ring (legacy descriptors)
+	// TX ring (legacy descriptors): filled at tx_tail, reclaimed at
+	// tx_clean, both under tx_lock; tx_stamp: tick queued (0 = free)
 	e1000_tx_desc_legacy_t *tx_descs; // TX descriptor ring (DMA)
 	uint64_t tx_descs_phys; // Physical address of TX ring
 	uint8_t *tx_bufs[E1000_NUM_TX_DESC]; // TX packet buffers
 	uint64_t tx_bufs_phys[E1000_NUM_TX_DESC];
-	uint16_t tx_tail; // Software TX tail
-	spinlock_t tx_lock; // Serializes e1000_send() across CPUs
+	uint64_t tx_stamp[E1000_NUM_TX_DESC];
+	uint16_t tx_tail; // Software TX tail (next to fill)
+	uint16_t tx_clean; // next to reclaim
+	spinlock_t tx_lock; // the TX ring and TDT/TDH
 
 	// Device info
 	uint8_t mac_addr[ETH_ALEN];
 	const pci_device_t *pci_dev;
 	uint8_t msi_vector;
 	int link_up;
+	uint32_t link_speed; // Mb/s, 0 while down
 	uint16_t device_id;
+	volatile int link_change_pending; // LSC seen: watchdog looks
+	volatile int rx_mode_pending; // set_rx_mode: watchdog applies
+
+	// NAPI and interrupt moderation
+	struct napi_struct napi;
+	int itr_rx_class, itr_tx_class;
+	uint32_t itr_rate;
+	uint32_t itr_rx_packets, itr_rx_bytes; // the poll's
+	uint32_t itr_tx_packets, itr_tx_bytes; // under tx_lock
+	uint32_t itr_tx_acc_packets, itr_tx_acc_bytes; // the poll's
+
+	// Hardware statistics (accumulated by the watchdog)
+	uint64_t stats_tick;
+	uint64_t st_crc, st_align, st_rxerr, st_missed, st_colls;
+	uint64_t st_latecol, st_ecol, st_tncrs, st_rlen, st_nobuf;
+	uint64_t st_csum_err, st_tx_hangs, st_rx_frag;
 
 	// Network device for registration
 	net_device_t net_dev;
@@ -288,6 +342,6 @@ typedef struct {
 // E1000 Driver API
 // ============================================================================
 void e1000_init(void);
-void e1000_irq_handler(void);
+int e1000_irq_handler(void);
 
 #endif // _KERNEL_E1000_H_

@@ -5,6 +5,7 @@
 
 #include <kernel/ke/waitq.h>
 #include <kernel/net/net.h>
+#include <kernel/net/ip.h>
 #include <kernel/io/console.h>
 #include <kernel/mm/slab.h>
 #include <kernel/ke/syscall.h>
@@ -20,9 +21,18 @@
 #include <kernel/ke/cred.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/fs/file.h>
+#include <kernel/ke/uaccess.h>
+
+/* "Operation already in progress" -- the conventional number, as in the
+ * libc's <errno.h>; the kernel's errno list has no use for it elsewhere. */
+#ifndef EALREADY
+#define EALREADY 114
+#endif
 
 /* Same extern tcp.c uses; poll.c exports it without a header. */
 extern void poll_notify_wq(struct wait_queue_head *);
+extern void poll_notify_wq_key(struct wait_queue_head *, unsigned key);
+extern void eventpoll_release(void *entry);
 
 // Socket table
 static net_socket_t sockets[NET_MAX_SOCKETS];
@@ -49,6 +59,74 @@ static inline void sock_conn_unlock(spinlock_t *lock, uint64_t flags)
 {
 	spin_unlock(lock);
 	local_irq_restore(flags);
+	// see tcp_lock_release(): transmits queued under the lock go now
+	if (flags & (1ULL << 9))
+		net_tx_flush_local();
+}
+
+/* ---------------------------------------------------------------------------
+ * What the socket layer reads of a TCP connection for poll() and the queue
+ * ioctls.  Kept to these few lines so the TCP side can change underneath:
+ * each is a plain read of state the protocol maintains, safe without the
+ * connection lock (a momentarily stale answer, never a torn pointer), on a
+ * connection the caller holds a reference to.
+ * ------------------------------------------------------------------------ */
+/* Bytes queued in order and not yet read. */
+static inline uint32_t sock_tcp_inq(const tcp_conn_t *c)
+{
+	return __atomic_load_n(&c->rcvq_bytes, __ATOMIC_ACQUIRE);
+}
+
+/* Bytes the application wrote that the peer has not acknowledged. */
+static inline uint32_t sock_tcp_outq(const tcp_conn_t *c)
+{
+	return __atomic_load_n(&c->write_seq, __ATOMIC_RELAXED) -
+	       __atomic_load_n(&c->snd_una, __ATOMIC_RELAXED);
+}
+
+/* ... of them, not yet sent at all. */
+static inline uint32_t sock_tcp_outq_nsd(const tcp_conn_t *c)
+{
+	return __atomic_load_n(&c->write_seq, __ATOMIC_RELAXED) -
+	       __atomic_load_n(&c->snd_nxt, __ATOMIC_RELAXED);
+}
+
+/* An urgent byte has arrived and not been read with MSG_OOB yet. */
+static inline int sock_tcp_urg_pending(const tcp_conn_t *c)
+{
+	return __atomic_load_n(&c->urg_state, __ATOMIC_ACQUIRE) ==
+	       TCP_URG_VALID;
+}
+
+/* The next byte read is the urgent one (rcv_up is its sequence). */
+static inline int sock_tcp_atmark(const tcp_conn_t *c)
+{
+	return tcp_at_mark((tcp_conn_t *)c);
+}
+
+/* The socket's connection with a reference held (tcp_conn_release), or
+ * NULL. */
+static tcp_conn_t *sock_tcp_get(net_socket_t *s)
+{
+	uint64_t f;
+	tcp_conn_t *c;
+
+	spin_lock_irqsave(&s->lock, &f);
+	c = s->active ? s->tcp : NULL;
+	if (c)
+		tcp_conn_get(c);
+	spin_unlock_irqrestore(&s->lock, f);
+	return c;
+}
+
+/* A write on a stream whose sending side is gone (EPIPE) also raises
+ * SIGPIPE, unless the caller said MSG_NOSIGNAL. */
+static void sock_sigpipe(void)
+{
+	task_t *cur = sched_current();
+
+	if (cur)
+		sched_signal_task(cur, SIGPIPE);
 }
 
 // Ephemeral port counter (49152-65535)
@@ -147,24 +225,40 @@ static uint16_t alloc_ephemeral_port(net_socket_t *s, uint32_t dst_ip,
 	return port;
 }
 
-// Find a UDP socket bound to a given port and destination IP (called from udp.c)
-net_socket_t *sock_find_udp(uint16_t port, uint32_t dst_ip)
+/* The table slot of a socket (for the wakeup bitmaps of the datagram
+ * delivery paths), -1 for anything else. */
+int sock_slot(const net_socket_t *s)
 {
-	net_socket_t *wildcard = NULL;
-	for (int i = 0; i < NET_MAX_SOCKETS; i++) {
-		net_socket_t *s = &sockets[i];
-		if (s->active && s->type == SOCK_DGRAM && s->bound &&
-		    net_ntohs(s->local_addr.sin_port) == port) {
-			uint32_t local_ip =
-				net_ntohl(s->local_addr.sin_addr.s_addr);
-			if (local_ip == dst_ip)
-				return s;
-			if (local_ip == 0 && !wildcard)
-				wildcard = s;
+	uintptr_t base = (uintptr_t)&sockets[0];
+	uintptr_t p = (uintptr_t)s;
+
+	if (p < base || p >= base + sizeof(sockets) ||
+	    (p - base) % sizeof(net_socket_t))
+		return -1;
+	return (int)((p - base) / sizeof(net_socket_t));
+}
+
+void sock_wake_slots(const uint64_t *bits)
+{
+	for (int w = 0; w < NET_MAX_SOCKETS / 64; w++) {
+		uint64_t m = bits[w];
+
+		while (m) {
+			int b = __builtin_ctzll(m);
+
+			m &= m - 1;
+			dgram_wake(&sockets[w * 64 + b]);
 		}
 	}
-	return wildcard;
 }
+
+/* SO_RCVBUF / SO_SNDBUF: what the caller asks for, doubled for the
+ * bookkeeping overhead, between a floor and twice the system maximum --
+ * and that doubled value is what getsockopt() reports. */
+#define SOCK_RMEM_MAX 212992
+#define SOCK_WMEM_MAX 212992
+#define SOCK_MIN_RCVBUF 2304
+#define SOCK_MIN_SNDBUF 4608
 
 // ============================================================================
 // sock_create - Create a new socket
@@ -181,24 +275,18 @@ int sock_create(int domain, int type, int protocol)
 	if (type == SOCK_RAW && !capable())
 		return -EPERM;
 
-	/* The datagram receive queue is out-of-line (see udp_rx_entry_t) and
-	 * kalloc may sleep, so allocate BEFORE taking the table spinlock. */
-	udp_rx_entry_t *rxq = NULL;
-	if (type == SOCK_DGRAM || type == SOCK_RAW) {
-		rxq = (udp_rx_entry_t *)kalloc(sizeof(udp_rx_entry_t) *
-					       UDP_RX_QUEUE_ENTRIES);
-		if (!rxq)
-			return -ENOMEM;
-		mm_memset(rxq, 0,
-			  sizeof(udp_rx_entry_t) * UDP_RX_QUEUE_ENTRIES);
-	}
+	if (type == SOCK_RAW && (protocol < 0 || protocol > 255))
+		return -EINVAL;
 
 	uint64_t flags;
 	spin_lock_irqsave(&socket_lock, &flags);
 
 	int fd = -ENOMEM;
 	for (int i = 0; i < NET_MAX_SOCKETS; i++) {
-		if (!sockets[i].active) {
+		/* A slot still on a lookup table is mid-close: its
+		 * table linkage must not be zeroed under the table. */
+		if (!sockets[i].active &&
+		    !__atomic_load_n(&sockets[i].hashed, __ATOMIC_ACQUIRE)) {
 			net_socket_t *s = &sockets[i];
 			// Zero the entire struct first so any new fields default to 0.
 			/* All but the poll queue, which survives the slot
@@ -221,13 +309,25 @@ int sock_create(int domain, int type, int protocol)
 			s->ip_ttl = 64;
 			s->mcast_ttl = 1;
 			s->mcast_loop = 1;
-			s->sndbuf_size = 65536;
-			s->rcvbuf_size = 65536;
+			/* The defaults everybody else has: datagram
+			 * sockets 208 KB both ways; a TCP socket the
+			 * connection's initial buffers. */
+			if (type == SOCK_STREAM) {
+				s->sndbuf_size = 16384;
+				s->rcvbuf_size = 131072;
+			} else {
+				s->sndbuf_size = SOCK_WMEM_MAX;
+				s->rcvbuf_size = SOCK_RMEM_MAX;
+			}
+			s->pmtudisc = IP_PMTUDISC_WANT;
+			s->mc_all = 1;
+			s->rcvlowat = 1;
+			s->max_pacing_rate = ~0ULL;
 			s->lock = (spinlock_t)SPINLOCK_INIT("sock");
+			skb_queue_init(&s->rx_queue, "sock_rxq");
+			skb_queue_init(&s->err_queue, "sock_errq");
 			s->local_addr.sin_family = AF_INET;
 			s->remote_addr.sin_family = AF_INET;
-			s->udp_rx_queue = rxq;
-			rxq = NULL; /* owned by the slot now */
 
 			fd = i;
 			break;
@@ -235,10 +335,11 @@ int sock_create(int domain, int type, int protocol)
 	}
 
 	spin_unlock_irqrestore(&socket_lock, flags);
-	if (rxq)
-		kfree(rxq); /* no slot took it */
 	WARN_RATELIMIT(fd < 0, "sock_create: socket table full (%d slots)",
 		       NET_MAX_SOCKETS);
+	/* A raw socket receives its protocol's datagrams from now on. */
+	if (fd >= 0 && type == SOCK_RAW)
+		raw_hash(&sockets[fd]);
 	return fd;
 }
 
@@ -252,31 +353,30 @@ int sock_bind(int sockfd, const struct sockaddr_in *addr)
 	net_socket_t *s = &sockets[sockfd];
 	if (!s->active)
 		return -EBADF;
+	/* UDP has its own port space and tables (udp.c). */
+	if (s->type == SOCK_DGRAM)
+		return udp_bind(s, addr);
 	if (s->bound)
 		return -EINVAL;
+	if (s->type == SOCK_RAW) {
+		/* A raw socket has no port: binding names the local
+		 * address it receives for (and sends from). */
+		uint32_t a = net_ntohl(addr->sin_addr.s_addr);
+
+		if (a && !ip_addr_is_local(a) && !ip_addr_is_broadcast(a) &&
+		    (a & 0xF0000000u) != 0xE0000000u)
+			return -EADDRNOTAVAIL;
+		s->local_addr.sin_family = AF_INET;
+		s->local_addr.sin_port = 0;
+		s->local_addr.sin_addr.s_addr = addr->sin_addr.s_addr;
+		s->udp_saddr = (a && ip_addr_is_local(a)) ? a : 0;
+		s->bound = 1;
+		return 0;
+	}
 	/* Reserved ports (<1024) may only be bound by the privileged caller. */
 	uint16_t bind_port = net_ntohs(addr->sin_port);
 	if (bind_port != 0 && bind_port < 1024 && !capable())
 		return -EACCES;
-
-	/* For non-ephemeral (explicit) ports, check for address already in use.
-     * Two UDP sockets cannot share a port unless SO_REUSEADDR is set. */
-	if (addr->sin_port != 0 && s->type == SOCK_DGRAM) {
-		uint64_t gflags;
-		spin_lock_irqsave(&socket_lock, &gflags);
-		for (int i = 0; i < NET_MAX_SOCKETS; i++) {
-			net_socket_t *o = &sockets[i];
-			if (i == sockfd || !o->active || !o->bound ||
-			    o->type != SOCK_DGRAM)
-				continue;
-			if (o->local_addr.sin_port == addr->sin_port &&
-			    !o->reuse_addr) {
-				spin_unlock_irqrestore(&socket_lock, gflags);
-				return -EADDRINUSE;
-			}
-		}
-		spin_unlock_irqrestore(&socket_lock, gflags);
-	}
 
 	/* TCP: reject a bind that conflicts with an existing ACTIVE TCP socket on
 	 * the same port with an overlapping local address.  POSIX/BSD: only
@@ -337,6 +437,136 @@ int sock_bind(int sockfd, const struct sockaddr_in *addr)
 	return 0;
 }
 
+/* Apply the TCP options set on the socket (see net_socket_t::tcp_opt_set)
+ * to a connection the socket has just come to own.  Only options set
+ * explicitly are applied; the rest keep the connection's defaults. */
+static void sock_apply_tcp_opts(const net_socket_t *s, tcp_conn_t *conn)
+{
+	uint8_t set = s->tcp_opt_set;
+
+	if (!conn)
+		return;
+	if (s->sk_userlocks)
+		tcp_set_buffers(conn, s->sndbuf_size, s->rcvbuf_size,
+				s->sk_userlocks);
+	if (s->pacing_set)
+		tcp_set_max_pacing_rate(conn, s->max_pacing_rate);
+	if (s->oobinline)
+		tcp_set_oobinline(conn, 1);
+	for (int i = 0; i < s->tcp_xopt_n; i++)
+		tcp_setsockopt_int(conn, s->tcp_xopt_name[i],
+				   s->tcp_xopt_val[i]);
+	if (!set)
+		return;
+	if (set & SOCK_TCPOPT_NODELAY)
+		tcp_setsockopt_int(conn, TCP_NODELAY, s->tcp_opt_nodelay);
+	/* Under the connection's lock: it is live already (its timers and
+	 * the receive path may be looking). */
+	if (set & SOCK_TCPOPT_KEEPIDLE)
+		tcp_setsockopt_int(conn, TCP_KEEPIDLE,
+				   (int)timer_ticks_to_s(s->tcp_opt_keepidle_ticks));
+	if (set & SOCK_TCPOPT_KEEPINTVL)
+		tcp_setsockopt_int(conn, TCP_KEEPINTVL,
+				   (int)timer_ticks_to_s(
+					   s->tcp_opt_keepintvl_ticks));
+	if (set & SOCK_TCPOPT_KEEPCNT)
+		tcp_setsockopt_int(conn, TCP_KEEPCNT, (int)s->tcp_opt_keepcnt);
+	if (set & SOCK_TCPOPT_KEEPALIVE)
+		tcp_setsockopt_int(conn, TCP_SOCKOPT_KEEPALIVE,
+				   s->tcp_opt_keepalive);
+	if (set & SOCK_TCPOPT_CORK)
+		tcp_set_cork(conn, s->tcp_opt_cork);
+}
+
+/* A connection option the TCP layer keeps (tcp_setsockopt_int): applied
+ * to the connection when it exists, and remembered for one made later
+ * (connect(), listen() and the listener's children). */
+static int sock_tcp_xopt_set(net_socket_t *s, int name, int val)
+{
+	int rc = 0, i;
+	tcp_conn_t *c = sock_tcp_get(s);
+
+	if (c) {
+		rc = tcp_setsockopt_int(c, name, val);
+		tcp_conn_release(c);
+		if (rc < 0)
+			return rc;
+	} else {
+		switch (name) {
+		case TCP_MAXSEG:
+			if (val && (val < 88 || val > 65535 - 40))
+				return -EINVAL;
+			break;
+		case TCP_SYNCNT:
+			if (val < 1 || val > 127)
+				return -EINVAL;
+			break;
+		case TCP_USER_TIMEOUT:
+		case TCP_WINDOW_CLAMP:
+			if (val < 0)
+				return -EINVAL;
+			break;
+		default:
+			break;
+		}
+	}
+	if (name == TCP_QUICKACK)
+		return rc; // a one-time request, nothing to remember
+	for (i = 0; i < s->tcp_xopt_n; i++)
+		if (s->tcp_xopt_name[i] == name)
+			break;
+	if (i == s->tcp_xopt_n) {
+		if (i >= SOCK_TCP_XOPTS)
+			return rc;
+		s->tcp_xopt_n++;
+		s->tcp_xopt_name[i] = name;
+	}
+	s->tcp_xopt_val[i] = val;
+	return rc;
+}
+
+// The remembered value of such an option, or `def'.
+static int sock_tcp_xopt_get(const net_socket_t *s, int name, int def)
+{
+	for (int i = 0; i < s->tcp_xopt_n; i++)
+		if (s->tcp_xopt_name[i] == name)
+			return s->tcp_xopt_val[i];
+	return def;
+}
+
+/* An accepted socket starts with its listener's TCP options, as it does
+ * everywhere else: a server that sets TCP_NODELAY or SO_KEEPALIVE on its
+ * listening socket means every connection it accepts. */
+static void sock_inherit_tcp_opts(net_socket_t *dst, const net_socket_t *src)
+{
+	dst->tcp_opt_set = src->tcp_opt_set;
+	dst->tcp_opt_keepalive = src->tcp_opt_keepalive;
+	dst->tcp_opt_nodelay = src->tcp_opt_nodelay;
+	dst->tcp_opt_cork = src->tcp_opt_cork;
+	dst->tcp_opt_keepidle_ticks = src->tcp_opt_keepidle_ticks;
+	dst->tcp_opt_keepintvl_ticks = src->tcp_opt_keepintvl_ticks;
+	dst->tcp_opt_keepcnt = src->tcp_opt_keepcnt;
+	dst->sk_userlocks = src->sk_userlocks;
+	/* SO_SNDBUF / SO_RCVBUF set on the listener are the accepted
+	 * socket's too (sock_apply_tcp_opts applies them from here -- with
+	 * the defaults instead it undid the listener's sizes). */
+	dst->sndbuf_size = src->sndbuf_size;
+	dst->rcvbuf_size = src->rcvbuf_size;
+	dst->tcp_xopt_n = src->tcp_xopt_n;
+	for (int i = 0; i < src->tcp_xopt_n && i < SOCK_TCP_XOPTS; i++) {
+		dst->tcp_xopt_name[i] = src->tcp_xopt_name[i];
+		dst->tcp_xopt_val[i] = src->tcp_xopt_val[i];
+	}
+	/* And the socket-level options an accepted socket takes over. */
+	dst->rcvlowat = src->rcvlowat;
+	dst->sk_mark = src->sk_mark;
+	dst->sk_priority = src->sk_priority;
+	dst->rcv_tstamp = src->rcv_tstamp;
+	dst->max_pacing_rate = src->max_pacing_rate;
+	dst->pacing_set = src->pacing_set;
+	dst->oobinline = src->oobinline;
+}
+
 // ============================================================================
 // sock_listen - Mark socket as listening (TCP only)
 // ============================================================================
@@ -351,6 +581,31 @@ int sock_listen(int sockfd, int backlog)
 		return -EOPNOTSUPP;
 	if (!s->bound)
 		return -EINVAL;
+
+	/* Already listening: only the backlog changes.  This used to start
+	 * a second listener on the same port and put it in place of the
+	 * first, which stayed in the lookup table: connections kept arriving
+	 * on the first, where accept() never looked, and the port went on
+	 * listening after close().  A socket that is connected or connecting
+	 * cannot listen. */
+	{
+		tcp_conn_t *cur = sock_tcp_get(s);
+
+		if (cur) {
+			int rc = 0;
+
+			if (s->listening &&
+			    __atomic_load_n(&cur->state, __ATOMIC_ACQUIRE) ==
+				    TCP_STATE_LISTEN)
+				tcp_listen_set_backlog(cur, backlog > 0 ?
+								    backlog :
+								    5);
+			else
+				rc = -EINVAL;
+			tcp_conn_release(cur);
+			return rc;
+		}
+	}
 
 	net_device_t *dev = net_get_default_device();
 	if (!dev)
@@ -367,10 +622,19 @@ int sock_listen(int sockfd, int backlog)
 	uint64_t flags;
 	spin_lock_irqsave(&s->lock, &flags);
 	lockdep_assert_held(&s->lock);
+	if (s->tcp) {
+		/* Another thread's listen() or connect() on this socket got
+		 * there first: one connection per socket. */
+		spin_unlock_irqrestore(&s->lock, flags);
+		tcp_close(conn);
+		tcp_conn_release(conn);
+		return s->listening ? 0 : -EINVAL;
+	}
 	s->tcp = conn;
 	conn->owner_socket = s;
 	s->listening = 1;
 	spin_unlock_irqrestore(&s->lock, flags);
+	sock_apply_tcp_opts(s, conn);
 
 	return 0;
 }
@@ -428,12 +692,14 @@ static void sock_wait_event(net_socket_t *s, int (*ready)(void *), void *arg,
 	wq_remove(&s->poll_wq, &we);
 }
 
+/* A child to take, or the listener stopped listening (accept() fails). */
 static int sock_accept_ready(void *arg)
 {
 	tcp_conn_t *listener = arg;
 
-	return __atomic_load_n(&listener->accept_head, __ATOMIC_ACQUIRE) !=
-	       __atomic_load_n(&listener->accept_tail, __ATOMIC_ACQUIRE);
+	return __atomic_load_n(&listener->accept_ready, __ATOMIC_ACQUIRE) != 0 ||
+	       __atomic_load_n(&listener->state, __ATOMIC_ACQUIRE) !=
+		       TCP_STATE_LISTEN;
 }
 
 static int sock_connect_ready(void *arg)
@@ -462,7 +728,10 @@ int sock_accept(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen)
 	if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS)
 		return -EBADF;
 	net_socket_t *s = &sockets[sockfd];
-	if (!s->active || !s->listening || !s->tcp)
+	if (!s->active || !s->listening)
+		return -EINVAL;
+	tcp_conn_t *lc = sock_tcp_get(s);
+	if (!lc)
 		return -EINVAL;
 
 	// Wait for a connection
@@ -471,21 +740,39 @@ int sock_accept(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen)
 
 	tcp_conn_t *new_conn = NULL;
 	task_t *acc_cur = sched_current();
+	int arc = 0;
 	while (1) {
-		new_conn = tcp_accept(s->tcp);
+		new_conn = tcp_accept(lc);
 		if (new_conn)
 			break;
-		if (s->nonblock)
-			return -EAGAIN;
-		if (deadline && timer_ticks() >= deadline)
-			return -ETIMEDOUT;
+		/* No longer listening -- shutdown(SHUT_RD) stopped it, here
+		 * or while a thread waited: EINVAL, as for a socket that
+		 * never listened (the waiters are woken by the close). */
+		if (__atomic_load_n(&lc->state, __ATOMIC_ACQUIRE) !=
+		    TCP_STATE_LISTEN) {
+			arc = -EINVAL;
+			break;
+		}
+		if (s->nonblock) {
+			arc = -EAGAIN;
+			break;
+		}
+		if (deadline && timer_ticks() >= deadline) {
+			arc = -ETIMEDOUT;
+			break;
+		}
 		/* Interruptible: a pending (possibly fatal) signal must be able
 		 * to take us out of this wait — POSIX accept() returns EINTR. */
-		if (acc_cur && signal_pending(acc_cur))
-			return -EINTR;
+		if (acc_cur && signal_pending(acc_cur)) {
+			arc = -EINTR;
+			break;
+		}
 		loopback_process_pending();
-		sock_wait_event(s, sock_accept_ready, s->tcp, deadline);
+		sock_wait_event(s, sock_accept_ready, lc, deadline);
 	}
+	tcp_conn_release(lc);
+	if (!new_conn)
+		return arc;
 
 	// Create a new socket for the accepted connection.  tcp_accept returned
 	// new_conn with a reference (the accept-queue reference, transferred to
@@ -499,10 +786,9 @@ int sock_accept(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen)
 
 	net_socket_t *ns = &sockets[newfd];
 	ns->tcp = new_conn;
-	WARN_ON_ONCE(
-		new_conn->state != TCP_STATE_ESTABLISHED &&
-		new_conn->state !=
-			TCP_STATE_CLOSE_WAIT); /* accepted connection in unexpected state: must be ESTABLISHED or CLOSE_WAIT */
+	/* The peer may reset the child at any moment, also between
+	 * tcp_accept() and here: the socket then reports it like any reset
+	 * connection (no assertion on the state). */
 	new_conn->owner_socket = ns;
 	ns->connected = 1;
 	ns->bind_euid = current_euid();
@@ -513,6 +799,8 @@ int sock_accept(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen)
 	ns->remote_addr.sin_family = AF_INET;
 	ns->remote_addr.sin_port = net_htons(new_conn->remote_port);
 	ns->remote_addr.sin_addr.s_addr = net_htonl(new_conn->remote_ip);
+	sock_inherit_tcp_opts(ns, s);
+	sock_apply_tcp_opts(ns, new_conn);
 
 	// Fill in caller's address if requested
 	if (addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
@@ -526,6 +814,81 @@ int sock_accept(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen)
 // ============================================================================
 // sock_connect - Connect to remote host (TCP or set UDP default dest)
 // ============================================================================
+/* The source address for a connection to dst_ip leaving through dev.  On
+ * the loopback device the IP layer stamps the destination itself as the
+ * source (ipv4_send_common()), so the connection must use the same address
+ * or its checksums -- computed over the pseudo header -- would not match
+ * what the receiver sees. */
+static uint32_t sock_source_ip(net_device_t *dev, uint32_t dst_ip)
+{
+	if (dev == net_get_loopback())
+		return dst_ip;
+	return dev->ip_addr;
+}
+
+/* Wait for the handshake of the socket's connection to end.  0 when it
+ * did (successfully or not -- sock_connect_finish() tells), otherwise the
+ * error the waiting connect() returns; the handshake carries on in the
+ * background either way.  The wait is bounded by SO_SNDTIMEO, which is
+ * what bounds connect() everywhere (it used to take SO_RCVTIMEO); its
+ * expiry reports EINPROGRESS, as a non-blocking connect would. */
+static int sock_connect_wait(net_socket_t *s, tcp_conn_t *conn)
+{
+	uint64_t deadline = s->snd_timeout_ticks ?
+				    timer_ticks() + s->snd_timeout_ticks :
+				    0;
+	task_t *con_cur = sched_current();
+
+	while (!__atomic_load_n(&conn->connect_done, __ATOMIC_ACQUIRE)) {
+		if (s->nonblock)
+			return -EINPROGRESS;
+		if (deadline && timer_ticks() >= deadline)
+			return -EINPROGRESS;
+		/* Interruptible (POSIX: connect() returns EINTR; the handshake
+		 * continues in the background if the caller survives). */
+		if (con_cur && signal_pending(con_cur))
+			return -EINTR;
+		loopback_process_pending();
+		sock_wait_event(s, sock_connect_ready, conn, deadline);
+	}
+	return 0;
+}
+
+/* The handshake of `conn' is over: report how it went.  A failed
+ * connection is detached from the socket, which may then connect() again;
+ * its error is returned once.  The caller holds a reference on conn. */
+static int sock_connect_finish(net_socket_t *s, tcp_conn_t *conn, int refuse)
+{
+	uint64_t f;
+
+	if (refuse || conn->error || conn->state == TCP_STATE_CLOSED ||
+	    conn->state == TCP_STATE_SYN_SENT) {
+		/* A failure whose error SO_ERROR already consumed reads as
+		 * ECONNABORTED, as it does elsewhere. */
+		int err = conn->error ? conn->error :
+			  (refuse || conn->state == TCP_STATE_SYN_SENT) ?
+					ECONNREFUSED :
+					ECONNABORTED;
+		int detached = 0;
+
+		spin_lock_irqsave(&s->lock, &f);
+		if (s->tcp == conn) {
+			conn->owner_socket = NULL;
+			s->tcp = NULL;
+			detached = 1;
+		}
+		spin_unlock_irqrestore(&s->lock, f);
+		if (detached) {
+			tcp_close(conn); // drive teardown
+			tcp_conn_release(conn); // drop the socket reference
+		}
+		return -err;
+	}
+
+	s->connected = 1;
+	return 0;
+}
+
 int sock_connect(int sockfd, const struct sockaddr_in *addr)
 {
 	might_sleep();
@@ -535,8 +898,63 @@ int sock_connect(int sockfd, const struct sockaddr_in *addr)
 	net_socket_t *s = &sockets[sockfd];
 	if (!s->active)
 		return -EBADF;
+	/* A datagram socket may change (or, with AF_UNSPEC, drop) its
+	 * peer at any time. */
+	if (s->type == SOCK_DGRAM)
+		return udp_connect(s, addr);
+	if (s->type == SOCK_RAW) {
+		if (addr->sin_family == 0) {
+			s->connected = 0;
+			s->remote_addr.sin_addr.s_addr = 0;
+			return 0;
+		}
+		if (addr->sin_family != AF_INET)
+			return -EAFNOSUPPORT;
+		s->remote_addr = *addr;
+		s->remote_addr.sin_port = 0;
+		s->connected = 1;
+		return 0;
+	}
 	if (s->connected)
 		return -EISCONN;
+
+	if (s->type == SOCK_STREAM) {
+		uint64_t f;
+		tcp_conn_t *prev;
+
+		if (s->listening)
+			return -EISCONN;
+		/* connect() on a socket whose connection already exists: the
+		 * second call of a non-blocking connect, or a retry after
+		 * EINTR.  It used to start a SECOND connection, leaking the
+		 * first and warning about it.  Answer from the existing one
+		 * instead: still handshaking -- EALREADY, or wait for it when
+		 * blocking; established -- success, once (EISCONN after);
+		 * failed -- its error, after which the socket is unconnected
+		 * and may connect() afresh. */
+		spin_lock_irqsave(&s->lock, &f);
+		prev = s->tcp;
+		if (prev)
+			tcp_conn_get(prev);
+		spin_unlock_irqrestore(&s->lock, f);
+		if (prev) {
+			int rc = 0;
+
+			if (!__atomic_load_n(&prev->connect_done,
+					     __ATOMIC_ACQUIRE)) {
+				if (s->nonblock)
+					rc = -EALREADY;
+				else
+					rc = sock_connect_wait(s, prev);
+				if (rc == -EINPROGRESS)
+					rc = -EALREADY;
+			}
+			if (rc == 0)
+				rc = sock_connect_finish(s, prev, 0);
+			tcp_conn_release(prev);
+			return rc;
+		}
+	}
 
 	uint32_t dst_ip = net_ntohl(addr->sin_addr.s_addr);
 	uint32_t next_hop = dst_ip;
@@ -546,65 +964,73 @@ int sock_connect(int sockfd, const struct sockaddr_in *addr)
 	if (!dev)
 		return -ENETDOWN;
 
+	/* The local port was bound before connect() (by bind(), even to a
+	 * port picked then), not chosen by connect() here: TCP may then take
+	 * over a TIME_WAIT sock's tuple (with timestamps) at once. */
+	uint8_t user_port = s->bound && s->local_addr.sin_port != 0;
+
 	if (!s->bound) {
-		s->local_addr.sin_addr.s_addr = net_htonl(dev->ip_addr);
+		s->local_addr.sin_addr.s_addr =
+			net_htonl(sock_source_ip(dev, dst_ip));
 		s->local_addr.sin_family = AF_INET;
 		s->bind_euid = current_euid();
 		/* Reserves the port and sets s->bound under the port lock.
 		 * The destination goes in because the port only has to be
 		 * free TOWARD IT -- see alloc_ephemeral_port(). */
 		alloc_ephemeral_port(s, dst_ip, net_ntohs(addr->sin_port));
+	} else if (s->type == SOCK_STREAM &&
+		   s->local_addr.sin_addr.s_addr == 0) {
+		/* Bound to the wildcard address: a connection needs a real
+		 * one, the one its segments will carry -- the TCP checksum
+		 * covers it, and a connection built on 0.0.0.0 sent segments
+		 * every receiver rejects.  getsockname() reports it from now
+		 * on, as it does everywhere. */
+		s->local_addr.sin_addr.s_addr =
+			net_htonl(sock_source_ip(dev, dst_ip));
 	}
 
 	s->remote_addr = *addr;
-
-	if (s->type == SOCK_DGRAM) {
-		// UDP: just set default destination
-		s->connected = 1;
-		return 0;
-	}
 
 	// TCP: initiate connection
 	uint16_t dst_port = net_ntohs(addr->sin_port);
 	uint16_t src_port = net_ntohs(s->local_addr.sin_port);
 	uint32_t local_ip = net_ntohl(s->local_addr.sin_addr.s_addr);
 
-	WARN_ON(s->tcp !=
-		NULL); /* s->tcp already set before connect: double connect or leaked connection */
-	tcp_conn_t *conn =
-		tcp_connect(dev, local_ip, dst_ip, src_port, dst_port);
+	struct tcp_conn_params cp = {
+		.sndbuf = s->sndbuf_size,
+		.rcvbuf = s->rcvbuf_size,
+		.userlocks = s->sk_userlocks,
+		.syn_retries = (uint8_t)sock_tcp_xopt_get(s, TCP_SYNCNT, 0),
+		.user_mss = (uint16_t)sock_tcp_xopt_get(s, TCP_MAXSEG, 0),
+		.window_clamp = (uint32_t)sock_tcp_xopt_get(s, TCP_WINDOW_CLAMP,
+							    0),
+		.user_port = user_port,
+	};
+	int cerr = 0;
+
+	cp.err = &cerr;
+	tcp_conn_t *conn = tcp_connect_opts(dev, local_ip, dst_ip, src_port,
+					    dst_port, &cp);
 	if (!conn)
-		return -ENOMEM;
+		return cerr ? cerr : -ENOMEM;
 
-	s->tcp = conn;
-	conn->owner_socket = s;
+	{
+		uint64_t f;
 
-	// Wait for connection to complete (blocking)
-	uint64_t deadline =
-		s->rcv_timeout_ticks ? timer_ticks() + s->rcv_timeout_ticks : 0;
-
-	task_t *con_cur = sched_current();
-	while (!conn->connect_done) {
-		if (s->nonblock)
-			return -EINPROGRESS;
-		if (deadline && timer_ticks() >= deadline)
-			return -ETIMEDOUT;
-		/* Interruptible (POSIX: connect() returns EINTR; the handshake
-		 * continues in the background if the caller survives). */
-		if (con_cur && signal_pending(con_cur))
-			return -EINTR;
-		loopback_process_pending();
-		sock_wait_event(s, sock_connect_ready, conn, deadline);
+		spin_lock_irqsave(&s->lock, &f);
+		s->tcp = conn;
+		conn->owner_socket = s;
+		spin_unlock_irqrestore(&s->lock, f);
 	}
+	sock_apply_tcp_opts(s, conn);
 
-	if (conn->error) {
-		int err = conn->error;
-		conn->owner_socket = NULL;
-		s->tcp = NULL;
-		tcp_close(
-			conn); // drive teardown (we still hold the socket ref)
-		tcp_conn_release(conn); // drop the socket reference
-		return -err;
+	// Wait for connection to complete (blocking).  Our own transient
+	// reference keeps conn alive across the wait whatever the socket does.
+	tcp_conn_get(conn);
+	int rc = sock_connect_wait(s, conn);
+	if (rc) {
+		tcp_conn_release(conn);
+		return rc;
 	}
 
 	/* connect_done can be observed without this socket's connection actually
@@ -615,26 +1041,22 @@ int sock_connect(int sockfd, const struct sockaddr_in *addr)
 	 * (it should always be refused — a SYN to a closed port only ever yields a
 	 * RST, never a SYN+ACK).  Only report success if this is still OUR
 	 * connection to the requested destination and it has left SYN_SENT. */
-	if (conn->owner_socket != s || conn->remote_ip != dst_ip ||
-	    conn->remote_port != dst_port ||
-	    conn->state == TCP_STATE_SYN_SENT) {
+	int bogus = 0;
+	if (!conn->error &&
+	    (conn->owner_socket != s || conn->remote_ip != dst_ip ||
+	     conn->remote_port != dst_port ||
+	     conn->state == TCP_STATE_SYN_SENT)) {
+		bogus = 1;
 		kprintf("tcp: connect %u.%u.%u.%u:%u completed without establishing to "
 			"it (state=%d rport=%u mine=%d) -> ECONNREFUSED\n",
 			(dst_ip >> 24) & 0xff, (dst_ip >> 16) & 0xff,
 			(dst_ip >> 8) & 0xff, dst_ip & 0xff, dst_port,
 			conn->state, conn->remote_port,
 			conn->owner_socket == s);
-		if (conn->owner_socket == s) {
-			conn->owner_socket = NULL;
-			tcp_close(conn);
-			tcp_conn_release(conn); // drop the socket reference
-		}
-		s->tcp = NULL;
-		return -ECONNREFUSED;
 	}
-
-	s->connected = 1;
-	return 0;
+	rc = sock_connect_finish(s, conn, bogus);
+	tcp_conn_release(conn);
+	return rc;
 }
 
 // ============================================================================
@@ -651,121 +1073,24 @@ int sock_sendto(int sockfd, const void *buf, size_t len, int flags,
 	net_socket_t *s = &sockets[sockfd];
 	if (!s->active)
 		return -EBADF;
-	// Surface any pending async error (e.g. ICMP port-unreach) once
+	/* A pending asynchronous error (an ICMP port unreachable on a
+	 * connected datagram socket, ...) is reported once, by the next
+	 * send or receive. */
 	if (s->error) {
-		int e = s->error;
-		s->error = 0;
-		return -e;
+		int e = (s->type == SOCK_STREAM) ? s->error :
+						     dgram_take_error(s);
+
+		if (s->type == SOCK_STREAM)
+			s->error = 0;
+		if (e)
+			return -e;
 	}
 
-	// SOCK_RAW: caller may supply a full IP packet (IP_HDRINCL) or a payload.
-	if (s->type == SOCK_RAW) {
-		const struct sockaddr_in *target =
-			dest_addr ? dest_addr : &s->remote_addr;
-		uint32_t dst_ip = net_ntohl(target->sin_addr.s_addr);
-		uint32_t next_hop = dst_ip;
-		net_device_t *dev = route_lookup(dst_ip, &next_hop);
-		if (!dev)
-			dev = net_get_default_device();
-		if (!dev)
-			return -ENETDOWN;
-		// buf is user memory read directly by the send path (SMAP)
-		int rret;
-		if (s->ip_hdrincl) {
-			// Caller-supplied IP header — forward as-is via raw L3 send hook
-			extern int ipv4_send_raw(net_device_t *, uint32_t,
-						 const uint8_t *, uint16_t);
-			smap_disable();
-			rret = ipv4_send_raw(dev, dst_ip, (const uint8_t *)buf,
-					     (uint16_t)len);
-			smap_enable();
-			return rret;
-		}
-		smap_disable();
-		rret = ipv4_send_full(dev, dst_ip, (uint8_t)s->protocol,
-				      (const uint8_t *)buf, (uint16_t)len,
-				      s->ip_ttl ? s->ip_ttl : 64, s->ip_tos);
-		smap_enable();
-		return rret;
-	}
-
-	if (s->type == SOCK_DGRAM) {
-		const struct sockaddr_in *target =
-			dest_addr ? dest_addr : &s->remote_addr;
-		if (target->sin_port == 0 && !s->connected)
-			return -EDESTADDRREQ;
-
-		uint32_t dst_ip = net_ntohl(target->sin_addr.s_addr);
-		uint16_t dst_port = net_ntohs(target->sin_port);
-
-		if (len > 0xFFFFU - 28U)
-			return -EINVAL;
-
-		// SO_BROADCAST gate: refuse class-D/limited bcast if not enabled
-		int is_bcast = (dst_ip == 0xFFFFFFFFU);
-		int is_dirbcast = 0;
-		if (!is_bcast) {
-			// Directed broadcast == host-portion all-ones for some local subnet
-			for (int dn = 0; dn < 8; dn++) {
-				net_device_t *dd = net_get_device(dn);
-				if (!dd)
-					continue;
-				if (dd->ip_addr && dd->netmask &&
-				    ((dst_ip | dd->netmask) == 0xFFFFFFFFU) &&
-				    ((dst_ip & dd->netmask) ==
-				     (dd->ip_addr & dd->netmask))) {
-					is_dirbcast = 1;
-					break;
-				}
-			}
-		}
-		if ((is_bcast || is_dirbcast) && !s->broadcast)
-			return -EACCES;
-
-		uint32_t next_hop = dst_ip;
-		net_device_t *dev = route_lookup(dst_ip, &next_hop);
-		if (!dev)
-			dev = net_get_default_device();
-		if (!dev)
-			return -ENETDOWN;
-
-		// SO_BINDTODEVICE: if specified, override route choice
-		if (s->bindtodevice[0]) {
-			for (int dn = 0; dn < 8; dn++) {
-				net_device_t *dd = net_get_device(dn);
-				if (!dd)
-					continue;
-				int match = 1;
-				for (int k = 0; k < 16 && s->bindtodevice[k];
-				     k++) {
-					if (dd->name[k] != s->bindtodevice[k]) {
-						match = 0;
-						break;
-					}
-				}
-				if (match) {
-					dev = dd;
-					break;
-				}
-			}
-		}
-
-		if (!s->bound) {
-			s->local_addr.sin_addr.s_addr = net_htonl(dev->ip_addr);
-			s->bind_euid = current_euid();
-			// Reserves the port and sets s->bound under the port lock.
-			alloc_ephemeral_port(s, 0, 0);
-		}
-
-		uint16_t src_port = net_ntohs(s->local_addr.sin_port);
-		uint16_t send_len = (uint16_t)len;
-
-		smap_disable();
-		int ret = udp_send(dev, dst_ip, src_port, dst_port,
-				   (const uint8_t *)buf, send_len);
-		smap_enable();
-		return ret < 0 ? ret : (int)send_len;
-	}
+	/* Raw and UDP: the datagram goes out whole (raw.c, udp.c). */
+	if (s->type == SOCK_RAW)
+		return raw_sendmsg(s, buf, len, dest_addr);
+	if (s->type == SOCK_DGRAM)
+		return udp_sendmsg(s, buf, len, flags, dest_addr);
 
 	// TCP sendto - ignore dest_addr, use connection
 	return sock_send(sockfd, buf, len, flags);
@@ -774,8 +1099,157 @@ int sock_sendto(int sockfd, const void *buf, size_t len, int flags,
 // ============================================================================
 // sock_recvfrom - Receive data (UDP with source address)
 // ============================================================================
-int sock_recvfrom(int sockfd, void *buf, size_t len, int flags,
-		  struct sockaddr_in *src_addr, socklen_t *addrlen)
+/* What recvmsg() needs to know about the datagram a receive dequeued,
+ * beyond its bytes. */
+struct sock_dgram_meta {
+	uint32_t real_len; // length of the datagram as it arrived
+	uint32_t dst_ip;
+	uint8_t ttl;
+	uint8_t tos;
+	uint8_t errqueue; // from the error queue: `ee' is valid
+	uint8_t _pad;
+	uint32_t ifindex;
+	struct sock_extended_err ee;
+	uint32_t offender; // host order
+	uint64_t tstamp_ns; // receive time (monotonic), 0 unknown
+};
+
+/* A datagram socket's receive: the pending error first (reported once),
+ * then the oldest datagram.  MSG_ERRQUEUE reads the error queue instead
+ * and never waits. */
+static int sock_dgram_recv(net_socket_t *s, void *buf, size_t len, int flags,
+			   struct sockaddr_in *src_addr, socklen_t *addrlen,
+			   struct sock_dgram_meta *meta)
+{
+	int peek = (flags & MSG_PEEK) != 0;
+	int dontwait = (flags & MSG_DONTWAIT) != 0;
+	uint64_t deadline = s->rcv_timeout_ticks ?
+				    timer_ticks() + s->rcv_timeout_ticks :
+				    0;
+	task_t *cur = sched_current();
+	sk_buff_t *skb;
+	uint32_t n;
+
+	if (flags & MSG_ERRQUEUE) {
+		struct sock_exterr_cb *ec;
+
+		skb = dgram_dequeue_err(s);
+		if (!skb)
+			return -EAGAIN;
+		ec = SKB_EXT_ERR(skb);
+		n = skb->len < len ? skb->len : (uint32_t)len;
+		if (n) {
+			smap_disable();
+			mm_memcpy(buf, skb->data, n);
+			smap_enable();
+		}
+		if (meta) {
+			meta->real_len = skb->len;
+			meta->errqueue = 1;
+			meta->ee = ec->ee;
+			meta->offender = ec->offender;
+			meta->dst_ip = ec->addr;
+		}
+		if (src_addr && addrlen &&
+		    *addrlen >= sizeof(struct sockaddr_in)) {
+			mm_memset(src_addr, 0, sizeof(*src_addr));
+			src_addr->sin_family = AF_INET;
+			src_addr->sin_port = net_htons(ec->port);
+			src_addr->sin_addr.s_addr = net_htonl(ec->addr);
+			*addrlen = sizeof(struct sockaddr_in);
+		}
+		skb_put(skb);
+		return (int)n;
+	}
+
+	for (;;) {
+		int e = dgram_take_error(s);
+
+		if (e)
+			return -e;
+		skb = dgram_dequeue(s, peek);
+		if (skb)
+			break;
+		/* shutdown(SHUT_RD): what was queued is read, then 0. */
+		if (__atomic_load_n(&s->rx_shutdown, __ATOMIC_ACQUIRE))
+			return 0;
+		if (s->nonblock || dontwait)
+			return -EAGAIN;
+		if (deadline && timer_ticks() >= deadline)
+			return -ETIMEDOUT;
+		/* Interruptible: recvfrom() returns EINTR on a signal. */
+		if (cur && signal_pending(cur))
+			return -EINTR;
+		/* Deliver any datagram already queued on the loopback device
+		 * ourselves (a same-task sender's datagram sits there until
+		 * someone drains it), then park on &s->udp_rx_ready, which
+		 * every delivery wakes.  Mark BLOCKED, re-check, and un-park
+		 * by CAS so the waker's claim never double-enqueues us. */
+		loopback_process_pending();
+		if (!cur) {
+			sched_yield_in_kernel();
+			continue;
+		}
+		cur->wait_channel = (void *)&s->udp_rx_ready;
+		cur->wakeup_tick = deadline; /* 0 = no timeout */
+		__atomic_thread_fence(__ATOMIC_SEQ_CST);
+		task_set_blocked(cur);
+		__atomic_thread_fence(__ATOMIC_SEQ_CST);
+		if (s->udp_rx_ready) {
+			task_state_t expected = TASK_BLOCKED;
+
+			if (__atomic_compare_exchange_n(
+				    &cur->state, &expected, TASK_RUNNING, false,
+				    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+				cur->wait_channel = NULL;
+				cur->wakeup_tick = 0;
+				continue;
+			}
+		}
+		sched_schedule();
+		cur->wait_channel = NULL;
+		cur->wakeup_tick = 0;
+	}
+
+	/* The datagram is ours (dequeued) or held (peeked): copy with no
+	 * lock held. */
+	{
+		struct dgram_cb *d = DGRAM_CB(skb);
+
+		n = skb->len < len ? skb->len : (uint32_t)len;
+		if (n) {
+			smap_disable();
+			mm_memcpy(buf, skb->data, n);
+			smap_enable();
+		}
+		if (meta) {
+			meta->real_len = skb->len;
+			meta->dst_ip = d->daddr;
+			meta->ttl = d->ttl;
+			meta->tos = d->tos;
+			meta->ifindex = (uint32_t)d->ifindex;
+			meta->tstamp_ns = skb->tstamp_ns;
+		}
+		if (src_addr && addrlen &&
+		    *addrlen >= sizeof(struct sockaddr_in)) {
+			mm_memset(src_addr, 0, sizeof(*src_addr));
+			src_addr->sin_family = AF_INET;
+			src_addr->sin_port = net_htons(d->sport);
+			src_addr->sin_addr.s_addr = net_htonl(d->saddr);
+			*addrlen = sizeof(struct sockaddr_in);
+		}
+	}
+	skb_put(skb);
+	return (int)n;
+}
+
+/* sock_recvfrom() proper.  For a datagram socket the return value is the
+ * number of bytes COPIED and *meta (when given) describes the datagram,
+ * including its full length; sock_recvfrom() and sock_recvmsg() turn that
+ * into MSG_TRUNC. */
+static int sock_recvfrom_ex(int sockfd, void *buf, size_t len, int flags,
+			    struct sockaddr_in *src_addr, socklen_t *addrlen,
+			    struct sock_dgram_meta *meta)
 {
 	mm_prefault_user_range((uint64_t)buf, len, 1); // see sock_recv
 	if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS)
@@ -783,111 +1257,59 @@ int sock_recvfrom(int sockfd, void *buf, size_t len, int flags,
 	net_socket_t *s = &sockets[sockfd];
 	if (!s->active)
 		return -EBADF;
-	int peek = (flags & MSG_PEEK) != 0;
-	int dontwait = (flags & MSG_DONTWAIT) != 0;
 
-	if (s->type == SOCK_DGRAM || s->type == SOCK_RAW) {
-		// Wait for data
-		uint64_t deadline =
-			s->rcv_timeout_ticks ?
-				timer_ticks() + s->rcv_timeout_ticks :
-				0;
-
-		task_t *udp_cur = sched_current();
-		while (!s->udp_rx_ready) {
-			if (s->nonblock || dontwait)
-				return -EAGAIN;
-			if (deadline && timer_ticks() >= deadline)
-				return -ETIMEDOUT;
-			/* Interruptible: recvfrom() returns EINTR on a signal. */
-			if (udp_cur && signal_pending(udp_cur))
-				return -EINTR;
-
-			/* Deliver any datagram already queued on the loopback
-			 * device ourselves (a same-task sender's datagram sits
-			 * there until someone drains it), then park on
-			 * &s->udp_rx_ready — udp_deliver_to_socket wakes it when
-			 * a datagram arrives from any other context.  This
-			 * replaces a busy spin-yield that pegged a CPU while
-			 * "blocked".  Mirrors the TCP recv park (see sock_recv):
-			 * mark BLOCKED, re-check, and un-park via CAS so we never
-			 * race the waker's claim into a double-enqueue. */
-			loopback_process_pending();
-			if (!udp_cur) {
-				sched_yield_in_kernel();
-				continue;
-			}
-			udp_cur->wait_channel = (void *)&s->udp_rx_ready;
-			udp_cur->wakeup_tick = deadline; /* 0 = no timeout */
-			__atomic_thread_fence(__ATOMIC_SEQ_CST);
-			task_set_blocked(udp_cur);
-			__atomic_thread_fence(__ATOMIC_SEQ_CST);
-			if (s->udp_rx_ready) {
-				task_state_t expected = TASK_BLOCKED;
-				if (__atomic_compare_exchange_n(
-					    &udp_cur->state, &expected,
-					    TASK_RUNNING, false,
-					    __ATOMIC_ACQ_REL,
-					    __ATOMIC_ACQUIRE)) {
-					udp_cur->wait_channel = NULL;
-					udp_cur->wakeup_tick = 0;
-					continue;
-				}
-				/* Waker claimed us: fall through to schedule as
-				 * READY current; the queue entry brings us back. */
-			}
-			sched_schedule();
-			udp_cur->wait_channel = NULL;
-			udp_cur->wakeup_tick = 0;
-		}
-
-		uint64_t sflags;
-		spin_lock_irqsave(&s->lock, &sflags);
-
-		if (!s->udp_rx_queue || s->udp_rx_head == s->udp_rx_tail) {
-			s->udp_rx_ready = 0;
-			spin_unlock_irqrestore(&s->lock, sflags);
-			return -EAGAIN;
-		}
-
-		int idx = s->udp_rx_head;
-		uint16_t data_len = s->udp_rx_queue[idx].len;
-		if (data_len > len)
-			data_len = (uint16_t)len;
-
-		smap_disable();
-		for (uint16_t i = 0; i < data_len; i++)
-			((uint8_t *)buf)[i] = s->udp_rx_queue[idx].data[i];
-		smap_enable();
-
-		if (src_addr && addrlen &&
-		    *addrlen >= sizeof(struct sockaddr_in)) {
-			*src_addr = s->udp_rx_queue[idx].from;
-			*addrlen = sizeof(struct sockaddr_in);
-		}
-
-		if (!peek) {
-			s->udp_rx_head = (s->udp_rx_head + 1) % 16;
-			if (s->udp_rx_head == s->udp_rx_tail)
-				s->udp_rx_ready = 0;
-		}
-
-		spin_unlock_irqrestore(&s->lock, sflags);
-		return data_len;
-	}
+	if (s->type == SOCK_DGRAM || s->type == SOCK_RAW)
+		return sock_dgram_recv(s, buf, len, flags, src_addr, addrlen,
+				       meta);
 
 	// TCP recvfrom
 	return sock_recv(sockfd, buf, len, flags);
 }
 
+int sock_recvfrom(int sockfd, void *buf, size_t len, int flags,
+		  struct sockaddr_in *src_addr, socklen_t *addrlen)
+{
+	struct sock_dgram_meta meta;
+
+	mm_memset(&meta, 0, sizeof(meta));
+	int ret = sock_recvfrom_ex(sockfd, buf, len, flags, src_addr, addrlen,
+				   &meta);
+	/* MSG_TRUNC on a datagram socket: report the datagram's real length
+	 * even though only `len' bytes of it were stored. */
+	if (ret >= 0 && (flags & MSG_TRUNC) && meta.real_len > (uint32_t)ret)
+		return meta.real_len;
+	return ret;
+}
+
 // ============================================================================
 // sock_send - Send data on connected socket (TCP)
 // ============================================================================
+static int sock_send_impl(int sockfd, const void *buf, size_t len, int flags);
+
+/* send() on any inet socket.  The socket-level part of a stream send is
+ * here: MSG_MORE is handed to TCP (the data of this call may be held back
+ * for more to come, as with TCP_CORK -- TCP reads it from the socket), and
+ * a write to a stream whose sending side is gone raises SIGPIPE as well as
+ * failing with EPIPE, unless MSG_NOSIGNAL. */
 int sock_send(int sockfd, const void *buf, size_t len, int flags)
+{
+	net_socket_t *s = sock_get(sockfd);
+	int r;
+
+	if (s && s->type == SOCK_STREAM)
+		__atomic_store_n(&s->tx_more, (flags & MSG_MORE) ? 1 : 0,
+				 __ATOMIC_RELEASE);
+	r = sock_send_impl(sockfd, buf, len, flags);
+	if (r == -EPIPE && !(flags & MSG_NOSIGNAL) && s &&
+	    s->type == SOCK_STREAM)
+		sock_sigpipe();
+	return r;
+}
+
+static int sock_send_impl(int sockfd, const void *buf, size_t len, int flags)
 {
 	might_sleep();
 	BUG_ON(buf == NULL && len > 0);
-	(void)flags;
 	/* Demand paging shield: the copy below runs under conn->lock with
 	 * IRQs off — fault-in the source buffer first. */
 	mm_prefault_user_range((uint64_t)buf, len, 0);
@@ -898,12 +1320,10 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 		return -EBADF;
 
 	if (s->type == SOCK_STREAM) {
-		if (!s->tcp)
+		tcp_conn_t *pc = sock_tcp_get(s);
+
+		if (!pc)
 			return -ENOTCONN;
-		/* Our own half-close: the write direction is gone, whatever
-		 * state the connection is in.  POSIX says EPIPE. */
-		if (s->tx_shutdown)
-			return -EPIPE;
 		// Allow sends when the TCP layer is established even if sock_connect()
 		// returned EINPROGRESS (non-blocking path) before setting s->connected.
 		//
@@ -915,11 +1335,30 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 		// a fresh connection"; ENOTCONN surfaces as a user-visible
 		// failure.  conn->connect_done is the TCP layer's own record
 		// of having completed the handshake.
-		if (!s->connected && !s->tcp->connect_done &&
-		    s->tcp->state != TCP_STATE_ESTABLISHED)
-			return -ENOTCONN;
-		if (s->tcp->state != TCP_STATE_ESTABLISHED)
-			return s->tcp->error ? -s->tcp->error : -EPIPE;
+		{
+			int pst = __atomic_load_n(&pc->state, __ATOMIC_ACQUIRE);
+			int perr = 0;
+
+			if (!s->connected && !pc->connect_done &&
+			    pst != TCP_STATE_ESTABLISHED && !s->tx_shutdown) {
+				tcp_conn_release(pc);
+				return -ENOTCONN;
+			}
+			/* Our own half-close (the write direction is gone,
+			 * whatever state the connection is in), or a state
+			 * that sends no more.  CLOSE_WAIT still sends: the
+			 * peer's FIN closed only ITS direction (a server
+			 * answers a client that half-closes after its
+			 * request).  A pending error (a reset) is reported
+			 * once, in place of the EPIPE. */
+			if (s->tx_shutdown || (pst != TCP_STATE_ESTABLISHED &&
+					       pst != TCP_STATE_CLOSE_WAIT)) {
+				perr = tcp_sock_error(pc);
+				tcp_conn_release(pc);
+				return perr ? -perr : -EPIPE;
+			}
+			tcp_conn_release(pc);
+		}
 
 		/* Send the WHOLE buffer before returning, not just the part
 		 * that happened to fit.
@@ -957,6 +1396,13 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 			return 0;
 
 		size_t total = 0;
+		/* SO_SNDTIMEO bounds the wait for room, as everywhere: on
+		 * expiry the bytes sent so far, or EAGAIN.  It was accepted
+		 * and ignored. */
+		uint64_t snd_deadline =
+			s->snd_timeout_ticks ?
+				timer_ticks() + s->snd_timeout_ticks :
+				0;
 
 		while (total < len) {
 			size_t remain = len - total;
@@ -977,7 +1423,7 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 				(conn && (conn->connect_done ||
 					  conn->state ==
 						  TCP_STATE_ESTABLISHED));
-			int nonblock = s->nonblock;
+			int nonblock = s->nonblock || (flags & MSG_DONTWAIT);
 			spin_unlock_irqrestore(&s->lock, sflags);
 			if (!conn || !connected) {
 				if (conn)
@@ -986,17 +1432,31 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 			}
 			if (conn->state != TCP_STATE_ESTABLISHED &&
 			    conn->state != TCP_STATE_CLOSE_WAIT) {
-				int err = conn->error ? -conn->error : -EPIPE;
+				/* What was queued is reported; the error, if
+				 * any, by the next call (once). */
+				int err = total ? 0 : tcp_sock_error(conn);
+
 				tcp_conn_release(conn);
-				return total ? (int)total : err;
+				return total ? (int)total : -(err ? err : EPIPE);
 			}
 
+			/* MSG_OOB: the last byte of the write is the urgent
+			 * one -- the urgent pointer goes just past it (see
+			 * tcp_send_data_urg); set by the call that carries it. */
+			int urg = (flags & MSG_OOB) && total + to_send == len;
+
 			smap_disable();
-			int ret = tcp_send_data(
-				conn, (const uint8_t *)buf + total, to_send);
+			int ret = tcp_send_data_urg(
+				conn, (const uint8_t *)buf + total, to_send, urg);
 			smap_enable();
 
 			if (ret < 0) {
+				if (ret == -EPIPE && !total) {
+					int err = tcp_sock_error(conn);
+
+					if (err)
+						ret = -err;
+				}
 				tcp_conn_release(conn);
 				return total ? (int)total : ret;
 			}
@@ -1019,6 +1479,10 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 				tcp_conn_release(conn);
 				return total ? (int)total : -EINTR;
 			}
+			if (snd_deadline && timer_ticks() >= snd_deadline) {
+				tcp_conn_release(conn);
+				return total ? (int)total : -EAGAIN;
+			}
 
 			loopback_process_pending();
 			/* Sleep until the window opens: tx_ready rising is
@@ -1027,18 +1491,16 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 			if (__atomic_load_n(&conn->tx_ready, __ATOMIC_ACQUIRE))
 				sched_yield_in_kernel();
 			else
-				sock_wait_event(s, sock_send_ready, conn, 0);
+				sock_wait_event(s, sock_send_ready, conn,
+						snd_deadline);
 			tcp_conn_release(conn);
 		}
 
 		return (int)total;
 	}
 
-	// UDP send (connected)
-	if (!s->connected)
-		return -EDESTADDRREQ;
-	return sock_sendto(sockfd, buf, len, flags, &s->remote_addr,
-			   sizeof(struct sockaddr_in));
+	// datagram sockets: to the connected peer
+	return sock_sendto(sockfd, buf, len, flags, NULL, 0);
 }
 
 /* No more data will ever arrive on this connection: the peer's FIN has been
@@ -1095,6 +1557,21 @@ int sock_recv(int sockfd, void *buf, size_t len, int flags)
 				0;
 		size_t total = 0;
 		int rc;
+
+		/* recv(MSG_OOB): the urgent byte, never waiting for it. */
+		if (flags & MSG_OOB) {
+			uint8_t byte = 0;
+			int r = tcp_recv_urg(conn, peek, &byte);
+
+			if (r == 1 && len) {
+				if (copy_to_user(buf, &byte, 1))
+					r = -EFAULT;
+			} else if (r == 1) {
+				r = 0; // no room: the byte stays (MSG_TRUNC)
+			}
+			rc = r;
+			goto recv_out;
+		}
 again:
 		while (1) {
 			uint64_t sflags;
@@ -1113,7 +1590,17 @@ again:
 			 * direction was shut down.  A connection we half
 			 * closed (FIN_WAIT_1/2) keeps waiting: the peer is
 			 * still entitled to send. */
-			if (conn->rx_ready || conn->error ||
+			/* SO_RCVLOWAT: a blocking read waits for that much
+			 * (or for what fits the buffer); a non-blocking one
+			 * takes what is there. */
+			uint32_t lowat = s->rcvlowat > 1 ? (uint32_t)s->rcvlowat :
+							   1;
+			if (lowat > len - total)
+				lowat = (uint32_t)(len - total);
+			int rx_ok = (conn->rx_ready || tcp_inq(conn) > 0) &&
+				    (nonblock || dontwait || peek ||
+				     tcp_inq(conn) >= lowat);
+			if (rx_ok || conn->error ||
 			    tcp_rx_finished(conn->state) || s->rx_shutdown)
 				break;
 			if (nonblock || dontwait) {
@@ -1139,7 +1626,7 @@ again:
 			/* Park on &conn->rx_ready instead of busy-yielding.  The previous
              * yield-based loop only checked rx_ready once per timer tick
              * (~10 ms at 100 Hz), capping throughput at ~146 KB/s for a
-             * 1460-byte MSS.  tcp_rx now sched_wake_channel(&conn->rx_ready)
+             * 1460-byte MSS.  The receive path now sched_wake_channel(&conn->rx_ready)
              * the moment data is delivered, eliminating the tick-quantum
              * latency.  Standard double-check pattern to avoid the race
              * where the waker fires between our check and our block. */
@@ -1164,7 +1651,20 @@ again:
                  * If the CAS fails the waker already claimed us and is
                  * enqueueing: wait for the entry to land and reconcile
                  * through sched_schedule (it picks us straight back). */
-				if (conn->rx_ready || conn->error ||
+				/* Waiting for more than is there: re-arm
+				 * the wake on the next arrival (the TCP
+				 * layer wakes readers on rx_ready rising).
+				 * Store, full fence, then the count: pairs
+				 * with tcp_wake_reader() (count stored, then
+				 * rx_ready exchanged), so one of the two
+				 * sides always sees the other. */
+				if (lowat > 1 && tcp_inq(conn) < lowat) {
+					__atomic_store_n(&conn->rx_ready, 0,
+							 __ATOMIC_SEQ_CST);
+					__atomic_thread_fence(__ATOMIC_SEQ_CST);
+				}
+				if (tcp_inq(conn) >= lowat ||
+				    conn->error ||
 				    tcp_rx_finished(conn->state) ||
 				    s->rx_shutdown) {
 					task_state_t expected = TASK_BLOCKED;
@@ -1194,66 +1694,36 @@ again:
 			}
 		}
 
-		if (conn->error) {
-			rc = total ? (int)total : -conn->error;
-			goto recv_out;
-		}
+		/* Data first: what arrived in order before a reset (or the
+		 * peer's FIN) is delivered before either is reported.  With
+		 * the queue empty, a pending error is returned -- once (it is
+		 * taken), unless this call already got data; after it the
+		 * connection reads end of file. */
+		if (tcp_inq(conn) == 0) {
+			if (__atomic_load_n(&conn->error, __ATOMIC_ACQUIRE)) {
+				int err = total ? 0 : tcp_sock_error(conn);
 
-		// No more data will come (peer FIN received / conn dead /
-		// SHUT_RD applied here): drain the ring, then EOF.
-		if (tcp_rx_finished(conn->state) || s->rx_shutdown) {
-			if (conn->rx_head == conn->rx_tail) {
+				rc = total ? (int)total : (err ? -err : 0);
+				goto recv_out;
+			}
+			// No more data will come (peer FIN received / conn
+			// dead / SHUT_RD applied here): end of file.
+			if (tcp_rx_finished(conn->state) || s->rx_shutdown) {
 				rc = (int)total;
 				goto recv_out;
 			}
 		}
 
-		// Copy from rx buffer
-		uint64_t cflags;
-		sock_conn_lock(&conn->lock, &cflags);
-
-		// Re-validate under conn->lock: a peer reset can NULL rx_buf.  We
-		// hold a reference so the connection object itself is valid.
-		if (!conn->active || !conn->rx_buf) {
-			sock_conn_unlock(&conn->lock, cflags);
-			rc = total ? (int)total : -EBADF;
-			goto recv_out;
-		}
-
-		uint32_t avail =
-			(conn->rx_tail - conn->rx_head + conn->rx_buf_size) %
-			conn->rx_buf_size;
-		uint32_t copy = avail;
-		if (copy > (len - total))
-			copy = (uint32_t)(len - total);
-
-		/* Bulk-copy from the rx ring to user buffer, split at the wrap
-         * boundary.  The previous per-byte loop ran with the lock held
-         * and added per-segment latency to every read(). */
+		/* Copy from the receive queue (skbs).  The TCP layer takes
+		 * its lock, frees what was read, advertises the window the
+		 * read opened and tunes the receive buffer. */
 		smap_disable();
-		if (copy > 0) {
-			uint32_t first = conn->rx_buf_size - conn->rx_head;
-			if (first > copy)
-				first = copy;
-			mm_memcpy((uint8_t *)buf + total,
-				  conn->rx_buf + conn->rx_head, first);
-			if (copy > first) {
-				mm_memcpy((uint8_t *)buf + total + first,
-					  conn->rx_buf, copy - first);
-			}
-		}
+		uint32_t copy = (uint32_t)tcp_recv_copy(
+			conn, (uint8_t *)buf + total, len - total, peek);
 		smap_enable();
-		if (!peek) {
-			conn->rx_head =
-				(conn->rx_head + copy) % conn->rx_buf_size;
-			if (conn->rx_head == conn->rx_tail)
-				conn->rx_ready = 0;
-		}
-
-		sock_conn_unlock(&conn->lock, cflags);
 
 		/* Defensive re-wait: rx_ready fired but the ring was empty (e.g. a
-         * zero-window probe arrived on a full ring — copy=0 in tcp_rx).
+         * zero-window probe arrived on a full ring — nothing queued by the receive path).
          * Returning 0 here would look like EOF to OpenSSL.  Re-enter the
          * wait loop on a blocking ESTABLISHED socket instead. */
 		if (copy == 0 &&
@@ -1267,32 +1737,11 @@ again:
 			spin_unlock_irqrestore(&s->lock, sfl);
 			if (!nb2 && !dontwait)
 				goto again;
-		}
-
-		/* Recv-side window-update ACK is only STRICTLY required when
-         * the peer is window-paused (our last-advertised window was
-         * so small that the peer has nothing to send → no incoming
-         * data → no piggy-backed window update from tcp_rx's normal
-         * every-2-segments ACK path).
-         *
-         * During a sustained download peer fills our buffer and the
-         * data ACKs that tcp_rx emits already carry our current
-         * window: emitting an additional ACK per recv() just makes
-         * the peer's TCP work harder, re-acquires conn->lock (which
-         * blocks new RX from tcp_rx for the duration of the NIC TX
-         * + IP/Eth encap), and burns NIC TX bandwidth.
-         *
-         * Heuristic: peer is "paused-ish" only when the last-advertised
-         * window was below one MSS (peer cannot send a full segment
-         * and is waiting for a window update).  In every other case
-         * the next data segment from the peer will trigger a data ACK
-         * with the latest window automatically. */
-		if (copy > 0 && !peek) {
-			uint32_t mss =
-				conn->peer_mss ? conn->peer_mss : TCP_MSS;
-			if (conn->rcv_adv_last_bytes < mss) {
-				tcp_send_window_update(conn);
-				/* rcv_adv_last_bytes is updated inside tcp_send_ack() */
+			/* Nothing to read after all (only an out-of-band
+			 * byte was queued): not end of file. */
+			if (!total) {
+				rc = -EAGAIN;
+				goto recv_out;
 			}
 		}
 
@@ -1378,14 +1827,41 @@ int sock_close(int sockfd)
 		tcp_to_teardown->owner_socket = NULL;
 	s->tcp = NULL;
 	s->closed = 1;
+	/* The delivery paths test `active' and `closed' under s->lock:
+	 * nothing is queued to the socket after this.  The slot stays
+	 * reserved (`hashed') until its teardown below is done -- for every
+	 * type, since epoll items keyed on this slot are removed below and a
+	 * new socket in it must not be seen by them. */
+	s->hashed = 1;
 	s->active = 0;
-	/* Detach the datagram queue under the lock (delivery paths test it
-	 * under s->lock), free it after. */
-	udp_rx_entry_t *rxq_free = s->udp_rx_queue;
-	s->udp_rx_queue = NULL;
 	spin_unlock_irqrestore(&s->lock, flags);
-	if (rxq_free)
-		kfree(rxq_free);
+
+	/* epoll sets watching this socket let go of it, while its poll queue
+	 * still belongs to it. */
+	eventpoll_release(MAKE_SOCKET_FD(sockfd));
+
+	/* A datagram socket leaves its lookup table, then its queues are
+	 * emptied.  The slot is not reused (sock_create) before `hashed'
+	 * is cleared at the end. */
+	if (s->type == SOCK_DGRAM)
+		udp_destroy(s);
+	else if (s->type == SOCK_RAW)
+		raw_unhash(s);
+	if (s->type != SOCK_STREAM)
+		dgram_purge(s, 0);
+	/* Group memberships end with the socket. */
+	for (int g = 0; g < NET_MAX_MCAST_GROUPS; g++) {
+		if (s->mcast_groups[g]) {
+			uint32_t grp = s->mcast_groups[g];
+			net_device_t *gdev = s->mcast_devs[g];
+
+			s->mcast_groups[g] = 0;
+			s->mcast_devs[g] = NULL;
+			if (gdev)
+				igmp_leave(gdev, grp);
+		}
+	}
+	__atomic_store_n(&s->hashed, 0, __ATOMIC_RELEASE);
 
 	// Do NOT hold s->lock across tcp_close/tcp_abort (they send FIN/RST and
 	// may free memory → TLB-shootdown IPIs).  We hold the socket reference,
@@ -1397,8 +1873,9 @@ int sock_close(int sockfd)
 		} else {
 			tcp_close(tcp_to_teardown);
 			if (do_linger_block) {
-				uint64_t deadline = timer_ticks() +
-						    (uint64_t)linger_secs * 100;
+				uint64_t deadline =
+					timer_ticks() +
+					timer_s_to_ticks(linger_secs);
 				// We hold a reference, so the deref is always
 				// memory-safe.
 				/* The socket has let go of the connection, so
@@ -1448,26 +1925,94 @@ int sock_shutdown(int sockfd, int how)
 	 * still consume inbound data, and close() later finishes an
 	 * already-closing connection harmlessly (its switch treats the
 	 * closing states as no-ops). */
-	if (s->type == SOCK_STREAM && s->tcp) {
-		tcp_conn_t *c = s->tcp;
-		if (how == SHUT_RD || how == SHUT_RDWR) {
-			s->rx_shutdown = 1;
-			/* A reader parked in sock_recv must wake to see it. */
-			sched_wake_channel((void *)&c->rx_ready);
-			poll_notify_wq(&s->poll_wq);
-		}
-		if ((how == SHUT_WR || how == SHUT_RDWR) && !s->tx_shutdown) {
-			s->tx_shutdown = 1;
-			tcp_close(c);
-		}
+	int rd = how == SHUT_RD || how == SHUT_RDWR;
+	int wr = how == SHUT_WR || how == SHUT_RDWR;
+
+	/* A datagram socket records the directions and wakes its readers
+	 * (a read then returns 0).  Not connected, it is applied all the
+	 * same, and ENOTCONN reported, as everywhere. */
+	if (s->type != SOCK_STREAM) {
+		if (rd)
+			__atomic_store_n(&s->rx_shutdown, 1, __ATOMIC_RELEASE);
+		if (wr)
+			__atomic_store_n(&s->tx_shutdown, 1, __ATOMIC_RELEASE);
+		dgram_wake(s);
+		return s->connected ? 0 : -ENOTCONN;
 	}
 
-	return 0;
+	tcp_conn_t *c = sock_tcp_get(s);
+	int ret = 0;
+
+	if (!c) {
+		/* Never connected: ENOTCONN, the directions noted all the
+		 * same (poll() reports them). */
+		if (rd)
+			__atomic_store_n(&s->rx_shutdown, 1, __ATOMIC_RELEASE);
+		if (wr)
+			__atomic_store_n(&s->tx_shutdown, 1, __ATOMIC_RELEASE);
+		poll_notify_wq(&s->poll_wq);
+		return -ENOTCONN;
+	}
+	if (s->listening) {
+		/* A listener has no sending side: SHUT_WR does nothing.  Shutting
+		 * its receiving side stops it listening, as close() would, and
+		 * a thread in accept() is woken to fail. */
+		if (rd && !s->tx_shutdown) {
+			s->rx_shutdown = 1;
+			s->tx_shutdown = 1;
+			tcp_close(c);
+			poll_notify_wq(&s->poll_wq);
+		}
+		tcp_conn_release(c);
+		return 0;
+	}
+	/* Reset, or both FINs through: the connection is gone (ENOTCONN). */
+	if (c->state == TCP_STATE_CLOSED || c->state == TCP_STATE_TIME_WAIT)
+		ret = -ENOTCONN;
+	if (rd) {
+		s->rx_shutdown = 1;
+		/* A reader parked in sock_recv must wake to see it. */
+		sched_wake_channel((void *)&c->rx_ready);
+		poll_notify_wq(&s->poll_wq);
+	}
+	if (wr && !s->tx_shutdown) {
+		s->tx_shutdown = 1;
+		if (!ret)
+			tcp_shutdown(c);
+		poll_notify_wq(&s->poll_wq);
+	}
+	tcp_conn_release(c);
+	return ret;
 }
 
 // ============================================================================
 // sock_setsockopt / sock_getsockopt
 // ============================================================================
+/* SO_RCVTIMEO / SO_SNDTIMEO value -> ticks, *out unchanged when optlen
+ * says nothing usable.  struct timeval is { int64_t tv_sec, int64_t
+ * tv_usec } = 16 bytes, converted at the calibrated tick rate.  Legacy
+ * callers passing a raw millisecond count (8 or 4 bytes) are converted
+ * the same way. */
+static void sock_parse_timeo(const void *optval, socklen_t optlen, int ival,
+			     uint64_t *out)
+{
+	uint32_t hz = timer_get_frequency();
+	if (hz == 0)
+		hz = 100;
+	if (optlen >= 2 * (int)sizeof(uint64_t)) {
+		const int64_t *tv = (const int64_t *)optval;
+		int64_t sec = tv[0] > 0 ? tv[0] : 0;
+		int64_t usec = tv[1] > 0 ? tv[1] : 0;
+		/* usec_per_tick = 1000000 / hz; avoid division: ticks =
+		 * sec*hz + usec*hz/1000000 */
+		*out = (uint64_t)sec * hz + (uint64_t)usec * hz / 1000000ULL;
+	} else if (optlen >= (int)sizeof(uint64_t)) {
+		*out = timer_ms_to_ticks(*(const uint64_t *)optval);
+	} else if (optlen >= (int)sizeof(int)) {
+		*out = timer_ms_to_ticks((uint64_t)ival);
+	}
+}
+
 int sock_setsockopt(int sockfd, int level, int optname, const void *optval,
 		    socklen_t optlen)
 {
@@ -1493,49 +2038,144 @@ int sock_setsockopt(int sockfd, int level, int optname, const void *optval,
 			s->broadcast = ival;
 			return 0;
 		case SO_OOBINLINE:
-			s->oobinline = ival;
+			s->oobinline = ival ? 1 : 0;
+			if (s->type == SOCK_STREAM) {
+				tcp_conn_t *c = sock_tcp_get(s);
+
+				if (c) {
+					tcp_set_oobinline(c, s->oobinline);
+					tcp_conn_release(c);
+				}
+			}
 			return 0;
 		case SO_KEEPALIVE:
-			if (s->tcp)
-				s->tcp->keepalive = ival ? 1 : 0;
+			s->tcp_opt_keepalive = ival ? 1 : 0;
+			s->tcp_opt_set |= SOCK_TCPOPT_KEEPALIVE;
+			if (s->type == SOCK_STREAM) {
+				tcp_conn_t *c = sock_tcp_get(s);
+
+				if (c) {
+					tcp_setsockopt_int(c, TCP_SOCKOPT_KEEPALIVE,
+							   ival ? 1 : 0);
+					tcp_conn_release(c);
+				}
+			}
 			return 0;
-		case SO_SNDBUF:
-			if (ival > 0)
-				s->sndbuf_size = (uint32_t)ival;
-			return 0;
-		case SO_RCVBUF:
-			if (ival > 0)
-				s->rcvbuf_size = (uint32_t)ival;
-			return 0;
-		case SO_RCVTIMEO: {
-			/* struct timeval is { int64_t tv_sec, int64_t tv_usec } = 16 bytes.
-             * Use the calibrated timer frequency so the timeout is correct
-             * regardless of the actual tick rate (e.g. VMware may calibrate
-             * g_frequency != 100 Hz).
-             * Legacy callers passing a raw millisecond uint64_t (<16 bytes)
-             * take a plain millisecond count, converted the same way. */
-			uint32_t hz = timer_get_frequency();
-			if (hz == 0)
-				hz = 100;
-			if (optlen >= 2 * (int)sizeof(uint64_t)) {
-				const int64_t *tv = (const int64_t *)optval;
-				int64_t sec = tv[0] > 0 ? tv[0] : 0;
-				int64_t usec = tv[1] > 0 ? tv[1] : 0;
-				/* usec_per_tick = 1000000 / hz; avoid division: ticks = sec*hz + usec*hz/1000000 */
-				s->rcv_timeout_ticks =
-					(uint64_t)sec * hz +
-					(uint64_t)usec * hz / 1000000ULL;
-			} else if (optlen >= (int)sizeof(uint64_t)) {
-				s->rcv_timeout_ticks = timer_ms_to_ticks(
-					*(const uint64_t *)optval);
-			} else if (optlen >= (int)sizeof(int)) {
-				s->rcv_timeout_ticks =
-					timer_ms_to_ticks((uint64_t)ival);
+		case SO_SNDBUF: {
+			int v = ival < 0 ? 0 :
+				ival > SOCK_WMEM_MAX ? SOCK_WMEM_MAX : ival;
+
+			s->sndbuf_size = v * 2 > SOCK_MIN_SNDBUF ?
+						 v * 2 :
+						 SOCK_MIN_SNDBUF;
+			if (s->type == SOCK_STREAM) {
+				/* Set by the application: no auto-tuning. */
+				s->sk_userlocks |= TCP_SNDBUF_LOCK;
+				tcp_conn_t *c = sock_tcp_get(s);
+
+				if (c) {
+					tcp_set_buffers(c, s->sndbuf_size, 0,
+							TCP_SNDBUF_LOCK);
+					tcp_conn_release(c);
+				}
 			}
 			return 0;
 		}
+		case SO_RCVBUF: {
+			int v = ival < 0 ? 0 :
+				ival > SOCK_RMEM_MAX ? SOCK_RMEM_MAX : ival;
+
+			s->rcvbuf_size = v * 2 > SOCK_MIN_RCVBUF ?
+						 v * 2 :
+						 SOCK_MIN_RCVBUF;
+			if (s->type == SOCK_STREAM) {
+				s->sk_userlocks |= TCP_RCVBUF_LOCK;
+				tcp_conn_t *c = sock_tcp_get(s);
+
+				if (c) {
+					tcp_set_buffers(c, 0, s->rcvbuf_size,
+							TCP_RCVBUF_LOCK);
+					tcp_conn_release(c);
+				}
+			}
+			return 0;
+		}
+		case SO_RCVLOWAT:
+			if (optlen < sizeof(int))
+				return -EINVAL;
+			/* Negative: as large as there is; 0 means 1. */
+			s->rcvlowat = ival < 0 ? 0x7fffffff : ival ? ival : 1;
+			poll_notify_wq(&s->poll_wq);
+			return 0;
+		case SO_SNDLOWAT:
+			/* Fixed at 1, and not settable, as everywhere. */
+			return -ENOPROTOOPT;
+		case SO_TIMESTAMP:
+		case SO_TIMESTAMPNS:
+			if (optlen < sizeof(int))
+				return -EINVAL;
+			/* The two are one switch: setting either picks the
+			 * format, clearing either turns time stamps off. */
+			s->rcv_tstamp = !ival ? 0 :
+					optname == SO_TIMESTAMPNS ? 2 : 1;
+			return 0;
+		case SO_MARK:
+			if (optlen < sizeof(int))
+				return -EINVAL;
+			if (!capable())
+				return -EPERM;
+			s->sk_mark = (uint32_t)ival;
+			return 0;
+		case SO_PRIORITY:
+			if (optlen < sizeof(int))
+				return -EINVAL;
+			/* 0..6 for everybody, the rest privileged. */
+			if ((ival < 0 || ival > 6) && !capable())
+				return -EPERM;
+			s->sk_priority = ival;
+			return 0;
+		case SO_PEEK_OFF:
+			/* Peeking at an offset is not implemented for any
+			 * protocol here; say so rather than ignore it. */
+			return -EOPNOTSUPP;
+		case SO_MAX_PACING_RATE: {
+			/* Bytes per second: 32 bits (~0U: no cap), or 64
+			 * with a 64-bit value.  Any value but "no cap" also
+			 * makes TCP pace the connection itself (it does not
+			 * by default). */
+			uint64_t rate;
+
+			if (!optval || optlen < sizeof(uint32_t))
+				return -EINVAL;
+			if (optlen >= sizeof(uint64_t))
+				rate = *(const uint64_t *)optval;
+			else
+				rate = *(const uint32_t *)optval == ~0U ?
+					       ~0ULL :
+					       *(const uint32_t *)optval;
+			s->max_pacing_rate = rate;
+			if (rate != ~0ULL)
+				s->pacing_set = 1;
+			if (s->type == SOCK_STREAM && s->pacing_set) {
+				tcp_conn_t *c = sock_tcp_get(s);
+
+				if (c) {
+					tcp_set_max_pacing_rate(c, rate);
+					tcp_conn_release(c);
+				}
+			}
+			return 0;
+		}
+		case SO_RCVTIMEO:
+			sock_parse_timeo(optval, optlen, ival,
+					 &s->rcv_timeout_ticks);
+			return 0;
 		case SO_SNDTIMEO:
-			return 0; // accepted; not enforced
+			/* Bounds blocking send() and connect() -- see
+			 * sock_send() and sock_connect_wait(). */
+			sock_parse_timeo(optval, optlen, ival,
+					 &s->snd_timeout_ticks);
+			return 0;
 		case SO_LINGER: {
 			if (optlen >= sizeof(struct linger)) {
 				const struct linger *l =
@@ -1547,11 +2187,39 @@ int sock_setsockopt(int sockfd, int level, int optname, const void *optval,
 		}
 		case SO_BINDTODEVICE: {
 			socklen_t n = optlen;
+			char name[16];
+			net_device_t *bd = NULL;
+
 			if (n > 15)
 				n = 15;
 			for (socklen_t i = 0; i < n; i++)
-				s->bindtodevice[i] = ((const char *)optval)[i];
-			s->bindtodevice[n] = 0;
+				name[i] = ((const char *)optval)[i];
+			name[n] = 0;
+			if (name[0]) {
+				// a device of that name, or ENODEV
+				net_device_t *lo = net_get_loopback();
+				int cnt = net_device_count();
+
+				for (int d = -1; d < cnt && !bd; d++) {
+					net_device_t *dd =
+						d < 0 ? lo : net_get_device(d);
+					int k = 0;
+
+					if (!dd || !dd->name)
+						continue;
+					while (k < 15 && name[k] &&
+					       dd->name[k] == name[k])
+						k++;
+					if (name[k] == 0 && dd->name[k] == 0)
+						bd = dd;
+				}
+				if (!bd)
+					return -ENODEV;
+			}
+			mm_memset(s->bindtodevice, 0, sizeof(s->bindtodevice));
+			for (socklen_t i = 0; i < n; i++)
+				s->bindtodevice[i] = name[i];
+			s->bound_ifindex = bd ? bd->ifindex : 0;
 			return 0;
 		}
 		default:
@@ -1562,8 +2230,12 @@ int sock_setsockopt(int sockfd, int level, int optname, const void *optval,
 	if (level == SOL_IP || level == IPPROTO_IP) {
 		switch (optname) {
 		case IP_TTL:
-			if (ival > 0 && ival < 256)
-				s->ip_ttl = (uint8_t)ival;
+			// -1: the default; otherwise 1..255
+			if (ival == -1)
+				ival = 64;
+			if (ival < 1 || ival > 255)
+				return -EINVAL;
+			s->ip_ttl = (uint8_t)ival;
 			return 0;
 		case IP_TOS:
 			s->ip_tos = (uint8_t)ival;
@@ -1581,39 +2253,86 @@ int sock_setsockopt(int sockfd, int level, int optname, const void *optval,
 			s->ip_recvtos = ival ? 1 : 0;
 			return 0;
 		case IP_MTU_DISCOVER:
-			return 0; // accepted; we only do PMTUD
+			if (ival < IP_PMTUDISC_DONT || ival > IP_PMTUDISC_OMIT)
+				return -EINVAL;
+			s->pmtudisc = (uint8_t)ival;
+			return 0;
+		case IP_RECVERR:
+			s->ip_recverr = ival ? 1 : 0;
+			if (!ival)
+				dgram_purge(s, 1); // what was queued goes
+			return 0;
+		case IP_MULTICAST_ALL:
+			s->mc_all = ival ? 1 : 0;
+			return 0;
 		case IP_OPTIONS:
 			return 0; // accepted; not emitted
 		case IP_MULTICAST_TTL:
-			s->mcast_ttl = (uint8_t)(ival & 0xFF);
+			// -1: the default (1); otherwise 0..255
+			if (optlen >= sizeof(int)) {
+				if (ival == -1)
+					ival = 1;
+				if (ival < 0 || ival > 255)
+					return -EINVAL;
+			} else if (optval && optlen >= 1) {
+				ival = *(const uint8_t *)optval;
+			}
+			s->mcast_ttl = (uint8_t)ival;
 			return 0;
 		case IP_MULTICAST_LOOP:
 			s->mcast_loop = ival ? 1 : 0;
 			return 0;
-		case IP_MULTICAST_IF:
-			if (optlen >= sizeof(uint32_t))
-				s->mcast_if =
-					net_ntohl(*(const uint32_t *)optval);
+		case IP_MULTICAST_IF: {
+			uint32_t a;
+
+			if (optlen < sizeof(uint32_t))
+				return -EINVAL;
+			/* struct in_addr, or struct ip_mreq(n) whose second
+			 * field is the interface address */
+			a = net_ntohl(((const uint32_t *)optval)[
+				optlen >= 2 * sizeof(uint32_t) ? 1 : 0]);
+			if (a && !ip_dev_by_addr(a))
+				return -EADDRNOTAVAIL;
+			s->mcast_if = a;
 			return 0;
+		}
 		case IP_ADD_MEMBERSHIP: {
 			if (optlen < sizeof(struct ip_mreq))
 				return -EINVAL;
 			const struct ip_mreq *mr =
 				(const struct ip_mreq *)optval;
 			uint32_t group = net_ntohl(mr->imr_multiaddr.s_addr);
+			uint32_t ifa = net_ntohl(mr->imr_interface.s_addr);
+			net_device_t *dev;
+			int rc;
+
+			if ((group >> 28) != 0xE)
+				return -EINVAL;
+			/* the interface with that address, or the default
+			 * one (the loopback device on a machine without) */
+			dev = ifa ? ip_dev_by_addr(ifa) :
+				    net_get_default_device();
+			if (!dev && !ifa)
+				dev = net_get_loopback();
+			if (!dev)
+				return ifa ? -EADDRNOTAVAIL : -ENODEV;
 			// Track on socket so we can leave on close.
 			int slot = -1;
 			for (int i = 0; i < NET_MAX_MCAST_GROUPS; i++) {
-				if (s->mcast_groups[i] == group)
-					return 0;
+				if (s->mcast_groups[i] == group &&
+				    s->mcast_devs[i] == dev)
+					return -EADDRINUSE;
 				if (slot < 0 && s->mcast_groups[i] == 0)
 					slot = i;
 			}
 			if (slot < 0)
 				return -ENOBUFS;
+			rc = igmp_join(dev, group);
+			if (rc < 0)
+				return rc;
 			s->mcast_groups[slot] = group;
-			net_device_t *dev = net_get_default_device();
-			return igmp_join(dev, group);
+			s->mcast_devs[slot] = dev;
+			return 0;
 		}
 		case IP_DROP_MEMBERSHIP: {
 			if (optlen < sizeof(struct ip_mreq))
@@ -1621,12 +2340,17 @@ int sock_setsockopt(int sockfd, int level, int optname, const void *optval,
 			const struct ip_mreq *mr =
 				(const struct ip_mreq *)optval;
 			uint32_t group = net_ntohl(mr->imr_multiaddr.s_addr);
+			uint32_t ifa = net_ntohl(mr->imr_interface.s_addr);
+			net_device_t *want = ifa ? ip_dev_by_addr(ifa) : NULL;
+
 			for (int i = 0; i < NET_MAX_MCAST_GROUPS; i++) {
-				if (s->mcast_groups[i] == group) {
+				if (s->mcast_groups[i] == group &&
+				    (!want || s->mcast_devs[i] == want)) {
+					net_device_t *dev = s->mcast_devs[i];
+
 					s->mcast_groups[i] = 0;
-					net_device_t *dev =
-						net_get_default_device();
-					return igmp_leave(dev, group);
+					s->mcast_devs[i] = NULL;
+					return dev ? igmp_leave(dev, group) : 0;
 				}
 			}
 			return -EADDRNOTAVAIL;
@@ -1636,32 +2360,98 @@ int sock_setsockopt(int sockfd, int level, int optname, const void *optval,
 		}
 	}
 
+	if (level == SOL_UDP) {
+		if (s->type != SOCK_DGRAM)
+			return -ENOPROTOOPT;
+		return udp_setsockopt(s, optname, ival);
+	}
+
 	if (level == SOL_TCP || level == IPPROTO_TCP) {
 		if (s->type != SOCK_STREAM)
 			return -ENOPROTOOPT;
+		/* Stored on the socket as well as applied to a connection
+		 * that already exists, so a value set before connect() or
+		 * listen() takes effect there -- see sock_apply_tcp_opts(). */
 		switch (optname) {
-		case TCP_NODELAY:
-			if (s->tcp)
-				s->tcp->nodelay = ival ? 1 : 0;
+		case TCP_NODELAY: {
+			tcp_conn_t *c = sock_tcp_get(s);
+
+			s->tcp_opt_nodelay = ival ? 1 : 0;
+			s->tcp_opt_set |= SOCK_TCPOPT_NODELAY;
+			if (c) {
+				tcp_setsockopt_int(c, TCP_NODELAY, ival ? 1 : 0);
+				tcp_conn_release(c);
+			}
 			return 0;
+		}
+		case TCP_CORK: {
+			tcp_conn_t *c = sock_tcp_get(s);
+
+			s->tcp_opt_cork = ival ? 1 : 0;
+			s->tcp_opt_set |= SOCK_TCPOPT_CORK;
+			if (c) {
+				tcp_set_cork(c, ival);
+				tcp_conn_release(c);
+			}
+			return 0;
+		}
 		case TCP_KEEPIDLE:
-			if (s->tcp && ival > 0)
-				s->tcp->keepidle_ticks =
-					(uint32_t)timer_s_to_ticks(
-						(uint64_t)ival);
-			return 0;
 		case TCP_KEEPINTVL:
-			if (s->tcp && ival > 0)
-				s->tcp->keepintvl_ticks =
-					(uint32_t)timer_s_to_ticks(
-						(uint64_t)ival);
+		case TCP_KEEPCNT: {
+			/* Range as everywhere: 1 .. 32767 seconds, 1 .. 127
+			 * probes; anything else is EINVAL, not silence. */
+			if (optlen < sizeof(int) || ival < 1 ||
+			    ival > (optname == TCP_KEEPCNT ? 127 : 32767))
+				return -EINVAL;
+			uint32_t t = (uint32_t)timer_s_to_ticks((uint64_t)ival);
+			if (optname == TCP_KEEPIDLE) {
+				s->tcp_opt_keepidle_ticks = t;
+				s->tcp_opt_set |= SOCK_TCPOPT_KEEPIDLE;
+			} else if (optname == TCP_KEEPINTVL) {
+				s->tcp_opt_keepintvl_ticks = t;
+				s->tcp_opt_set |= SOCK_TCPOPT_KEEPINTVL;
+			} else {
+				s->tcp_opt_keepcnt = (uint32_t)ival;
+				s->tcp_opt_set |= SOCK_TCPOPT_KEEPCNT;
+			}
+			/* The connection's copy under its lock (a new idle
+			 * time re-arms the keepalive timer there). */
+			{
+				tcp_conn_t *c = sock_tcp_get(s);
+
+				if (c) {
+					tcp_setsockopt_int(c, optname, ival);
+					tcp_conn_release(c);
+				}
+			}
 			return 0;
-		case TCP_KEEPCNT:
-			if (s->tcp && ival > 0)
-				s->tcp->keepcnt = (uint8_t)ival;
-			return 0;
+		}
 		case TCP_MAXSEG:
-			return 0;
+		case TCP_QUICKACK:
+		case TCP_USER_TIMEOUT:
+		case TCP_NOTSENT_LOWAT:
+		case TCP_DEFER_ACCEPT:
+		case TCP_LINGER2:
+		case TCP_SYNCNT:
+		case TCP_WINDOW_CLAMP:
+			if (optlen < sizeof(int))
+				return -EINVAL;
+			return sock_tcp_xopt_set(s, optname, ival);
+		case TCP_CONGESTION: {
+			/* The name, up to TCP_CA_NAME_MAX - 1 characters
+			 * (it need not be terminated). */
+			int id;
+
+			if (!optval || optlen < 1)
+				return -EINVAL;
+			id = tcp_ca_find((const char *)optval,
+					 optlen < TCP_CA_NAME_MAX - 1 ?
+						 (size_t)optlen :
+						 TCP_CA_NAME_MAX - 1);
+			if (id < 0)
+				return id;
+			return sock_tcp_xopt_set(s, TCP_CONGESTION, id);
+		}
 		default:
 			return -ENOPROTOOPT;
 		}
@@ -1683,22 +2473,32 @@ int sock_getsockopt(int sockfd, int level, int optname, void *optval,
 		switch (optname) {
 		case SO_ERROR:
 			if (*optlen >= sizeof(int)) {
-				int e = s->error;
-				// For non-blocking connect: conn->error holds the TCP-level
-				// result (ECONNREFUSED, ETIMEDOUT, …) while s->error stays 0.
-				// POSIX requires getsockopt(SO_ERROR) to return that error.
-				if (e == 0 && s->tcp)
-					e = s->tcp->error;
+				tcp_conn_t *c = s->type == SOCK_STREAM ?
+							sock_tcp_get(s) :
+							NULL;
+				int e = __atomic_exchange_n(&s->error, 0,
+							    __ATOMIC_ACQ_REL);
+
+				/* The connection's hard error (a non-blocking
+				 * connect's ECONNREFUSED, ETIMEDOUT, a reset),
+				 * taken: reported once.  Without one, the soft
+				 * error an ICMP message left (tcp_icmp_error),
+				 * also taken. */
+				if (e == 0 && c)
+					e = tcp_sock_error(c);
+				if (e == 0 && c)
+					e = __atomic_exchange_n(&c->soft_error, 0,
+								__ATOMIC_ACQ_REL);
 				*(int *)optval = e;
-				s->error = 0;
-				if (s->tcp)
-					s->tcp->error = 0;
 				// If the non-blocking connect completed successfully, mark
 				// the socket connected so sock_send() works.
-				if (e == 0 && s->tcp &&
-				    s->tcp->state == TCP_STATE_ESTABLISHED &&
+				if (e == 0 && c &&
+				    __atomic_load_n(&c->state, __ATOMIC_ACQUIRE) ==
+					    TCP_STATE_ESTABLISHED &&
 				    !s->connected)
 					s->connected = 1;
+				if (c)
+					tcp_conn_release(c);
 				*optlen = sizeof(int);
 			}
 			return 0;
@@ -1713,6 +2513,43 @@ int sock_getsockopt(int sockfd, int level, int optname, void *optval,
 			if (*optlen >= sizeof(int)) {
 				*(int *)optval = s->listening ? 1 : 0;
 				*optlen = sizeof(int);
+			}
+			return 0;
+		case SO_PROTOCOL:
+		case SO_DOMAIN:
+		case SO_RCVLOWAT:
+		case SO_SNDLOWAT:
+		case SO_TIMESTAMP:
+		case SO_TIMESTAMPNS:
+		case SO_MARK:
+		case SO_PRIORITY: {
+			int v = optname == SO_PROTOCOL ? s->protocol :
+				optname == SO_DOMAIN   ? s->domain :
+				optname == SO_RCVLOWAT ? s->rcvlowat :
+				optname == SO_SNDLOWAT ? 1 :
+				optname == SO_TIMESTAMP ? s->rcv_tstamp == 1 :
+				optname == SO_TIMESTAMPNS ?
+							 s->rcv_tstamp == 2 :
+				optname == SO_MARK ? (int)s->sk_mark :
+							 s->sk_priority;
+			if (*optlen >= sizeof(int)) {
+				*(int *)optval = v;
+				*optlen = sizeof(int);
+			}
+			return 0;
+		}
+		case SO_PEEK_OFF:
+			return -EOPNOTSUPP;
+		case SO_MAX_PACING_RATE:
+			if (*optlen >= sizeof(uint64_t)) {
+				*(uint64_t *)optval = s->max_pacing_rate;
+				*optlen = sizeof(uint64_t);
+			} else if (*optlen >= sizeof(uint32_t)) {
+				*(uint32_t *)optval =
+					s->max_pacing_rate > ~0U ?
+						~0U :
+						(uint32_t)s->max_pacing_rate;
+				*optlen = sizeof(uint32_t);
 			}
 			return 0;
 		case SO_REUSEADDR:
@@ -1731,9 +2568,29 @@ int sock_getsockopt(int sockfd, int level, int optname, void *optval,
 		}
 		case SO_KEEPALIVE:
 			if (*optlen >= sizeof(int)) {
-				*(int *)optval =
-					(s->tcp && s->tcp->keepalive) ? 1 : 0;
+				tcp_conn_t *c = s->type == SOCK_STREAM ?
+							sock_tcp_get(s) :
+							NULL;
+
+				*(int *)optval = c ? (c->keepalive ? 1 : 0) :
+						     s->tcp_opt_keepalive;
+				if (c)
+					tcp_conn_release(c);
 				*optlen = sizeof(int);
+			}
+			return 0;
+		case SO_RCVTIMEO:
+		case SO_SNDTIMEO:
+			if (*optlen >= 2 * sizeof(int64_t)) {
+				uint64_t t = optname == SO_RCVTIMEO ?
+						     s->rcv_timeout_ticks :
+						     s->snd_timeout_ticks;
+				uint64_t us = t * timer_us_per_tick();
+				int64_t *tv = (int64_t *)optval;
+
+				tv[0] = (int64_t)(us / 1000000ULL);
+				tv[1] = (int64_t)(us % 1000000ULL);
+				*optlen = 2 * sizeof(int64_t);
 			}
 			return 0;
 		case SO_SNDBUF:
@@ -1793,47 +2650,202 @@ int sock_getsockopt(int sockfd, int level, int optname, void *optval,
 				*optlen = sizeof(int);
 			}
 			return 0;
+		case IP_MTU_DISCOVER:
+		case IP_RECVERR:
+		case IP_PKTINFO:
+		case IP_RECVTTL:
+		case IP_RECVTOS:
+		case IP_MULTICAST_ALL:
+			if (*optlen >= sizeof(int)) {
+				*(int *)optval =
+					optname == IP_MTU_DISCOVER ? s->pmtudisc :
+					optname == IP_RECVERR	  ? s->ip_recverr :
+					optname == IP_PKTINFO	  ? s->ip_recvpktinfo :
+					optname == IP_RECVTTL	  ? s->ip_recvttl :
+					optname == IP_RECVTOS	  ? s->ip_recvtos :
+								    s->mc_all;
+				*optlen = sizeof(int);
+			}
+			return 0;
+		case IP_MULTICAST_IF:
+			if (*optlen >= sizeof(uint32_t)) {
+				*(uint32_t *)optval = net_htonl(s->mcast_if);
+				*optlen = sizeof(uint32_t);
+			}
+			return 0;
+		case IP_MTU: {
+			/* The path MTU towards the connected peer. */
+			struct ip_route rt;
+			uint32_t mtu;
+
+			if (!s->connected)
+				return -ENOTCONN;
+			if (ip_route_out(net_ntohl(s->remote_addr.sin_addr
+							   .s_addr),
+					 0, NULL, &rt) < 0)
+				return -ENOTCONN;
+			mtu = rt.mtu;
+			ip_route_put(&rt);
+			if (*optlen >= sizeof(int)) {
+				*(int *)optval = (int)mtu;
+				*optlen = sizeof(int);
+			}
+			return 0;
+		}
 		default:
 			return -ENOPROTOOPT;
 		}
 	}
 
+	if (level == SOL_UDP) {
+		int v = 0, rc;
+
+		if (s->type != SOCK_DGRAM)
+			return -ENOPROTOOPT;
+		rc = udp_getsockopt(s, optname, &v);
+		if (rc == 0 && *optlen >= sizeof(int)) {
+			*(int *)optval = v;
+			*optlen = sizeof(int);
+		}
+		return rc;
+	}
+
 	if (level == SOL_TCP || level == IPPROTO_TCP) {
 		if (s->type != SOCK_STREAM)
 			return -ENOPROTOOPT;
+		/* The connection is read with a reference held: a sibling
+		 * thread's failed connect() may detach and release it
+		 * (sock_connect_finish) at any moment. */
 		switch (optname) {
 		case TCP_NODELAY:
 			if (*optlen >= sizeof(int)) {
+				tcp_conn_t *c = sock_tcp_get(s);
+
 				*(int *)optval =
-					(s->tcp && s->tcp->nodelay) ? 1 : 0;
+					c ? (c->nodelay ? 1 : 0) :
+					(s->tcp_opt_set & SOCK_TCPOPT_NODELAY) ?
+						 s->tcp_opt_nodelay :
+						 1; // the connection default
+				if (c)
+					tcp_conn_release(c);
 				*optlen = sizeof(int);
 			}
 			return 0;
-		case TCP_INFO:
-			if (!s->tcp)
+		case TCP_CORK:
+			if (*optlen >= sizeof(int)) {
+				tcp_conn_t *c = sock_tcp_get(s);
+
+				*(int *)optval = c ? (c->cork ? 1 : 0) :
+						     s->tcp_opt_cork;
+				if (c)
+					tcp_conn_release(c);
+				*optlen = sizeof(int);
+			}
+			return 0;
+		case TCP_INFO: {
+			/* As much of the struct as the caller has room for:
+			 * a program built against a shorter struct gets its
+			 * prefix. */
+			struct tcp_info ti;
+			socklen_t n;
+			tcp_conn_t *c = sock_tcp_get(s);
+
+			if (!c)
 				return -ENOTCONN;
-			if (*optlen < sizeof(struct tcp_info))
-				return -EINVAL;
-			tcp_fill_info(s->tcp, (struct tcp_info *)optval);
-			*optlen = sizeof(struct tcp_info);
+			tcp_fill_info(c, &ti);
+			tcp_conn_release(c);
+			n = *optlen < (socklen_t)sizeof(ti) ? *optlen :
+							      (socklen_t)sizeof(ti);
+			if (n && optval)
+				mm_memcpy(optval, &ti, (size_t)n);
+			*optlen = n;
 			return 0;
+		}
+		case TCP_CONGESTION: {
+			char name[TCP_CA_NAME_MAX];
+			const char *cur;
+			socklen_t n;
+			tcp_conn_t *c = sock_tcp_get(s);
+
+			if (c) {
+				cur = tcp_ca_name(tcp_ca_id(c));
+				tcp_conn_release(c);
+			} else {
+				cur = tcp_ca_name(sock_tcp_xopt_get(
+					s, TCP_CONGESTION, 0));
+			}
+			mm_memset(name, 0, sizeof(name));
+			for (int i = 0; cur[i] && i < TCP_CA_NAME_MAX - 1; i++)
+				name[i] = cur[i];
+			n = *optlen < (socklen_t)sizeof(name) ? *optlen :
+								(socklen_t)sizeof(name);
+			if (n && optval)
+				mm_memcpy(optval, name, (size_t)n);
+			*optlen = n;
+			return 0;
+		}
+		/* Before a connection exists: the value set on the socket,
+		 * or the default a connection would get. */
 		case TCP_KEEPIDLE:
-			if (*optlen >= sizeof(int) && s->tcp) {
-				*(int *)optval = (int)timer_ticks_to_s(
-					s->tcp->keepidle_ticks);
-				*optlen = sizeof(int);
-			}
-			return 0;
 		case TCP_KEEPINTVL:
-			if (*optlen >= sizeof(int) && s->tcp) {
-				*(int *)optval = (int)timer_ticks_to_s(
-					s->tcp->keepintvl_ticks);
+		case TCP_KEEPCNT:
+			if (*optlen >= sizeof(int)) {
+				tcp_conn_t *c = sock_tcp_get(s);
+				int v;
+
+				if (optname == TCP_KEEPIDLE)
+					v = c ? (int)timer_ticks_to_s(
+							c->keepidle_ticks) :
+					    (s->tcp_opt_set & SOCK_TCPOPT_KEEPIDLE) ?
+						(int)timer_ticks_to_s(
+							s->tcp_opt_keepidle_ticks) :
+						7200;
+				else if (optname == TCP_KEEPINTVL)
+					v = c ? (int)timer_ticks_to_s(
+							c->keepintvl_ticks) :
+					    (s->tcp_opt_set & SOCK_TCPOPT_KEEPINTVL) ?
+						(int)timer_ticks_to_s(
+							s->tcp_opt_keepintvl_ticks) :
+						75;
+				else
+					v = c ? (int)c->keepcnt :
+					    (s->tcp_opt_set & SOCK_TCPOPT_KEEPCNT) ?
+						(int)s->tcp_opt_keepcnt :
+						9;
+				if (c)
+					tcp_conn_release(c);
+				*(int *)optval = v;
 				*optlen = sizeof(int);
 			}
 			return 0;
-		case TCP_KEEPCNT:
-			if (*optlen >= sizeof(int) && s->tcp) {
-				*(int *)optval = (int)s->tcp->keepcnt;
+		case TCP_MAXSEG:
+		case TCP_QUICKACK:
+		case TCP_USER_TIMEOUT:
+		case TCP_NOTSENT_LOWAT:
+		case TCP_DEFER_ACCEPT:
+		case TCP_LINGER2:
+		case TCP_SYNCNT:
+		case TCP_WINDOW_CLAMP:
+			if (*optlen < sizeof(int))
+				return -EINVAL;
+			{
+				int v = 0, rc = -ENOTCONN;
+				tcp_conn_t *c = sock_tcp_get(s);
+
+				if (c) {
+					rc = tcp_getsockopt_int(c, optname, &v);
+					tcp_conn_release(c);
+				}
+				if (rc < 0) {
+					// no connection: the value it would get
+					int def = optname == TCP_MAXSEG	 ? 536 :
+						  optname == TCP_SYNCNT	 ? 6 :
+						  optname == TCP_LINGER2 ? 60 :
+						  optname == TCP_QUICKACK ? 1 :
+									   0;
+					v = sock_tcp_xopt_get(s, optname, def);
+				}
+				*(int *)optval = v;
 				*optlen = sizeof(int);
 			}
 			return 0;
@@ -1846,55 +2858,6 @@ int sock_getsockopt(int sockfd, int level, int optname, void *optval,
 }
 
 // ============================================================================
-// raw_socket_deliver - hand a copy of an inbound IPv4 packet to every
-// SOCK_RAW socket whose protocol matches (or IPPROTO_RAW).  Called by ipv4_rx
-// before the normal demux.
-// ============================================================================
-void raw_socket_deliver(uint32_t src_ip, uint32_t dst_ip, uint8_t protocol,
-			const uint8_t *packet, uint16_t total_len)
-{
-	(void)dst_ip;
-	for (int i = 0; i < NET_MAX_SOCKETS; i++) {
-		net_socket_t *s = &sockets[i];
-		if (!s->active || s->type != SOCK_RAW)
-			continue;
-		if (s->protocol != protocol && s->protocol != IPPROTO_RAW)
-			continue;
-
-		uint64_t flags;
-		spin_lock_irqsave(&s->lock, &flags);
-
-		if (!s->udp_rx_queue) {
-			spin_unlock_irqrestore(&s->lock, flags);
-			continue; // socket being torn down
-		}
-		int next = (s->udp_rx_tail + 1) % 16;
-		if (next == s->udp_rx_head) {
-			spin_unlock_irqrestore(&s->lock, flags);
-			continue; // queue full, drop
-		}
-		uint16_t copy = total_len;
-		if (copy > sizeof(s->udp_rx_queue[0].data))
-			copy = sizeof(s->udp_rx_queue[0].data);
-		for (uint16_t b = 0; b < copy; b++)
-			s->udp_rx_queue[s->udp_rx_tail].data[b] = packet[b];
-		s->udp_rx_queue[s->udp_rx_tail].len = copy;
-		s->udp_rx_queue[s->udp_rx_tail].from.sin_family = AF_INET;
-		s->udp_rx_queue[s->udp_rx_tail].from.sin_port = 0;
-		s->udp_rx_queue[s->udp_rx_tail].from.sin_addr.s_addr =
-			net_htonl(src_ip);
-		s->udp_rx_tail = next;
-		s->udp_rx_ready = 1;
-
-		spin_unlock_irqrestore(&s->lock, flags);
-		/* Wake a receiver parked on this RAW socket (see sock_recvfrom),
-		 * and whoever polls it. */
-		sched_wake_channel((void *)&s->udp_rx_ready);
-		poll_notify_wq(&s->poll_wq);
-	}
-}
-
-// ============================================================================
 // sock_getpeername / sock_getsockname
 // ============================================================================
 int sock_getpeername(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen)
@@ -1904,6 +2867,24 @@ int sock_getpeername(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen)
 	net_socket_t *s = &sockets[sockfd];
 	if (!s->active)
 		return -EBADF;
+	/* A non-blocking connect() never comes back to set `connected': the
+	 * connection completes in the background and the program learns of
+	 * it from poll().  It used to stay ENOTCONN here until SO_ERROR was
+	 * read, which many programs never do.  The peer is known once the
+	 * handshake got past SYN_SENT, as it is everywhere. */
+	if (!s->connected && s->type == SOCK_STREAM && !s->listening) {
+		tcp_conn_t *c = sock_tcp_get(s);
+
+		if (c) {
+			int st = __atomic_load_n(&c->state, __ATOMIC_ACQUIRE);
+
+			if (st != TCP_STATE_SYN_SENT && st != TCP_STATE_CLOSED &&
+			    st != TCP_STATE_LISTEN && c->connect_done &&
+			    !c->error)
+				s->connected = 1;
+			tcp_conn_release(c);
+		}
+	}
 	if (!s->connected)
 		return -ENOTCONN;
 
@@ -1932,54 +2913,32 @@ int sock_getsockname(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen)
 // ============================================================================
 // sock_get - Get socket structure by index (for external use)
 // ============================================================================
+int sock_tryhold(int sockfd)
+{
+	int old;
+
+	if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS)
+		return 0;
+	/* ref_count reaches 0 exactly once per socket (sock_close, which then
+	 * tears it down); taking a reference only while it is above 0 can
+	 * never revive one being torn down, and needs no lock. */
+	old = __atomic_load_n(&sockets[sockfd].ref_count, __ATOMIC_RELAXED);
+	while (old > 0) {
+		if (__atomic_compare_exchange_n(&sockets[sockfd].ref_count,
+						&old, old + 1, false,
+						__ATOMIC_ACQ_REL,
+						__ATOMIC_RELAXED))
+			return 1;
+	}
+	return 0;
+}
+
 net_socket_t *sock_get(int sockfd)
 {
 	if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS)
 		return NULL;
 	net_socket_t *s = &sockets[sockfd];
 	return s->active ? s : NULL;
-}
-
-// ============================================================================
-// sock_post_icmp_error — set error on a socket matching the 4-tuple
-// ============================================================================
-void sock_post_icmp_error(uint8_t proto, uint32_t src_ip, uint16_t src_port,
-			  uint32_t dst_ip, uint16_t dst_port, int error)
-{
-	int wanted_type = (proto == IP_PROTO_TCP) ? SOCK_STREAM : SOCK_DGRAM;
-	for (int i = 0; i < NET_MAX_SOCKETS; i++) {
-		net_socket_t *s = &sockets[i];
-		if (!s->active || s->type != wanted_type)
-			continue;
-		// local side: src_ip/src_port from the original outbound packet
-		if (net_ntohs(s->local_addr.sin_port) != src_port)
-			continue;
-		if (s->local_addr.sin_addr.s_addr != 0 &&
-		    net_ntohl(s->local_addr.sin_addr.s_addr) != src_ip)
-			continue;
-		if (s->connected) {
-			if (net_ntohs(s->remote_addr.sin_port) != dst_port)
-				continue;
-			if (net_ntohl(s->remote_addr.sin_addr.s_addr) != dst_ip)
-				continue;
-		}
-		s->error = error;
-		s->udp_rx_ready = 1; // wake any blocked recv
-		if (proto == IP_PROTO_TCP && s->tcp) {
-			s->tcp->error = error;
-			s->tcp->rx_ready = 1;
-			s->tcp->tx_ready = 1;
-			s->tcp->connect_done = 1;
-		}
-		/* A UDP recv now parks on &s->udp_rx_ready rather than
-		 * busy-polling, so an error posted here must wake it or it
-		 * would sleep through the failure until its timeout. */
-		if (wanted_type == SOCK_DGRAM)
-			sched_wake_channel((void *)&s->udp_rx_ready);
-		/* ...and a poller: the socket is now readable and in error --
-		 * a non-blocking connect() waiting for POLLOUT included. */
-		poll_notify_wq(&s->poll_wq);
-	}
 }
 
 // ============================================================================
@@ -2006,6 +2965,39 @@ int sock_socketpair(int domain, int type, int protocol, int sv[2])
 
 	net_socket_t *s0 = &sockets[fd0];
 	net_socket_t *s1 = &sockets[fd1];
+
+	if (real_type == SOCK_DGRAM) {
+		/* Two UDP sockets on 127.0.0.1, each connected to the other
+		 * (each bind reserves its own port, so the two differ). */
+		struct sockaddr_in a0, a1;
+		int rc;
+
+		mm_memset(&a0, 0, sizeof(a0));
+		a0.sin_family = AF_INET;
+		a0.sin_addr.s_addr = net_htonl(0x7F000001);
+		a1 = a0;
+		rc = udp_bind(s0, &a0);
+		if (rc == 0)
+			rc = udp_bind(s1, &a1);
+		a0.sin_port = s0->local_addr.sin_port;
+		a1.sin_port = s1->local_addr.sin_port;
+		if (rc == 0)
+			rc = udp_connect(s0, &a1);
+		if (rc == 0)
+			rc = udp_connect(s1, &a0);
+		if (rc < 0) {
+			sock_close(fd0);
+			sock_close(fd1);
+			return rc;
+		}
+		if (type & SOCK_NONBLOCK) {
+			s0->nonblock = 1;
+			s1->nonblock = 1;
+		}
+		sv[0] = fd0;
+		sv[1] = fd1;
+		return 0;
+	}
 
 	// Reserve each local port with alloc_ephemeral_port(), which publishes
 	// sin_port+bound on the socket under the port lock before returning.
@@ -2052,6 +3044,8 @@ int sock_socketpair(int domain, int type, int protocol, int sv[2])
 int sock_accept4(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen,
 		 int flags)
 {
+	if (flags & ~(SOCK_NONBLOCK | SOCK_CLOEXEC))
+		return -EINVAL;
 	int newfd = sock_accept(sockfd, addr, addrlen);
 	if (newfd < 0)
 		return newfd;
@@ -2070,54 +3064,126 @@ int sock_accept4(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen,
 // ============================================================================
 // sock_sendmsg - Send message with scatter/gather
 // ============================================================================
+/* The most one sendmsg/recvmsg moves, as for read()/write(). */
+#define SOCK_MSG_MAX_BYTES 0x7FFFF000UL
+
+/* msg->msg_iov is the syscall layer's KERNEL copy of the iovec array
+ * (msghdr_prepare()); the buffers it points to, msg_name and msg_control
+ * are user memory, each range already validated.
+ *
+ * Both directions used to bounce through a 2048-byte stack buffer and
+ * silently cut every message to that size: a 64 KB write() through
+ * sendmsg() sent 2 KB and reported 2 KB, a UDP datagram larger than 2 KB
+ * went out truncated, and recvmsg() never returned more than 2 KB of
+ * anything. */
 int sock_sendmsg(int sockfd, const struct msghdr *msg, int flags)
 {
 	if (!msg)
 		return -EINVAL;
+	net_socket_t *s = sock_get(sockfd);
+	if (!s)
+		return -EBADF;
 
-	// Calculate total length from iovec
 	size_t total = 0;
-	smap_disable();
-	for (int i = 0; i < msg->msg_iovlen; i++)
-		total += msg->msg_iov[i].iov_len;
+	for (int i = 0; i < msg->msg_iovlen; i++) {
+		size_t l = msg->msg_iov[i].iov_len;
 
-	if (total == 0) {
-		smap_enable(); /* not left open on the way out */
-		return 0;
+		if (l > SOCK_MSG_MAX_BYTES - total)
+			return -EINVAL;
+		total += l;
 	}
 
-	// Copy scatter buffers into a single contiguous buffer
-	uint8_t buf[2048];
-	if (total > sizeof(buf))
-		total = sizeof(buf);
-
-	size_t off = 0;
-	for (int i = 0; i < msg->msg_iovlen && off < total; i++) {
-		size_t chunk = msg->msg_iov[i].iov_len;
-		if (off + chunk > total)
-			chunk = total - off;
-		for (size_t j = 0; j < chunk; j++)
-			buf[off + j] =
-				((const uint8_t *)msg->msg_iov[i].iov_base)[j];
-		off += chunk;
-	}
-
-	// Use sendto with optional address
 	const struct sockaddr_in *dest = NULL;
 	struct sockaddr_in dest_copy;
 	if (msg->msg_name && msg->msg_namelen >= sizeof(struct sockaddr_in)) {
-		dest_copy = *(const struct sockaddr_in *)msg->msg_name;
+		if (copy_from_user(&dest_copy, msg->msg_name,
+				   sizeof(dest_copy)))
+			return -EFAULT;
 		dest = &dest_copy;
 	}
-	smap_enable();
 
-	return sock_sendto(sockfd, buf, total, flags, dest,
-			   dest ? sizeof(struct sockaddr_in) : 0);
+	if (s->type == SOCK_STREAM) {
+		/* A byte stream: each iovec goes to sock_send() in turn,
+		 * straight from user memory.  A short send ends the walk --
+		 * the window filled on a non-blocking socket, or a signal --
+		 * and reports what went out, as a single send() would. */
+		size_t sent = 0;
+		int last = -1;
+
+		for (int i = 0; i < msg->msg_iovlen; i++)
+			if (msg->msg_iov[i].iov_len)
+				last = i;
+		for (int i = 0; i < msg->msg_iovlen; i++) {
+			size_t l = msg->msg_iov[i].iov_len;
+			int f = flags;
+
+			if (l == 0)
+				continue;
+			/* One message: TCP may join the iovecs into full
+			 * segments (more follows), and only a send that
+			 * moved nothing raises SIGPIPE. */
+			if (i < last)
+				f |= MSG_MORE;
+			if (sent)
+				f |= MSG_NOSIGNAL;
+			int r = sock_send(sockfd, msg->msg_iov[i].iov_base, l,
+					  f);
+			if (r < 0)
+				return sent ? (int)sent : r;
+			sent += (size_t)r;
+			if ((size_t)r < l)
+				break;
+		}
+		return (int)sent;
+	}
+
+	/* A datagram is ONE unit: gather the iovecs into one buffer and
+	 * send it whole.  Its size is checked by the protocol (UDP: 65507
+	 * bytes of payload). */
+	if (total > 0xFFFFU)
+		return -EMSGSIZE;
+	uint8_t *kbuf = (uint8_t *)kalloc(total ? total : 1);
+	if (!kbuf)
+		return -ENOMEM;
+	size_t off = 0;
+	for (int i = 0; i < msg->msg_iovlen; i++) {
+		size_t l = msg->msg_iov[i].iov_len;
+
+		if (l && copy_from_user(kbuf + off, msg->msg_iov[i].iov_base,
+					l)) {
+			kfree(kbuf);
+			return -EFAULT;
+		}
+		off += l;
+	}
+	int ret = sock_sendto(sockfd, kbuf, total, flags, dest,
+			      dest ? sizeof(struct sockaddr_in) : 0);
+	kfree(kbuf);
+	return ret;
 }
 
 // ============================================================================
 // sock_recvmsg - Receive message with scatter/gather
 // ============================================================================
+/* Copy `len' bytes of a kernel buffer out across the iovecs, in order. */
+static int sock_scatter_to_iov(const struct msghdr *msg, const uint8_t *src,
+			       size_t len)
+{
+	size_t off = 0;
+
+	for (int i = 0; i < msg->msg_iovlen && off < len; i++) {
+		size_t chunk = msg->msg_iov[i].iov_len;
+
+		if (chunk > len - off)
+			chunk = len - off;
+		if (chunk && copy_to_user(msg->msg_iov[i].iov_base, src + off,
+					  chunk))
+			return -EFAULT;
+		off += chunk;
+	}
+	return 0;
+}
+
 int sock_recvmsg(int sockfd, struct msghdr *msg, int flags)
 {
 	if (!msg)
@@ -2128,66 +3194,176 @@ int sock_recvmsg(int sockfd, struct msghdr *msg, int flags)
 	if (!s->active)
 		return -EBADF;
 
-	// Calculate total iovec capacity
 	size_t total = 0;
-	smap_disable();
-	for (int i = 0; i < msg->msg_iovlen; i++)
-		total += msg->msg_iov[i].iov_len;
-	smap_enable();
+	for (int i = 0; i < msg->msg_iovlen; i++) {
+		size_t l = msg->msg_iov[i].iov_len;
 
-	if (total == 0)
-		return 0;
+		if (l > SOCK_MSG_MAX_BYTES - total)
+			return -EINVAL;
+		total += l;
+	}
+	msg->msg_flags = 0;
 
-	uint8_t buf[2048];
-	if (total > sizeof(buf))
-		total = sizeof(buf);
+	if (s->type == SOCK_STREAM) {
+		/* A stream has no sender address and no ancillary data here. */
+		msg->msg_namelen = 0;
+		msg->msg_controllen = 0;
+		if (total == 0)
+			return 0;
+		/* The urgent byte: one byte into the first buffer. */
+		if (flags & MSG_OOB) {
+			for (int i = 0; i < msg->msg_iovlen; i++) {
+				if (!msg->msg_iov[i].iov_len)
+					continue;
+				int r = sock_recv(sockfd, msg->msg_iov[i].iov_base,
+						  msg->msg_iov[i].iov_len, flags);
+				if (r >= 0)
+					msg->msg_flags |= MSG_OOB;
+				return r;
+			}
+		}
 
+		/* MSG_PEEK cannot be split across calls -- every call would
+		 * peek at the same first bytes -- so a peek into several
+		 * iovecs goes through one kernel buffer, as large as the
+		 * receive ring can be. */
+		if ((flags & MSG_PEEK) && msg->msg_iovlen > 1) {
+			size_t cap = total > TCP_RX_BUF_MAX ? TCP_RX_BUF_MAX :
+							      total;
+			uint8_t *kbuf = (uint8_t *)kalloc(cap);
+			if (!kbuf)
+				return -ENOMEM;
+			int r = sock_recv(sockfd, kbuf, cap, flags);
+			if (r > 0 && sock_scatter_to_iov(msg, kbuf, (size_t)r))
+				r = -EFAULT;
+			kfree(kbuf);
+			return r;
+		}
+
+		/* Otherwise each iovec is filled straight from the ring.  The
+		 * first may block as the caller asked; the rest only take
+		 * what is already there (all of it with MSG_WAITALL), as one
+		 * read() into one large buffer would. */
+		size_t got = 0;
+		for (int i = 0; i < msg->msg_iovlen; i++) {
+			size_t l = msg->msg_iov[i].iov_len;
+
+			if (l == 0)
+				continue;
+			int f = flags;
+			if (got && !(flags & MSG_WAITALL))
+				f |= MSG_DONTWAIT;
+			int r = sock_recv(sockfd, msg->msg_iov[i].iov_base, l,
+					  f);
+			if (r < 0)
+				return got ? (int)got : r;
+			got += (size_t)r;
+			if ((size_t)r < l)
+				break;
+		}
+		return (int)got;
+	}
+
+	/* Datagram: one datagram, scattered across the iovecs.  The part
+	 * that does not fit is discarded and MSG_TRUNC set in msg_flags;
+	 * with MSG_TRUNC in `flags' the real length is returned. */
 	struct sockaddr_in src_addr;
 	socklen_t addrlen = sizeof(src_addr);
+	struct sock_dgram_meta meta;
+	size_t cap = total > 0xFFFFU ? 0xFFFFU : total;
+	uint8_t *kbuf = (uint8_t *)kalloc(cap ? cap : 1);
+	if (!kbuf)
+		return -ENOMEM;
+	mm_memset(&src_addr, 0, sizeof(src_addr));
+	src_addr.sin_family = AF_INET;
+	mm_memset(&meta, 0, sizeof(meta));
 
-	// For DGRAM/RAW, capture per-packet metadata BEFORE recvfrom dequeues
-	uint32_t pkt_dst_ip = 0;
-	uint8_t pkt_ttl = 0, pkt_tos = 0;
-	uint32_t pkt_ifindex = 0;
-	int have_meta = 0;
-	if ((s->type == SOCK_DGRAM || s->type == SOCK_RAW) &&
-	    s->udp_rx_head != s->udp_rx_tail) {
-		int idx = s->udp_rx_head;
-		pkt_dst_ip = s->udp_rx_queue[idx].dst_ip;
-		pkt_ttl = s->udp_rx_queue[idx].ttl;
-		pkt_tos = s->udp_rx_queue[idx].tos;
-		pkt_ifindex = s->udp_rx_queue[idx].ifindex;
-		have_meta = 1;
-	}
-
-	int ret = sock_recvfrom(sockfd, buf, total, flags, &src_addr, &addrlen);
-	if (ret < 0)
+	int ret = sock_recvfrom_ex(sockfd, kbuf, cap, flags, &src_addr,
+				   &addrlen, &meta);
+	if (ret < 0) {
+		kfree(kbuf);
 		return ret;
-
-	// Scatter into iovecs
-	smap_disable();
-	size_t off = 0;
-	for (int i = 0; i < msg->msg_iovlen && off < (size_t)ret; i++) {
-		size_t chunk = msg->msg_iov[i].iov_len;
-		if (off + chunk > (size_t)ret)
-			chunk = (size_t)ret - off;
-		for (size_t j = 0; j < chunk; j++)
-			((uint8_t *)msg->msg_iov[i].iov_base)[j] = buf[off + j];
-		off += chunk;
 	}
+	if (sock_scatter_to_iov(msg, kbuf, (size_t)ret)) {
+		kfree(kbuf);
+		return -EFAULT;
+	}
+	kfree(kbuf);
+	if (meta.real_len > (uint32_t)ret) {
+		msg->msg_flags |= MSG_TRUNC;
+		if (flags & MSG_TRUNC)
+			ret = (int)meta.real_len;
+	}
+	if (meta.errqueue)
+		msg->msg_flags |= MSG_ERRQUEUE;
+	uint32_t pkt_dst_ip = meta.dst_ip;
+	uint8_t pkt_ttl = meta.ttl, pkt_tos = meta.tos;
+	uint32_t pkt_ifindex = meta.ifindex;
 
 	// Return source address if requested
 	if (msg->msg_name && msg->msg_namelen >= sizeof(struct sockaddr_in)) {
-		*(struct sockaddr_in *)msg->msg_name = src_addr;
+		if (copy_to_user(msg->msg_name, &src_addr, sizeof(src_addr)))
+			return -EFAULT;
 		msg->msg_namelen = sizeof(struct sockaddr_in);
 	}
 
+	smap_disable();
 	// RFC 2292 ancillary data
 	size_t cmsg_avail = msg->msg_controllen;
 	size_t cmsg_used = 0;
-	msg->msg_flags = 0;
-	if (have_meta && msg->msg_control && cmsg_avail > 0) {
+	if (msg->msg_control && cmsg_avail > 0 && meta.errqueue) {
+		/* The extended error, then who reported it. */
 		unsigned char *cp = (unsigned char *)msg->msg_control;
+		size_t dlen = sizeof(struct sock_extended_err) +
+			      sizeof(struct sockaddr_in);
+
+		if (CMSG_SPACE(dlen) <= cmsg_avail) {
+			struct cmsghdr *c = (struct cmsghdr *)cp;
+			struct sockaddr_in off;
+
+			c->cmsg_len = CMSG_LEN(dlen);
+			c->cmsg_level = IPPROTO_IP;
+			c->cmsg_type = IP_RECVERR;
+			mm_memcpy(CMSG_DATA(c), &meta.ee, sizeof(meta.ee));
+			mm_memset(&off, 0, sizeof(off));
+			off.sin_family = meta.offender ? AF_INET : 0;
+			off.sin_addr.s_addr = net_htonl(meta.offender);
+			mm_memcpy(CMSG_DATA(c) + sizeof(meta.ee), &off,
+				  sizeof(off));
+			cmsg_used += CMSG_SPACE(dlen);
+		} else {
+			msg->msg_flags |= MSG_CTRUNC;
+		}
+	} else if (msg->msg_control && cmsg_avail > 0) {
+		unsigned char *cp = (unsigned char *)msg->msg_control;
+		/* SO_TIMESTAMP / SO_TIMESTAMPNS: when the datagram arrived,
+		 * on the wall clock, first as everywhere. */
+		if (s->rcv_tstamp) {
+			uint64_t mono = meta.tstamp_ns ? meta.tstamp_ns :
+							 hrtimer_now_ns();
+			uint64_t rt = mono + timer_realtime_offset_ns(mono);
+			int64_t ts[2];
+			size_t dlen = sizeof(ts);
+
+			ts[0] = (int64_t)(rt / 1000000000ULL);
+			ts[1] = s->rcv_tstamp == 2 ?
+					(int64_t)(rt % 1000000000ULL) :
+					(int64_t)(rt % 1000000000ULL / 1000ULL);
+			if (cmsg_used + CMSG_SPACE(dlen) <= cmsg_avail) {
+				struct cmsghdr *c =
+					(struct cmsghdr *)(cp + cmsg_used);
+
+				c->cmsg_len = CMSG_LEN(dlen);
+				c->cmsg_level = SOL_SOCKET;
+				c->cmsg_type = s->rcv_tstamp == 2 ?
+						       SCM_TIMESTAMPNS :
+						       SCM_TIMESTAMP;
+				mm_memcpy(CMSG_DATA(c), ts, dlen);
+				cmsg_used += CMSG_SPACE(dlen);
+			} else {
+				msg->msg_flags |= MSG_CTRUNC;
+			}
+		}
 		if (s->ip_recvpktinfo &&
 		    cmsg_used + CMSG_SPACE(sizeof(struct in_pktinfo)) <=
 			    cmsg_avail) {
@@ -2233,96 +3409,124 @@ int sock_recvmsg(int sockfd, struct msghdr *msg, int flags)
 }
 
 // ============================================================================
-// sock_poll - Check socket for events
-// Returns bitmask of POLLIN/POLLOUT/POLLERR/POLLHUP
+// sock_poll - the readiness of a socket, as poll()/select()/epoll report it
 // ============================================================================
+/* No more data will ever arrive: the peer's FIN came in (CLOSE_WAIT and
+ * every state after it) or the connection is gone. */
+static int sock_tcp_rcv_done(int st)
+{
+	return st == TCP_STATE_CLOSE_WAIT || st == TCP_STATE_CLOSING ||
+	       st == TCP_STATE_LAST_ACK || st == TCP_STATE_TIME_WAIT ||
+	       st == TCP_STATE_CLOSED;
+}
+
+/* Our sending side is finished: our FIN went out, or the connection is
+ * gone. */
+static int sock_tcp_snd_done(int st)
+{
+	return st == TCP_STATE_FIN_WAIT_1 || st == TCP_STATE_FIN_WAIT_2 ||
+	       st == TCP_STATE_CLOSING || st == TCP_STATE_LAST_ACK ||
+	       st == TCP_STATE_TIME_WAIT || st == TCP_STATE_CLOSED;
+}
+
+/* A stream socket:
+ *   listening       POLLIN while a connection waits to be accepted;
+ *   not connected   POLLOUT | POLLHUP (nothing to wait for);
+ *   connecting      nothing until the handshake ends;
+ *   connected       POLLIN with SO_RCVLOWAT bytes queued, POLLOUT with
+ *                   room to send, POLLPRI for an unread urgent byte;
+ *   either side shut or the peer's FIN in: POLLIN | POLLRDHUP (a read
+ *                   returns end of file); our send side shut: POLLOUT (a
+ *                   write fails at once with EPIPE and must be woken);
+ *   both sides finished, or the connection gone: POLLHUP;
+ *   a pending error: POLLERR. */
+static int sock_poll_stream(net_socket_t *s)
+{
+	int mask = 0;
+	tcp_conn_t *c = sock_tcp_get(s);
+	int rx_shut = __atomic_load_n(&s->rx_shutdown, __ATOMIC_ACQUIRE);
+	int tx_shut = __atomic_load_n(&s->tx_shutdown, __ATOMIC_ACQUIRE);
+
+	if (c && __atomic_load_n(&s->listening, __ATOMIC_ACQUIRE)) {
+		if (__atomic_load_n(&c->accept_ready, __ATOMIC_ACQUIRE))
+			mask |= POLLIN | POLLRDNORM;
+		tcp_conn_release(c);
+		return mask;
+	}
+	if (!c) {
+		/* Never connected (or the connection was taken away): the
+		 * state everywhere else calls CLOSE. */
+		mask = POLLOUT | POLLWRNORM | POLLHUP;
+		if (rx_shut)
+			mask |= POLLIN | POLLRDNORM | POLLRDHUP;
+		if (s->error)
+			mask |= POLLERR;
+		return mask;
+	}
+
+	int st = __atomic_load_n(&c->state, __ATOMIC_ACQUIRE);
+	int rcv_done = rx_shut || sock_tcp_rcv_done(st);
+	int snd_done = tx_shut || sock_tcp_snd_done(st);
+
+	if ((rcv_done && snd_done) || st == TCP_STATE_CLOSED)
+		mask |= POLLHUP;
+	if (rcv_done)
+		mask |= POLLIN | POLLRDNORM | POLLRDHUP;
+	if (st != TCP_STATE_SYN_SENT && st != TCP_STATE_SYN_RECEIVED) {
+		int lowat = s->rcvlowat > 1 ? s->rcvlowat : 1;
+		uint32_t inq = sock_tcp_inq(c);
+
+		/* At the urgent mark an out-of-band byte is not data: one
+		 * byte more is needed to read anything. */
+		if (!c->urg_inline && sock_tcp_atmark(c))
+			lowat++;
+		if (lowat == 1 ? (inq > 0 || c->rx_ready) :
+				 inq >= (uint32_t)lowat)
+			mask |= POLLIN | POLLRDNORM;
+		if (snd_done ||
+		    __atomic_load_n(&c->tx_ready, __ATOMIC_ACQUIRE))
+			mask |= POLLOUT | POLLWRNORM;
+		if (sock_tcp_urg_pending(c))
+			mask |= POLLPRI;
+	}
+	if (__atomic_load_n(&c->error, __ATOMIC_ACQUIRE) || s->error)
+		mask |= POLLERR;
+	tcp_conn_release(c);
+	return mask;
+}
+
+/* A datagram socket (UDP, raw): readable with a datagram queued, always
+ * writable; an error, or one waiting on the error queue, is POLLERR. */
+static int sock_poll_dgram(net_socket_t *s)
+{
+	int mask = POLLOUT | POLLWRNORM | POLLWRBAND;
+	int rx_shut = __atomic_load_n(&s->rx_shutdown, __ATOMIC_ACQUIRE);
+	int tx_shut = __atomic_load_n(&s->tx_shutdown, __ATOMIC_ACQUIRE);
+
+	if (!skb_queue_empty(&s->rx_queue))
+		mask |= POLLIN | POLLRDNORM;
+	if (rx_shut)
+		mask |= POLLIN | POLLRDNORM | POLLRDHUP;
+	if (rx_shut && tx_shut)
+		mask |= POLLHUP;
+	if (s->error || !skb_queue_empty(&s->err_queue))
+		mask |= POLLERR;
+	return mask;
+}
+
 int sock_poll(int sockfd, short events)
 {
 	if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS)
 		return POLLNVAL;
 	net_socket_t *s = &sockets[sockfd];
-	if (!s->active)
+	if (!__atomic_load_n(&s->active, __ATOMIC_ACQUIRE))
 		return POLLNVAL;
 
-	short revents = 0;
+	int mask = s->type == SOCK_STREAM ? sock_poll_stream(s) :
+					    sock_poll_dgram(s);
 
-	if (s->type == SOCK_DGRAM) {
-		if ((events & (POLLIN | POLLRDNORM)) && s->udp_rx_ready)
-			revents |= POLLIN | POLLRDNORM;
-		if (events & (POLLOUT | POLLWRNORM))
-			revents |=
-				POLLOUT | POLLWRNORM; // UDP is always writable
-	} else if (s->type == SOCK_STREAM) {
-		if (s->listening && s->tcp) {
-			// Listening socket: readable when accept queue is non-empty
-			if ((events & (POLLIN | POLLRDNORM)) &&
-			    s->tcp->accept_ready)
-				revents |= POLLIN | POLLRDNORM;
-		} else if (s->tcp) {
-			tcp_conn_t *conn = s->tcp;
-			// Readable if data available or connection closed
-			if (events & (POLLIN | POLLRDNORM)) {
-				if (conn->rx_ready ||
-				    conn->rx_head != conn->rx_tail)
-					revents |= POLLIN | POLLRDNORM;
-				/* EOF is readable: peer FIN received (any
-				 * post-FIN state, not just CLOSE_WAIT), or
-				 * our own SHUT_RD. */
-				if (tcp_rx_finished(conn->state) ||
-				    s->rx_shutdown)
-					revents |= POLLIN | POLLRDNORM; // EOF
-			}
-			/* Writable: ESTABLISHED or CLOSE_WAIT (the peer's FIN
-			 * closed only its direction) with room to send; and
-			 * every state after our own FIN or shutdown(SHUT_WR),
-			 * where a write fails at once with EPIPE -- a writer
-			 * parked on POLLOUT must be woken to collect that
-			 * error, not left asleep until the socket dies. */
-			if (events & (POLLOUT | POLLWRNORM)) {
-				int st = conn->state;
-				int open_dir = st == TCP_STATE_ESTABLISHED ||
-					       st == TCP_STATE_CLOSE_WAIT;
-				int tx_done = st == TCP_STATE_FIN_WAIT_1 ||
-					      st == TCP_STATE_FIN_WAIT_2 ||
-					      st == TCP_STATE_CLOSING ||
-					      st == TCP_STATE_LAST_ACK ||
-					      st == TCP_STATE_TIME_WAIT ||
-					      st == TCP_STATE_CLOSED ||
-					      s->tx_shutdown;
-				if ((open_dir && conn->tx_ready) || tx_done)
-					revents |= POLLOUT | POLLWRNORM;
-			}
-			// Error / hangup
-			if (conn->error)
-				revents |= POLLERR;
-			/* Hangup means BOTH directions are finished.
-			 *
-			 * CLOSE_WAIT does not qualify and used to be listed
-			 * here: it means the peer sent FIN and we have not
-			 * closed our side, which is the ordinary end of every
-			 * keep-alive HTTP response.  Reporting a full hangup
-			 * for it told the caller the connection was dead
-			 * while it was still perfectly readable -- the EOF is
-			 * already signalled, correctly, as POLLIN above, and
-			 * that is the whole of what a reader needs.  A client
-			 * library that believes HUP instead tears the
-			 * connection down mid-exchange and reports the error
-			 * of whatever it tried next. */
-			if (conn->state == TCP_STATE_CLOSED ||
-			    conn->state == TCP_STATE_TIME_WAIT ||
-			    (s->rx_shutdown && s->tx_shutdown))
-				revents |= POLLHUP;
-		} else if (!s->connected && !s->listening) {
-			// Unconnected TCP socket is writable (can connect)
-			if (events & (POLLOUT | POLLWRNORM))
-				revents |= POLLOUT | POLLWRNORM;
-		}
-	}
-
-	if (s->error)
-		revents |= POLLERR;
-
-	return revents;
+	/* What was asked, and what is always reported. */
+	return mask & ((unsigned short)events | POLLERR | POLLHUP);
 }
 
 // ============================================================================
@@ -2385,7 +3589,13 @@ int sock_ioctl_net(int sockfd, unsigned long request, void *argp)
 		s->nonblock = (*((int *)argp) != 0) ? 1 : 0;
 		return 0;
 	}
-	if (request == SOCK_FIONREAD) {
+	/* The queue ioctls.  SIOCINQ is FIONREAD: a stream's unread bytes, a
+	 * datagram socket's first datagram (what one read returns).  SIOCOUTQ:
+	 * bytes sent and not yet acknowledged; SIOCOUTQNSD: not yet sent;
+	 * SIOCATMARK: the next byte read is the urgent one.  The TCP queue
+	 * questions are EINVAL on a listener and 0 while connecting. */
+	if (request == SIOCINQ || request == SIOCOUTQ ||
+	    request == SIOCOUTQNSD || request == SIOCATMARK) {
 		if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS)
 			return -EBADF;
 		net_socket_t *s = &sockets[sockfd];
@@ -2393,21 +3603,36 @@ int sock_ioctl_net(int sockfd, unsigned long request, void *argp)
 			return -EBADF;
 		if (!argp)
 			return -EFAULT;
-		int avail = 0;
-		if (s->tcp) {
-			tcp_conn_t *c = s->tcp;
-			avail = (int)((c->rx_tail - c->rx_head +
-				       c->rx_buf_size) %
-				      c->rx_buf_size);
-		} else {
-			/* UDP: sum all queued packet lengths */
-			int h = s->udp_rx_head, t = s->udp_rx_tail;
-			while (h != t) {
-				avail += s->udp_rx_queue[h].len;
-				h = (h + 1) % 16;
+		int answ = 0;
+		if (s->type == SOCK_STREAM) {
+			tcp_conn_t *c = sock_tcp_get(s);
+			int st = c ? c->state : TCP_STATE_CLOSED;
+
+			if (s->listening && request != SIOCATMARK) {
+				if (c)
+					tcp_conn_release(c);
+				return -EINVAL;
 			}
+			if (c && st != TCP_STATE_SYN_SENT &&
+			    st != TCP_STATE_SYN_RECEIVED) {
+				uint32_t v = 0;
+
+				if (request == SIOCINQ)
+					v = sock_tcp_inq(c);
+				else if (request == SIOCOUTQ)
+					v = sock_tcp_outq(c);
+				else if (request == SIOCOUTQNSD)
+					v = sock_tcp_outq_nsd(c);
+				else
+					v = (uint32_t)sock_tcp_atmark(c);
+				answ = v > 0x7fffffffu ? 0x7fffffff : (int)v;
+			}
+			if (c)
+				tcp_conn_release(c);
+		} else if (request == SIOCINQ) {
+			answ = (int)dgram_first_len(s);
 		}
-		*((int *)argp) = avail;
+		*((int *)argp) = answ;
 		return 0;
 	}
 	/* Delegate interface-level ioctls */
@@ -2462,6 +3687,19 @@ static net_device_t *net_find_dev_by_name(const char *name)
 static int net_dev_is_loopback(net_device_t *dev)
 {
 	return dev == net_get_loopback();
+}
+
+/* The interface flags user space sees: the kind of interface, and IFF_UP
+ * and IFF_RUNNING while it is administratively up (SIOCSIFFLAGS). */
+static uint32_t sock_if_flags(net_device_t *dev)
+{
+	uint32_t f = net_dev_is_loopback(dev) ? IFF_LOOPBACK :
+						IFF_BROADCAST | IFF_MULTICAST;
+
+	if (!dev->core_ready ||
+	    (__atomic_load_n(&dev->flags, __ATOMIC_ACQUIRE) & IFF_UP))
+		f |= IFF_UP | IFF_RUNNING;
+	return f;
 }
 
 // ============================================================================
@@ -2525,16 +3763,20 @@ int net_ioctl(unsigned long request, void *argp)
 		net_device_t *dev = net_find_dev_by_name(ifr->ifr_name);
 		if (!dev)
 			return -ENOENT;
-		if (net_dev_is_loopback(dev))
-			ifr->ifr_flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
-		else
-			ifr->ifr_flags = IFF_UP | IFF_BROADCAST | IFF_RUNNING |
-					 IFF_MULTICAST;
+		ifr->ifr_flags = (short)sock_if_flags(dev);
 		return 0;
 	}
 
-	case SIOCSIFFLAGS:
-		return 0; // Accept but ignore flag changes
+	case SIOCSIFFLAGS: {
+		/* IFF_UP takes the interface up or down; the other flags are
+		 * accepted and not changed. */
+		struct ifreq *ifr = (struct ifreq *)argp;
+		net_device_t *dev = net_find_dev_by_name(ifr->ifr_name);
+		if (!dev)
+			return -ENOENT;
+		(void)dev_change_flags(dev, (uint16_t)ifr->ifr_flags & IFF_UP);
+		return 0;
+	}
 
 	case SIOCGIFADDR: {
 		struct ifreq *ifr = (struct ifreq *)argp;
@@ -2554,7 +3796,12 @@ int net_ioctl(unsigned long request, void *argp)
 		if (!dev)
 			return -ENOENT;
 		struct sockaddr_in *sin = (struct sockaddr_in *)&ifr->ifr_addr;
-		dev->ip_addr = net_ntohl(sin->sin_addr.s_addr);
+		uint32_t addr = net_ntohl(sin->sin_addr.s_addr);
+		if (addr != dev->ip_addr) {
+			dev->ip_addr = addr;
+			// neighbours and routes of the old address are stale
+			call_netdevice_notifiers(NETDEV_CHANGEADDR, dev);
+		}
 		return 0;
 	}
 
@@ -2578,7 +3825,11 @@ int net_ioctl(unsigned long request, void *argp)
 			return -ENOENT;
 		struct sockaddr_in *sin =
 			(struct sockaddr_in *)&ifr->ifr_netmask;
-		dev->netmask = net_ntohl(sin->sin_addr.s_addr);
+		uint32_t mask = net_ntohl(sin->sin_addr.s_addr);
+		if (mask != dev->netmask) {
+			dev->netmask = mask;
+			call_netdevice_notifiers(NETDEV_CHANGEADDR, dev);
+		}
 		return 0;
 	}
 
@@ -2614,7 +3865,11 @@ int net_ioctl(unsigned long request, void *argp)
 			return -ENOENT;
 		if (ifr->ifr_mtu < 68 || ifr->ifr_mtu > 9000)
 			return -EINVAL;
-		dev->mtu = (uint16_t)ifr->ifr_mtu;
+		if (dev->mtu != (uint16_t)ifr->ifr_mtu) {
+			dev->mtu = (uint16_t)ifr->ifr_mtu;
+			// every route's MTU is looked up again
+			call_netdevice_notifiers(NETDEV_CHANGEMTU, dev);
+		}
 		return 0;
 	}
 
@@ -2719,12 +3974,19 @@ int net_ioctl(unsigned long request, void *argp)
 		uint8_t mac[ETH_ALEN];
 		for (int j = 0; j < ETH_ALEN; j++)
 			mac[j] = (uint8_t)req->arp_ha.sa_data[j];
-		arp_add_entry(ip, mac);
+		// ATF_PERM: a permanent entry; otherwise one that ages (STALE)
+		if (arp_set_entry(ip, mac, (req->arp_flags & ATF_PERM) != 0) < 0)
+			return -ENETUNREACH;
 		return 0;
 	}
 
-	case SIOCDARP:
-		return 0; // Accept but no-op (ARP entries expire naturally)
+	case SIOCDARP: {
+		struct arpreq *req = (struct arpreq *)argp;
+		struct sockaddr_in *sin = (struct sockaddr_in *)&req->arp_pa;
+
+		arp_del_entry(net_ntohl(sin->sin_addr.s_addr));
+		return 0;
+	}
 
 	// Routing ioctls
 	case SIOCADDRT: {
@@ -3116,10 +4378,7 @@ int net_get_udp_sockets(net_udp_info_t *entries, int max_entries)
 		entries[count].remote_ip =
 			net_ntohl(s->remote_addr.sin_addr.s_addr);
 		entries[count].remote_port = net_ntohs(s->remote_addr.sin_port);
-		int rx_count = s->udp_rx_tail - s->udp_rx_head;
-		if (rx_count < 0)
-			rx_count += 16;
-		entries[count].rx_queue = (uint32_t)rx_count;
+		entries[count].rx_queue = skb_queue_len(&s->rx_queue);
 		count++;
 	}
 	return count;
@@ -3146,7 +4405,7 @@ int net_get_iface_info(net_iface_info_t *entries, int max_entries)
 		entries[count].netmask = lo->netmask;
 		entries[count].gateway = lo->gateway;
 		entries[count].dns_server = lo->dns_server;
-		entries[count].flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
+		entries[count].flags = sock_if_flags(lo);
 		entries[count].pad = 0;
 		entries[count].rx_packets = lo->rx_packets;
 		entries[count].tx_packets = lo->tx_packets;
@@ -3176,8 +4435,7 @@ int net_get_iface_info(net_iface_info_t *entries, int max_entries)
 		entries[count].netmask = dev->netmask;
 		entries[count].gateway = dev->gateway;
 		entries[count].dns_server = dev->dns_server;
-		entries[count].flags =
-			IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST;
+		entries[count].flags = sock_if_flags(dev);
 		entries[count].pad = 0;
 		entries[count].rx_packets = dev->rx_packets;
 		entries[count].tx_packets = dev->tx_packets;

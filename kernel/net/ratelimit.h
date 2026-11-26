@@ -72,7 +72,6 @@ extern net_rl_t g_udp_unreach_rl; // ICMP port-unreach:   20/s burst  5
 
 extern net_rl_src_table_t g_icmp_src_rl; // per-source ICMP:  20/s burst 10
 extern net_rl_src_table_t g_arp_src_rl; // per-source ARP:   10/s burst  5
-extern net_rl_src_table_t g_tcp_syn_rl; // per-source SYN:    5/s burst  5
 extern net_rl_src_table_t g_frag_src_rl; // per-source frags: 50/s burst 20
 extern net_rl_src_table_t g_arp_new_rl; // new ARP entries:  10/s burst 10
 

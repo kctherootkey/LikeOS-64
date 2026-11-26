@@ -182,8 +182,15 @@ int prctl(int option, ...)
 	case PR_GET_NAME:
 		return pthread_getname_np(pthread_self(), (char *)a1, 16) ? -1 : 0;
 	case PR_GET_DUMPABLE:
-		return 1;
-	case PR_SET_DUMPABLE:
+	case PR_SET_DUMPABLE: {
+		/* Kernel state: what decides who may trace this process. */
+		long ret = syscall2(SYS_PRCTL, option, (long)a1);
+		if (ret < 0) {
+			errno = (int)-ret;
+			return -1;
+		}
+		return (int)ret;
+	}
 	case PR_SET_PDEATHSIG:
 	case PR_SET_NO_NEW_PRIVS:
 	case PR_SET_CHILD_SUBREAPER:

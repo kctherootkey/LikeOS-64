@@ -20,6 +20,8 @@
 #include <kernel/ke/timer.h>
 #include <kernel/net/skb.h>
 #include <kernel/net/softirq.h>
+#include <kernel/net/netdevice.h>
+#include <kernel/net/net_timer.h>
 #include <kernel/ke/percpu.h>
 #include <kernel/uapi/bug.h>
 
@@ -45,63 +47,8 @@ const char *net_get_hostname(void)
 	return g_hostname;
 }
 
-// Network device registry
-static net_device_t *net_devices[NET_MAX_DEVICES];
-static int net_device_num = 0;
-static spinlock_t net_registry_lock = SPINLOCK_INIT("net_registry");
-
-int net_register(net_device_t *dev)
-{
-	uint64_t flags;
-	spin_lock_irqsave(&net_registry_lock, &flags);
-	if (net_device_num >= NET_MAX_DEVICES) {
-		WARN_ON_ONCE(
-			net_device_num >=
-			NET_MAX_DEVICES); /* NET_MAX_DEVICES exhausted: too many NICs registered */
-		spin_unlock_irqrestore(&net_registry_lock, flags);
-		return -1;
-	}
-	net_devices[net_device_num++] = dev;
-	spin_unlock_irqrestore(&net_registry_lock, flags);
-	return 0;
-}
-
-net_device_t *net_get_device(int index)
-{
-	if (index < 0 || index >= net_device_num)
-		return NULL;
-	return net_devices[index];
-}
-
-net_device_t *net_get_default_device(void)
-{
-	return net_device_num > 0 ? net_devices[0] : NULL;
-}
-
-int net_device_count(void)
-{
-	return net_device_num;
-}
-
-// Called from acpi_poweroff() before writing SLP_TYP|SLP_EN.  Each NIC
-// driver may register a shutdown() callback that masks its interrupts,
-// stops bus-master DMA, and clears any Wake-on-LAN enables.  Skipping
-// this leaves PME# / WUC asserted on PCH-LAN integrated NICs (notably
-// the I219 LOM on Lenovo business laptops), which causes the chipset
-// to refuse the S5 transition: screen goes black and fans stop, but
-// the power rail stays hot until the user presses the power button.
-void net_quiesce_for_poweroff(void)
-{
-	// No locking — by the time we get here, IRQs have been masked by
-	// the acpi_poweroff() caller is about to mask them, and we want
-	// to run even if the registry lock is held by some stuck path.
-	for (int i = 0; i < net_device_num; i++) {
-		net_device_t *d = net_devices[i];
-		if (d && d->shutdown) {
-			d->shutdown(d);
-		}
-	}
-}
+/* The device registry, the transmit queues, link state and the watchdog
+ * are in dev.c; the receive side (NAPI, the backlog) in napi.c. */
 
 static inline uint32_t net_safe_cpu_id(void);
 
@@ -112,67 +59,67 @@ void net_timer_tick(void)
 	// running it inline here on every CPU with interrupts disabled.  Only
 	// the lowest online CPU raises it, so the sweep runs once per tick (its
 	// per-connection deadlines are absolute, so a single sweeper suffices).
-	if (net_safe_cpu_id() == 0)
-		softirq_raise(SOFTIRQ_TCP_TIMER);
-	static uint64_t dhcp_last = 0;
+	if (net_safe_cpu_id() != 0)
+		return;
+	softirq_raise(SOFTIRQ_TCP_TIMER);
+	net_timer_tick_hook(); // the network timer wheel (neighbours, ...)
+	/* The DHCP lease timer and the NIC link watchdogs run in the
+	 * housekeeping softirq, ten times a second.  dhcp_tick() used to be
+	 * called right here, from the hard timer interrupt of EVERY CPU:
+	 * it builds a packet and transmits it -- skb allocation, ARP, the
+	 * NIC's transmit lock -- with interrupts off, and the unlocked
+	 * once-a-second check let two CPUs renew at the same time. */
+	static uint64_t hk_last;
 	uint64_t now = timer_ticks();
-	// Timer frequency is TSC-calibrated at boot and is NOT necessarily
-	// 100 Hz (e.g. on VMware it lands elsewhere).  Use the real rate so
-	// dhcp_tick() runs at ~1 Hz wall-time regardless of platform.
-	uint32_t hz = timer_get_frequency();
+	uint64_t period = net_ms_to_ticks(100);
+	if (now - hk_last >= period) {
+		hk_last = now;
+		softirq_raise(SOFTIRQ_NET_HOUSEKEEPING);
+	}
+}
+
+void net_housekeeping_kick(void)
+{
+	softirq_raise_on(0, SOFTIRQ_NET_HOUSEKEEPING); // CPU 0, as below
+}
+
+/* SOFTIRQ_NET_HOUSEKEEPING, on CPU 0 only (see net_timer_tick and
+ * net_housekeeping_kick), so it never runs concurrently with itself, nor
+ * with the receive softirq that feeds dhcp_rx() on the same CPU. */
+static void net_housekeeping_softirq(void)
+{
+	static uint64_t dhcp_last;
+	uint64_t now = timer_ticks();
+	// The calibrated rate, so dhcp_tick() runs at ~1 Hz wall time.
+	uint64_t hz = timer_get_frequency();
+
 	if (hz == 0)
 		hz = 100;
 	if (now - dhcp_last >= hz) {
 		dhcp_last = now;
 		dhcp_tick();
 	}
+	linkwatch_run(); // carrier changes -> notifiers
+	dev_watchdog_run(); // the drivers' link supervision, TX timeouts
+	/* Packet memory: top the dynamic reserve up while the static pools
+	 * are short, give memory back once they are not. */
+	if (skb_reserve_maintain())
+		net_housekeeping_kick();
 }
 
 // Called by NIC driver on packet receive (HARD IRQ context).
 //
-// We do the bare minimum here -- allocate an skb from the size-classed
-// pool, copy the frame, enqueue it on this CPU's RX queue, and raise the
-// SOFTIRQ_NET_RX bit.  All actual parsing (eth_rx -> ip_rx -> ...) runs
-// later in softirq context with interrupts ENABLED, so we never block
-// TLB-shootdown IPIs nor risk re-entering protocol locks held by user
-// context paths.
-
-static skb_queue_t rx_queue[MAX_CPUS];
-static int rx_queue_inited = 0;
-
-// All protocol-stack RX is funneled through CPU 0's rx_queue, regardless of
-// which CPU received the frame from hardware or which CPU originated a
-// loopback transmit.  This preserves FIFO ordering across senders that
-// migrate between CPUs (e.g. tcp_send_data() emitting multiple segments
-// across a preemption point would otherwise enqueue them on different
-// per-CPU queues, letting the protocol stack reassemble them out of order
-// and corrupt TCP byte streams).  CPU 0's ksoftirqd then sequentially
-// drives ipv4_rx / tcp_rx for the entire stack.
-// Hardware NIC RX is funnelled through rx_queue[NET_RX_CPU] (a single
-// CPU drains the queue, so per-conn segment ordering is preserved
-// without per-conn locks held across handler invocations).
+// The bare minimum happens here: an skb from the packet pools (never the
+// slab allocator: interrupts are off), a copy of the frame, and the
+// backlog napi (napi.c), which the NET_RX softirq on NET_RX_CPU drains --
+// so every frame is processed by one CPU in arrival order, with
+// interrupts enabled, never re-entering protocol locks held by process
+// context.
 //
-// Loopback packets, however, are enqueued onto the *sending* CPU's own
-// rx_queue and drained by that CPU's ksoftirqd.  Two reasons:
-//
-//   1. Self-throttling: the loopback sender's CPU does the receive
-//      work, so a runaway sender on one CPU cannot DoS the others.
-//
-//   2. Wake reliability under hypervisors: pinning all loopback RX to
-//      ksoftirqd/NET_RX_CPU means a process-context caller on a
-//      different CPU must IPI CPU NET_RX_CPU and wait for *its* idle
-//      thread to be preempted out of HLT.  Under VMware the IPI
-//      latency was observed to stretch into multiple seconds when
-//      NET_RX_CPU was deeply idle, hanging accept() / connect() /
-//      recv() wait-loops in test_libc.  Draining on the local CPU
-//      (where the caller is about to sched_yield_in_kernel() anyway)
-//      makes wake-up immediate.
-//
-// Critically, EACH rx_queue is read by exactly ONE ksoftirqd (its own
-// CPU's), so this still preserves per-queue ordering — no two CPUs
-// race over the same rx_queue and a TCP connection's segments stay in
-// the order they were enqueued by their sender.
-#define NET_RX_CPU 0
+// Loopback traffic takes the same backlog (loopback_xmit): one FIFO for
+// everything, so the segments of a sender that migrates between CPUs
+// across a preemption point (data from one CPU, the FIN from close() on
+// another) still arrive in the order they were sent.
 
 // Before percpu_init(), GS base is 0; this_cpu_id() would fault.  In that
 // (BSP-only) window we are always CPU 0.
@@ -181,37 +128,14 @@ static inline uint32_t net_safe_cpu_id(void)
 	return read_gs_base_msr() ? this_cpu_id() : 0;
 }
 
-static inline int skb_is_loopback(sk_buff_t *skb)
-{
-	return skb && skb->dev && skb->dev == net_get_loopback();
-}
-
-static void net_rx_softirq(void)
-{
-	// Drain THIS CPU's queue only.  See the rx-queue commentary above.
-	skb_queue_t *q = &rx_queue[net_safe_cpu_id()];
-	sk_buff_t *skb;
-	while ((skb = skb_queue_head(q)) != NULL) {
-		if (skb_is_loopback(skb)) {
-			// Loopback packets are raw IPv4 datagrams (no Ethernet header).
-			ipv4_rx(skb->dev, skb->data, skb->len);
-		} else {
-			eth_rx(skb->dev, skb->data, skb->len);
-		}
-		skb_put(skb);
-	}
-}
-
 void net_rx_packet(net_device_t *dev, const uint8_t *data, uint16_t len)
 {
 	BUG_ON(dev == NULL);
 	BUG_ON(data == NULL);
 	dev->rx_packets++;
 	dev->rx_bytes += len;
-	if (!rx_queue_inited || len == 0) {
-		// Pre-init: drop silently (should not happen after net_init()).
+	if (len == 0)
 		return;
-	}
 	WARN_RATELIMIT(len > 9000, "net_rx_packet: oversized frame len=%u",
 		       len);
 	sk_buff_t *skb = skb_alloc(len);
@@ -221,105 +145,77 @@ void net_rx_packet(net_device_t *dev, const uint8_t *data, uint16_t len)
 	}
 	skb->dev = dev;
 	uint8_t *p = skb_append(skb, len);
-	/* rep-movs-backed bulk copy — was a byte-at-a-time loop running in
-     * hard-IRQ context per packet, costing ~1500 dependent stores at
-     * IRQ-disabled time per frame and capping receive packet rate. */
+	/* rep-movs-backed bulk copy -- was a byte-at-a-time loop running in
+	 * hard-IRQ context per packet. */
 	mm_memcpy(p, data, len);
-	// Hardware NIC RX: funnel to NET_RX_CPU's queue/ksoftirqd so a
-	// single CPU processes all incoming wire packets in arrival order.
-	skb_queue_tail(&rx_queue[NET_RX_CPU], skb);
-	softirq_raise_on(NET_RX_CPU, SOFTIRQ_NET_RX);
+	if (netif_rx(skb) != NET_RX_SUCCESS)
+		dev->rx_dropped++;
 }
 
 // Loopback device
 static net_device_t lo_device;
 static int lo_initialized = 0;
 
-// Loopback transmit: enqueue an skb on NET_RX_CPU's RX queue (same as
-// hardware NIC RX) and raise SOFTIRQ_NET_RX there.
-//
-// Using a single shared queue (NET_RX_CPU) instead of per-CPU queues
-// guarantees FIFO ordering across CPU migrations.  The alternative
-// (per-CPU loopback queues) introduced an intermittent bug: when a sender
-// migrated CPUs across a sched_yield_in_kernel() boundary inside sock_send
-// (e.g. ssl_write data segments on CPU X, then FIN from close() on CPU Y),
-// the FIN arrived at the receiver via a different queue than the data
-// segments and could be processed first, causing CLOSE_WAIT + empty rx_buf
-// → sock_recv returning 0 (false EOF) before all data arrived.
-//
-// IPI overhead to wake NET_RX_CPU is negligible on real hardware (<10 µs).
-// If the caller is already on NET_RX_CPU no IPI is needed at all.
-static int loopback_send(net_device_t *dev, const uint8_t *data, uint16_t len)
+/* Loopback transmit: the datagram itself (no link header) goes to the
+ * backlog as a received frame -- no copy. */
+static int loopback_xmit(sk_buff_t *skb, net_device_t *dev)
 {
+	uint32_t len = skb->len;
+
 	dev->tx_packets++;
 	dev->tx_bytes += len;
+	/* The frame has left the sender: it no longer counts against the
+	 * sending socket's transmit budget (TCP small queues) while it
+	 * waits in the receiver's queues. */
+	if (skb->destructor) {
+		skb->destructor(skb);
+		skb->destructor = NULL;
+		skb->sk = NULL;
+	}
+	skb->pkt_type = PACKET_LOOPBACK;
+	skb->dev = dev;
+	if (netif_rx(skb) != NET_RX_SUCCESS) {
+		dev->rx_dropped++;
+		return NETDEV_TX_OK; // consumed (dropped) either way
+	}
 	dev->rx_packets++;
 	dev->rx_bytes += len;
-	if (!rx_queue_inited || len == 0)
+	return NETDEV_TX_OK;
+}
+
+/* The byte interface of the loopback device, for callers that hand it a
+ * finished datagram without an skb. */
+static int loopback_send(net_device_t *dev, const uint8_t *data, uint16_t len)
+{
+	if (len == 0)
 		return 0;
 	sk_buff_t *skb = skb_alloc(len);
 	if (!skb) {
-		// This is silent packet loss on loopback — callers (TCP) treat
-		// it as a local drop and retry, but make exhaustion visible so
-		// pool sizing problems are diagnosable instead of appearing
-		// only as mysterious latency/hangs under parallel stress.
-		WARN_RATELIMIT(1, "loopback_send: skb pool exhausted, dropping %u bytes",
-			       len);
 		dev->rx_errors++;
 		return -1;
 	}
+	mm_memcpy(skb_append(skb, len), data, len);
 	skb->dev = dev;
-	uint8_t *p = skb_append(skb, len);
-	mm_memcpy(p, data, len);
-	// Use NET_RX_CPU (same queue as NIC RX) so that loopback segments from
-	// a sender that migrates CPUs across preemption points always land in
-	// the same FIFO queue in send order.  Per-CPU queues broke ordering when
-	// e.g. SSL_write data segments and the subsequent FIN (from close()) were
-	// emitted from different CPUs: the FIN's queue was processed first,
-	// transitioning the peer to CLOSE_WAIT with an empty rx_buf, causing
-	// sock_recv to return 0 (false EOF) before all echo data arrived.
-	skb_queue_tail(&rx_queue[NET_RX_CPU], skb);
-	softirq_raise_on(NET_RX_CPU, SOFTIRQ_NET_RX);
-	return 0;
+	return loopback_xmit(skb, dev) == NETDEV_TX_OK ? 0 : -1;
 }
 
-// Compatibility shim for legacy callers (syscall.c, socket.c).  Loopback
-// delivery is now driven by the SOFTIRQ_NET_RX handler.
-//
-// IMPORTANT: this is invoked from process context (typically a user
-// task inside sock_accept / sock_connect / sock_recvfrom polling for
-// an inbound packet).  Earlier versions of this function called
-// softirq_drain() inline, which on a process-context caller (IRQs
-// enabled) would synchronously run net_rx_softirq → ipv4_rx → tcp_rx →
-// tcp_send_segment → ipv4_send → loopback_send → ...  on the *user
-// task's* 16 KiB kernel stack — and then any hard IRQ (timer, e1000,
-// xhci completion) would nest on top, blowing the kernel stack under
-// real-USB latency (RSP wrapped to small constants like 0x20).
-//
-// Fix: do NOT process softirqs synchronously on the calling task's
-// stack.  Just raise NET_RX on the local CPU; ksoftirqd has its own
-// 16 KiB stack and the caller's wait-loop will sched_yield_in_kernel()
-// immediately after this returns, giving ksoftirqd a chance to run.
-//
-// Loopback is now funnelled through NET_RX_CPU (same as NIC RX).  Raise the
-// softirq there so the packet is processed regardless of which CPU the
-// calling process is on.
+// Compatibility shim for legacy callers (syscall.c, socket.c), called from
+// process context while they wait for an inbound packet.  It must NOT
+// process softirqs on the calling task's stack (the whole receive path on
+// a user task's kernel stack, with hard IRQs nesting on top, overflowed
+// it); it only makes sure NET_RX is raised on NET_RX_CPU when frames are
+// waiting, so ksoftirqd gets to them while the caller yields.
 void loopback_process_pending(void)
 {
-	if (!rx_queue_inited)
-		return;
-	if (__atomic_load_n(&rx_queue[NET_RX_CPU].len, __ATOMIC_ACQUIRE) != 0) {
+	if (net_backlog_len() != 0)
 		softirq_raise_on(NET_RX_CPU, SOFTIRQ_NET_RX);
-	}
 }
 
 /* Read-only diagnostic accessors used by the Ctrl+N TCP/net dump
  * (tcp_dump_table).  No locks, no side effects. */
 uint32_t net_rx_queue_len(uint32_t cpu)
 {
-	if (cpu >= MAX_CPUS || !rx_queue_inited)
-		return 0;
-	return __atomic_load_n(&rx_queue[cpu].len, __ATOMIC_ACQUIRE);
+	return cpu == NET_RX_CPU ? net_backlog_len() : 0;
 }
 
 int net_rx_cpu(void)
@@ -345,14 +241,16 @@ void net_init(void)
 	// Initialize CSPRNG first (needed by TCP, DHCP, etc.)
 	random_init();
 
-	// Bring up the skb pool and per-CPU RX queues, then register the
-	// SOFTIRQ_NET_RX handler.  Must happen before any send/receive path runs.
+	// The packet pools, the timer wheel, the transmit (NET_TX) and
+	// receive (NET_RX, backlog) halves of the device core.  Before any
+	// send/receive path runs.
 	skb_pool_init();
-	for (uint32_t i = 0; i < MAX_CPUS; i++) {
-		skb_queue_init(&rx_queue[i], "net_rx");
-	}
-	rx_queue_inited = 1;
-	softirq_register(SOFTIRQ_NET_RX, net_rx_softirq);
+	net_timer_init_subsys();
+	dev_core_init_subsys();
+	napi_init_subsys();
+	softirq_register(SOFTIRQ_NET_HOUSEKEEPING, net_housekeeping_softirq);
+	// The routing table first: device registration notifies it.
+	route_init();
 
 	// Initialize loopback device
 	mm_memset(&lo_device, 0, sizeof(lo_device));
@@ -364,19 +262,23 @@ void net_init(void)
 	lo_device.gateway = 0;
 	lo_device.dns_server = 0;
 	lo_device.send = loopback_send;
+	lo_device.xmit = loopback_xmit;
 	lo_device.link_status = loopback_link_status;
 	lo_device.lock = (spinlock_t)SPINLOCK_INIT("lo");
+	lo_device.flags = IFF_LOOPBACK;
+	lo_device.priv_flags = IFF_NO_QUEUE;
+	lo_device.features = NETIF_F_LOOPBACK;
+	lo_device.ifindex = 1;
+	dev_init_core(&lo_device);
 	lo_initialized = 1;
 
 	ratelimit_init();
 	arp_init();
+	ipv4_init(); // reassembly, raw sockets, ICMP, the protocol table
 	udp_init();
 	tcp_init();
 	socket_init();
 	igmp_init();
-
-	// Initialize routing table
-	route_init();
 
 	// Initialize DNS resolver
 	dns_init();

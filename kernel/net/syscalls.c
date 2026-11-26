@@ -6,6 +6,7 @@
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/timer.h>
+#include <kernel/ke/hrtimer.h>
 #include <kernel/fs/icache.h>
 #include <kernel/net/net.h>
 #include <kernel/ke/uaccess.h>
@@ -69,18 +70,49 @@ static void sock_put_peer_addr(uint64_t uaddr, uint64_t ulenp,
 	copy_to_user((void *)ulenp, &kaddrlen, sizeof(socklen_t));
 }
 
-static int sock_idx_from_fd(uint64_t fd)
+/* Resolve a descriptor to an AF_INET socket and HOLD it for the rest of the
+ * syscall: the index is returned and *held names the hold, which the
+ * SOCK_FD_HOLD variable releases automatically when the syscall's function
+ * returns, whatever path it takes.
+ *
+ * The descriptor used to be read with no lock and no reference.  A sibling
+ * thread's close() could then drop the socket's last reference while this
+ * one was inside sock_send()/sock_recv(); the table slot was freed, a
+ * concurrent socket() reused it, and the first thread carried on with
+ * somebody else's socket -- its data sent on another connection.  fdget()
+ * takes its reference in the same locked step that reads the slot (see
+ * fs/file.c), so the slot cannot be recycled while the call runs; a close()
+ * meanwhile only drops the descriptor's reference and the socket goes when
+ * this hold does. */
+static int sock_idx_from_fd(uint64_t fd, vfs_file_t **held)
 {
 	task_t *cur = sched_current();
+	vfs_file_t *entry;
+
+	*held = NULL;
 	if (!cur || fd >= TASK_MAX_FDS)
 		return -EBADF;
-	void *entry = task_fds(cur)[fd];
+	entry = fdget(cur, (int)fd);
 	if (!entry)
 		return -EBADF;
-	if (!IS_SOCKET_FD(entry))
+	if (!IS_SOCKET_FD(entry)) {
+		fdput(entry);
 		return -ENOTSOCK;
+	}
+	*held = entry;
 	return SOCKET_FD_IDX(entry);
 }
+
+static void sock_fd_release(vfs_file_t **held)
+{
+	if (*held)
+		fdput(*held);
+}
+
+/* One per socket syscall that resolves an AF_INET descriptor; the hold it
+ * names is released when the enclosing function returns. */
+#define SOCK_FD_HOLD \
+	vfs_file_t *sock_held __attribute__((cleanup(sock_fd_release))) = NULL
 
 /* Resolve a descriptor to a UNIX socket, and hold the socket for the rest of
  * this syscall.
@@ -701,7 +733,7 @@ __attribute__((noinline)) static int unix_do_recvmsg(unix_socket_t *ufd,
 	 * of 0xff.  Every one of those is this, seen from further away.
 	 *
 	 * The record path a few hundred lines above has always done it this
-	 * way, and so does the reference implementation's scm_detach_fds():
+	 * way, and so does scm_detach_fds() of the stack this one follows:
 	 * install as many as the caller's control buffer can report, release
 	 * the remainder rather than leaking them into the process unreported,
 	 * and say MSG_CTRUNC when any were left behind.
@@ -846,6 +878,7 @@ int64_t sys_socket(uint64_t a1, uint64_t a2, uint64_t a3)
 
 int64_t sys_bind(uint64_t a1, uint64_t a2, uint64_t a3)
 {
+	SOCK_FD_HOLD;
 	unix_socket_t *ufd = unix_sock_from_fd(a1);
 	if (ufd) {
 		/* Validate and copy only the DECLARED length, into a
@@ -871,7 +904,7 @@ int64_t sys_bind(uint64_t a1, uint64_t a2, uint64_t a3)
 			return -EFAULT;
 		return unix_bind(ufd, &kaddr, alen);
 	}
-	int idx = sock_idx_from_fd(a1);
+	int idx = sock_idx_from_fd(a1, &sock_held);
 	if (idx < 0)
 		return idx;
 	struct sockaddr_in kaddr;
@@ -884,10 +917,11 @@ int64_t sys_bind(uint64_t a1, uint64_t a2, uint64_t a3)
 
 int64_t sys_listen(uint64_t a1, uint64_t a2)
 {
+	SOCK_FD_HOLD;
 	unix_socket_t *ufd = unix_sock_from_fd(a1);
 	if (ufd)
 		return unix_listen(ufd, (int)a2);
-	int idx = sock_idx_from_fd(a1);
+	int idx = sock_idx_from_fd(a1, &sock_held);
 	if (idx < 0)
 		return idx;
 	return sock_listen(idx, (int)a2);
@@ -895,6 +929,7 @@ int64_t sys_listen(uint64_t a1, uint64_t a2)
 
 int64_t sys_accept(uint64_t a1, uint64_t a2, uint64_t a3)
 {
+	SOCK_FD_HOLD;
 	unix_socket_t *ufd = unix_sock_from_fd(a1);
 	if (ufd) {
 		struct sockaddr_un kaddr;
@@ -925,7 +960,7 @@ int64_t sys_accept(uint64_t a1, uint64_t a2, uint64_t a3)
 		sock_put_peer_addr(a2, a3, &kaddr, kaddrlen);
 		return newfd;
 	}
-	int idx = sock_idx_from_fd(a1);
+	int idx = sock_idx_from_fd(a1, &sock_held);
 	if (idx < 0)
 		return idx;
 	struct sockaddr_in kaddr;
@@ -954,6 +989,7 @@ int64_t sys_accept(uint64_t a1, uint64_t a2, uint64_t a3)
 
 int64_t sys_connect(uint64_t a1, uint64_t a2, uint64_t a3)
 {
+	SOCK_FD_HOLD;
 	unix_socket_t *ufd = unix_sock_from_fd(a1);
 	if (ufd) {
 		/* Validate and copy only the DECLARED length, into a
@@ -979,7 +1015,7 @@ int64_t sys_connect(uint64_t a1, uint64_t a2, uint64_t a3)
 			return -EFAULT;
 		return unix_connect(ufd, &kaddr, alen);
 	}
-	int idx = sock_idx_from_fd(a1);
+	int idx = sock_idx_from_fd(a1, &sock_held);
 	if (idx < 0)
 		return idx;
 	struct sockaddr_in kaddr;
@@ -992,6 +1028,7 @@ int64_t sys_connect(uint64_t a1, uint64_t a2, uint64_t a3)
 
 int64_t sys_sendto(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
+	SOCK_FD_HOLD;
 	unix_socket_t *ufd = unix_sock_from_fd(a1);
 	if (ufd) {
 		if (!validate_user_ptr(a2, a3))
@@ -999,7 +1036,7 @@ int64_t sys_sendto(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t 
 		return unix_send(ufd, (const void *)a2, (size_t)a3,
 				 (int)a4);
 	}
-	int idx = sock_idx_from_fd(a1);
+	int idx = sock_idx_from_fd(a1, &sock_held);
 	if (idx < 0)
 		return idx;
 	if (!validate_user_ptr(a2, a3))
@@ -1017,13 +1054,14 @@ int64_t sys_sendto(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t 
 
 int64_t sys_recvfrom(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
+	SOCK_FD_HOLD;
 	unix_socket_t *ufd = unix_sock_from_fd(a1);
 	if (ufd) {
 		if (!validate_user_ptr(a2, a3))
 			return -EFAULT;
 		return unix_recv(ufd, (void *)a2, (size_t)a3, (int)a4);
 	}
-	int idx = sock_idx_from_fd(a1);
+	int idx = sock_idx_from_fd(a1, &sock_held);
 	if (idx < 0)
 		return idx;
 	if (!validate_user_ptr(a2, a3))
@@ -1041,6 +1079,7 @@ int64_t sys_recvfrom(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_
 
 int64_t sys_send(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 {
+	SOCK_FD_HOLD;
 	unix_socket_t *ufd = unix_sock_from_fd(a1);
 	if (ufd) {
 		if (!validate_user_ptr(a2, a3))
@@ -1048,7 +1087,7 @@ int64_t sys_send(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 		return unix_send(ufd, (const void *)a2, (size_t)a3,
 				 (int)a4);
 	}
-	int idx = sock_idx_from_fd(a1);
+	int idx = sock_idx_from_fd(a1, &sock_held);
 	if (idx < 0)
 		return idx;
 	if (!validate_user_ptr(a2, a3))
@@ -1058,13 +1097,14 @@ int64_t sys_send(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 
 int64_t sys_recv(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 {
+	SOCK_FD_HOLD;
 	unix_socket_t *ufd = unix_sock_from_fd(a1);
 	if (ufd) {
 		if (!validate_user_ptr(a2, a3))
 			return -EFAULT;
 		return unix_recv(ufd, (void *)a2, (size_t)a3, (int)a4);
 	}
-	int idx = sock_idx_from_fd(a1);
+	int idx = sock_idx_from_fd(a1, &sock_held);
 	if (idx < 0)
 		return idx;
 	if (!validate_user_ptr(a2, a3))
@@ -1074,10 +1114,11 @@ int64_t sys_recv(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 
 int64_t sys_shutdown(uint64_t a1, uint64_t a2)
 {
+	SOCK_FD_HOLD;
 	unix_socket_t *ufd = unix_sock_from_fd(a1);
 	if (ufd)
 		return unix_shutdown(ufd, (int)a2);
-	int idx = sock_idx_from_fd(a1);
+	int idx = sock_idx_from_fd(a1, &sock_held);
 	if (idx < 0)
 		return idx;
 	return sock_shutdown(idx, (int)a2);
@@ -1085,6 +1126,7 @@ int64_t sys_shutdown(uint64_t a1, uint64_t a2)
 
 int64_t sys_setsockopt(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
+	SOCK_FD_HOLD;
 	/* AF_UNIX first, as in every other socket arm.  Going straight
 	 * to sock_idx_from_fd() answered -ENOTSOCK for every option on
 	 * every local socket, and a caller cannot read that as "option
@@ -1097,7 +1139,7 @@ int64_t sys_setsockopt(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint6
 	int idx = 0;
 
 	if (!ufd) {
-		idx = sock_idx_from_fd(a1);
+		idx = sock_idx_from_fd(a1, &sock_held);
 		if (idx < 0)
 			return idx;
 	}
@@ -1129,12 +1171,13 @@ int64_t sys_setsockopt(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint6
 
 int64_t sys_getsockopt(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
+	SOCK_FD_HOLD;
 	/* AF_UNIX first — see SYS_SETSOCKOPT above. */
 	unix_socket_t *ufd = unix_sock_from_fd(a1);
 	int idx = 0;
 
 	if (!ufd) {
-		idx = sock_idx_from_fd(a1);
+		idx = sock_idx_from_fd(a1, &sock_held);
 		if (idx < 0)
 			return idx;
 	}
@@ -1168,6 +1211,7 @@ int64_t sys_getsockopt(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint6
 
 int64_t sys_getpeername(uint64_t a1, uint64_t a2, uint64_t a3)
 {
+	SOCK_FD_HOLD;
 	/* AF_UNIX first: sock_idx_from_fd() only knows AF_INET, so a
 	 * Unix socket used to fail here -- and an X client that cannot
 	 * name its own socket cannot choose an authorisation record,
@@ -1212,7 +1256,7 @@ int64_t sys_getpeername(uint64_t a1, uint64_t a2, uint64_t a3)
 		return 0;
 	}
 
-	int idx = sock_idx_from_fd(a1);
+	int idx = sock_idx_from_fd(a1, &sock_held);
 	if (idx < 0)
 		return idx;
 	struct sockaddr_in kaddr;
@@ -1229,6 +1273,7 @@ int64_t sys_getpeername(uint64_t a1, uint64_t a2, uint64_t a3)
 
 int64_t sys_getsockname(uint64_t a1, uint64_t a2, uint64_t a3)
 {
+	SOCK_FD_HOLD;
 	/* AF_UNIX first: sock_idx_from_fd() only knows AF_INET, so a
 	 * Unix socket used to fail here -- and an X client that cannot
 	 * name its own socket cannot choose an authorisation record,
@@ -1273,7 +1318,7 @@ int64_t sys_getsockname(uint64_t a1, uint64_t a2, uint64_t a3)
 		return 0;
 	}
 
-	int idx = sock_idx_from_fd(a1);
+	int idx = sock_idx_from_fd(a1, &sock_held);
 	if (idx < 0)
 		return idx;
 	struct sockaddr_in kaddr;
@@ -1387,6 +1432,7 @@ int64_t sys_socketpair(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 
 int64_t sys_accept4(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 {
+	SOCK_FD_HOLD;
 	unix_socket_t *ufd = unix_sock_from_fd(a1);
 	if (ufd) {
 		struct sockaddr_un kaddr;
@@ -1420,7 +1466,7 @@ int64_t sys_accept4(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 		sock_put_peer_addr(a2, a3, &kaddr, kaddrlen);
 		return newfd;
 	}
-	int idx = sock_idx_from_fd(a1);
+	int idx = sock_idx_from_fd(a1, &sock_held);
 	if (idx < 0)
 		return idx;
 	struct sockaddr_in kaddr;
@@ -1497,65 +1543,222 @@ static int msghdr_prepare(struct msghdr *kmsg, struct iovec **kiov_out)
 	return 0;
 }
 
-int64_t sys_sendmsg(uint64_t a1, uint64_t a2, uint64_t a3)
+/* One message of sendmsg/sendmmsg on a socket already resolved: `ufd' for
+ * AF_UNIX, else the inet socket `idx'. */
+static int msg_send_one(unix_socket_t *ufd, int idx, uint64_t umsg, int flags)
 {
-	if (!validate_user_ptr(a2, sizeof(struct msghdr)))
-		return -EFAULT;
 	struct msghdr kmsg;
-	if (copy_from_user(&kmsg, (const void *)a2, sizeof(struct msghdr)))
-		return -EFAULT;
+	struct iovec *kiov;
+	int r;
 
-	unix_socket_t *ufd = unix_sock_from_fd(a1);
+	if (!validate_user_ptr(umsg, sizeof(struct msghdr)))
+		return -EFAULT;
+	if (copy_from_user(&kmsg, (const void *)umsg, sizeof(struct msghdr)))
+		return -EFAULT;
 	if (ufd)
 		return unix_do_sendmsg(ufd, &kmsg);
-
-	int idx = sock_idx_from_fd(a1);
-	if (idx < 0)
-		return idx;
-	struct iovec *kiov;
-	int r = msghdr_prepare(&kmsg, &kiov);
+	r = msghdr_prepare(&kmsg, &kiov);
 	if (r < 0)
 		return r;
-	r = sock_sendmsg(idx, &kmsg, (int)a3);
+	r = sock_sendmsg(idx, &kmsg, flags);
 	if (kiov)
 		kfree(kiov);
 	return r;
 }
 
-int64_t sys_recvmsg(uint64_t a1, uint64_t a2, uint64_t a3)
+/* The receiving half: the caller's header gets the results back. */
+static int msg_recv_one(unix_socket_t *ufd, int idx, uint64_t umsg, int flags)
 {
-	if (!validate_user_ptr(a2, sizeof(struct msghdr)))
-		return -EFAULT;
 	struct msghdr kmsg;
-	if (copy_from_user(&kmsg, (const void *)a2, sizeof(struct msghdr)))
-		return -EFAULT;
+	struct iovec *uiov, *kiov;
+	int ret;
 
-	unix_socket_t *ufd = unix_sock_from_fd(a1);
+	if (!validate_user_ptr(umsg, sizeof(struct msghdr)))
+		return -EFAULT;
+	if (copy_from_user(&kmsg, (const void *)umsg, sizeof(struct msghdr)))
+		return -EFAULT;
 	if (ufd) {
-		int ret = unix_do_recvmsg(ufd, &kmsg);
+		ret = unix_do_recvmsg(ufd, &kmsg);
 		if (ret >= 0)
-			copy_to_user((void *)a2, &kmsg,
-				     sizeof(struct msghdr));
+			copy_to_user((void *)umsg, &kmsg, sizeof(struct msghdr));
 		return ret;
 	}
-
-	int idx = sock_idx_from_fd(a1);
-	if (idx < 0)
-		return idx;
-	struct iovec *uiov = kmsg.msg_iov;
-	struct iovec *kiov;
-	int ret = msghdr_prepare(&kmsg, &kiov);
+	uiov = kmsg.msg_iov;
+	ret = msghdr_prepare(&kmsg, &kiov);
 	if (ret < 0)
 		return ret;
-	ret = sock_recvmsg(idx, &kmsg, (int)a3);
+	ret = sock_recvmsg(idx, &kmsg, flags);
 	if (kiov)
 		kfree(kiov);
 	/* The caller's header gets its own iovec pointer back, not the
 	 * kernel copy's. */
 	kmsg.msg_iov = uiov;
 	if (ret >= 0)
-		copy_to_user((void *)a2, &kmsg, sizeof(struct msghdr));
+		copy_to_user((void *)umsg, &kmsg, sizeof(struct msghdr));
 	return ret;
+}
+
+/* Resolve the socket of a msg call once: AF_UNIX (parked on the task) or
+ * inet (held in *held).  Returns the inet index, 0 for AF_UNIX (*ufd set),
+ * or -errno. */
+static int msg_sock_resolve(uint64_t fd, unix_socket_t **ufd,
+			    vfs_file_t **held)
+{
+	*ufd = unix_sock_from_fd(fd);
+	if (*ufd)
+		return 0;
+	return sock_idx_from_fd(fd, held);
+}
+
+int64_t sys_sendmsg(uint64_t a1, uint64_t a2, uint64_t a3)
+{
+	SOCK_FD_HOLD;
+	unix_socket_t *ufd;
+
+	if (!validate_user_ptr(a2, sizeof(struct msghdr)))
+		return -EFAULT;
+	int idx = msg_sock_resolve(a1, &ufd, &sock_held);
+	if (idx < 0)
+		return idx;
+	return msg_send_one(ufd, idx, a2, (int)a3);
+}
+
+int64_t sys_recvmsg(uint64_t a1, uint64_t a2, uint64_t a3)
+{
+	SOCK_FD_HOLD;
+	unix_socket_t *ufd;
+
+	if (!validate_user_ptr(a2, sizeof(struct msghdr)))
+		return -EFAULT;
+	int idx = msg_sock_resolve(a1, &ufd, &sock_held);
+	if (idx < 0)
+		return idx;
+	return msg_recv_one(ufd, idx, a2, (int)a3);
+}
+
+/* struct mmsghdr: a message header and the length of its message. */
+struct mmsghdr {
+	struct msghdr msg_hdr;
+	unsigned int msg_len;
+};
+
+/* The most messages one call handles (UIO_MAXIOV, as everywhere). */
+#define MMSG_MAX 1024
+
+/* sendmmsg(fd, vec, vlen, flags): the messages in order until one fails.
+ * Returns how many were sent, or the error when the first one failed. */
+int64_t sys_sendmmsg(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
+{
+	SOCK_FD_HOLD;
+	unix_socket_t *ufd;
+	unsigned vlen = (unsigned)a3;
+	unsigned i;
+	int idx, r = 0;
+
+	if (vlen > MMSG_MAX)
+		vlen = MMSG_MAX;
+	idx = msg_sock_resolve(a1, &ufd, &sock_held);
+	if (idx < 0)
+		return idx;
+	if (vlen && !validate_user_ptr(a2, (size_t)vlen * sizeof(struct mmsghdr)))
+		return -EFAULT;
+	for (i = 0; i < vlen; i++) {
+		uint64_t m = a2 + (uint64_t)i * sizeof(struct mmsghdr);
+		unsigned len;
+
+		r = msg_send_one(ufd, idx, m, (int)a4);
+		if (r < 0)
+			break;
+		len = (unsigned)r;
+		if (copy_to_user((void *)(m + __builtin_offsetof(struct mmsghdr,
+								 msg_len)),
+				 &len, sizeof(len))) {
+			r = -EFAULT;
+			break;
+		}
+	}
+	return i ? (int64_t)i : (int64_t)r;
+}
+
+/* recvmmsg(fd, vec, vlen, flags, timeout): up to vlen messages.  The
+ * timeout is looked at after each message, as everywhere -- it does not
+ * bound the wait for the first one (SO_RCVTIMEO does) -- and the time left
+ * is written back. */
+int64_t sys_recvmmsg(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+		     uint64_t a5)
+{
+	SOCK_FD_HOLD;
+	unix_socket_t *ufd;
+	unsigned vlen = (unsigned)a3;
+	int flags = (int)a4;
+	uint64_t deadline = 0, start = 0;
+	int64_t tmo[2] = { 0, 0 };
+	int forever = 0; // the timeout lies beyond what the clock counts
+	unsigned i;
+	int idx, r = 0;
+
+	if (vlen > MMSG_MAX)
+		vlen = MMSG_MAX;
+	if (a5) {
+		if (!validate_user_ptr(a5, sizeof(tmo)) ||
+		    copy_from_user(tmo, (void *)a5, sizeof(tmo)))
+			return -EFAULT;
+		if (tmo[0] < 0 || tmo[1] < 0 || tmo[1] >= 1000000000LL)
+			return -EINVAL;
+		start = hrtimer_now_ns();
+		forever = net_ts_deadline(start, tmo[0], tmo[1], &deadline);
+	}
+	idx = msg_sock_resolve(a1, &ufd, &sock_held);
+	if (idx < 0)
+		return idx;
+	if (vlen && !validate_user_ptr(a2, (size_t)vlen * sizeof(struct mmsghdr)))
+		return -EFAULT;
+	for (i = 0; i < vlen; i++) {
+		uint64_t m = a2 + (uint64_t)i * sizeof(struct mmsghdr);
+		int f = flags & ~MSG_WAITFORONE;
+		unsigned len;
+
+		if (i && (flags & MSG_WAITFORONE))
+			f |= MSG_DONTWAIT;
+		r = msg_recv_one(ufd, idx, m, f);
+		if (r < 0)
+			break;
+		len = (unsigned)r;
+		if (copy_to_user((void *)(m + __builtin_offsetof(struct mmsghdr,
+								 msg_len)),
+				 &len, sizeof(len))) {
+			r = -EFAULT;
+			break;
+		}
+		/* Out-of-band data ends the batch. */
+		{
+			int mf = 0;
+
+			copy_from_user(&mf,
+				       (void *)(m + __builtin_offsetof(
+							   struct msghdr,
+							   msg_flags)),
+				       sizeof(mf));
+			if (mf & MSG_OOB) {
+				i++;
+				break;
+			}
+		}
+		if (a5 && !forever && hrtimer_now_ns() >= deadline) {
+			i++;
+			break;
+		}
+	}
+	if (a5) {
+		int64_t ts[2];
+
+		net_ts_left(hrtimer_now_ns(), start, deadline, forever, tmo[0],
+			    tmo[1], ts);
+		copy_to_user((void *)a5, ts, sizeof(ts));
+	}
+	/* A failure after some messages is not reported: the caller gets
+	 * what was received, and the next call meets the condition again. */
+	return i ? (int64_t)i : (int64_t)r;
 }
 
 int64_t sys_sendfile(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
@@ -1747,9 +1950,12 @@ int64_t sys_dhcp_control(uint64_t a1)
 int64_t sys_raw_send(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
 	// a1 = subcmd (1=ICMP echo, 2=ARP request)
-	// a2 = dst_ip, a3 = id/seq packed, a4 = ttl, a5 = data_ptr (optional)
+	// a2 = dst_ip, a3 = id/seq packed, a4 = ttl, a5 = data_ptr (optional,
+	// not used: the echo always carries the 56-byte pattern below)
 	int subcmd = (int)a1;
 	net_device_t *dev = net_get_default_device();
+
+	(void)a5;
 	if (!dev)
 		return -ENETDOWN;
 	if (subcmd == 1) {

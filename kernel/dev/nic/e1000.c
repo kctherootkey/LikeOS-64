@@ -9,7 +9,10 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/nic/e1000.h>
+#include <kernel/dev/nic/nic_util.h>
 #include <kernel/net/net.h>
+#include <kernel/net/netdevice.h>
+#include <kernel/net/skb.h>
 #include <kernel/hal/pci.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
@@ -108,18 +111,50 @@ static inline void e1000_write(e1000_dev_t *dev, uint32_t reg, uint32_t val)
 // ============================================================================
 // EEPROM Read
 // ============================================================================
-static uint16_t e1000_read_eeprom(e1000_dev_t *dev, uint8_t addr)
+/* The EERD layout of the 8254x: the word address in bits 15:8 and DONE in
+ * bit 4 -- except on the 82541 and 82547, whose EERD has the address in
+ * bits 15:2 and DONE in bit 1.  Returns 0 and the word, -1 when the read
+ * never completed (the caller then takes the address the hardware loaded
+ * into RAL0/RAH0). */
+static int e1000_is_82541_82547(uint16_t did)
 {
-	e1000_write(dev, E1000_EERD,
-		    (uint32_t)addr << E1000_EERD_ADDR_SHIFT | E1000_EERD_START);
-	uint32_t val;
-	for (int i = 0; i < 10000; i++) {
-		val = e1000_read(dev, E1000_EERD);
-		if (val & E1000_EERD_DONE) {
-			return (uint16_t)(val >> E1000_EERD_DATA_SHIFT);
-		}
+	switch (did) {
+	case 0x1013: // 82541EI
+	case 0x1018: // 82541EI Mobile
+	case 0x1076: // 82541GI
+	case 0x1077: // 82541GI Mobile
+	case 0x1078: // 82541ER
+	case 0x107C: // 82541PI
+	case 0x1019: // 82547EI
+	case 0x101A: // 82547EI Mobile
+	case 0x1075: // 82547GI
+		return 1;
+	default:
+		return 0;
 	}
-	return 0;
+}
+
+static void e1000_delay_us(uint32_t us);
+
+static int e1000_read_eeprom(e1000_dev_t *dev, uint8_t addr, uint16_t *out)
+{
+	uint32_t shift = E1000_EERD_ADDR_SHIFT, done = E1000_EERD_DONE;
+
+	if (e1000_is_82541_82547(dev->device_id)) {
+		shift = 2;
+		done = 1u << 1;
+	}
+	e1000_write(dev, E1000_EERD, ((uint32_t)addr << shift) | E1000_EERD_START);
+	for (int i = 0; i < 2000; i++) {
+		uint32_t val = e1000_read(dev, E1000_EERD);
+
+		if (val & done) {
+			*out = (uint16_t)(val >> E1000_EERD_DATA_SHIFT);
+			return 0;
+		}
+		e1000_delay_us(5);
+	}
+	return -1;
 }
 
 // ============================================================================
@@ -127,12 +162,14 @@ static uint16_t e1000_read_eeprom(e1000_dev_t *dev, uint8_t addr)
 // ============================================================================
 static void e1000_read_mac(e1000_dev_t *dev)
 {
-	// Try EEPROM first
-	uint16_t w0 = e1000_read_eeprom(dev, 0);
-	uint16_t w1 = e1000_read_eeprom(dev, 1);
-	uint16_t w2 = e1000_read_eeprom(dev, 2);
+	uint16_t w0 = 0, w1 = 0, w2 = 0;
+	int nvm_ok = e1000_read_eeprom(dev, 0, &w0) == 0 &&
+		     e1000_read_eeprom(dev, 1, &w1) == 0 &&
+		     e1000_read_eeprom(dev, 2, &w2) == 0;
 
-	if (w0 != 0 || w1 != 0 || w2 != 0) {
+	if (nvm_ok && (w0 | w1 | w2) != 0 &&
+	    !(w0 == 0xFFFF && w1 == 0xFFFF && w2 == 0xFFFF) &&
+	    !(w0 & 1)) { // a station address is never a group address
 		dev->mac_addr[0] = w0 & 0xFF;
 		dev->mac_addr[1] = (w0 >> 8) & 0xFF;
 		dev->mac_addr[2] = w1 & 0xFF;
@@ -140,7 +177,7 @@ static void e1000_read_mac(e1000_dev_t *dev)
 		dev->mac_addr[4] = w2 & 0xFF;
 		dev->mac_addr[5] = (w2 >> 8) & 0xFF;
 	} else {
-		// Fallback: read from RAL/RAH
+		// RAL/RAH, loaded from the EEPROM by the hardware at reset
 		uint32_t ral = e1000_read(dev, E1000_RAL);
 		uint32_t rah = e1000_read(dev, E1000_RAH);
 		dev->mac_addr[0] = ral & 0xFF;
@@ -197,7 +234,7 @@ static void e1000_reset(e1000_dev_t *dev)
 }
 
 // ============================================================================
-// Initialize RX Ring with Extended Descriptors
+// Initialize RX Ring
 // ============================================================================
 static int e1000_init_rx(e1000_dev_t *dev)
 {
@@ -240,6 +277,19 @@ static int e1000_init_rx(e1000_dev_t *dev)
 	e1000_write(dev, E1000_RDH, 0);
 	e1000_write(dev, E1000_RDT, E1000_NUM_RX_DESC - 1);
 
+	/* TCP/UDP receive checksum offload: the MAC reports in each
+	 * descriptor whether it verified the checksum (e1000_rx_deliver). */
+	e1000_write(dev, E1000_RXCSUM,
+		    e1000_read(dev, E1000_RXCSUM) | E1000_RXCSUM_TUOFL);
+
+	/* Interrupt moderation: no per-frame receive delay, the rate capped
+	 * by ITR from 20000/s; the poll adapts it (e1000_update_itr). */
+	e1000_write(dev, E1000_RDTR, 0);
+	e1000_write(dev, E1000_RADV, 8);
+	dev->itr_rate = NIC_ITR_RATE_LOW;
+	dev->itr_rx_class = dev->itr_tx_class = NIC_ITR_LOW;
+	e1000_write(dev, E1000_ITR, nic_itr_reg(dev->itr_rate));
+
 	// Configure receive control
 	uint32_t rctl = E1000_RCTL_EN // Enable receiver
 			| E1000_RCTL_BAM // Accept broadcast
@@ -249,12 +299,31 @@ static int e1000_init_rx(e1000_dev_t *dev)
 	e1000_write(dev, E1000_RCTL, rctl);
 
 	dev->rx_tail = E1000_NUM_RX_DESC - 1;
+	dev->rx_discarding = 0;
 	return 0;
 }
 
 // ============================================================================
-// Initialize TX Ring with Extended Descriptors
+// Initialize TX Ring
 // ============================================================================
+/* Fiber and SerDes parts take a transmit IPG of 9, copper 8. */
+static int e1000_is_fiber(uint16_t did)
+{
+	switch (did) {
+	case 0x1003:
+	case 0x1009:
+	case 0x1011:
+	case 0x1012:
+	case 0x1027:
+	case 0x1028:
+	case 0x107A:
+	case 0x107B:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
 static int e1000_init_tx(e1000_dev_t *dev)
 {
 	uint32_t tx_ring_size =
@@ -282,6 +351,7 @@ static int e1000_init_tx(e1000_dev_t *dev)
 		}
 		dev->tx_bufs[i] = (uint8_t *)phys_to_virt(buf_phys);
 		dev->tx_bufs_phys[i] = buf_phys;
+		dev->tx_stamp[i] = 0;
 	}
 
 	// Program TX ring registers
@@ -291,9 +361,16 @@ static int e1000_init_tx(e1000_dev_t *dev)
 	e1000_write(dev, E1000_TDH, 0);
 	e1000_write(dev, E1000_TDT, 0);
 
-	// Configure transmit inter-packet gap
+	/* Transmit inter-packet gap of the 82543 and later: IPGT 8 on copper
+	 * (9 on fiber), IPGR1 8, IPGR2 6. */
 	e1000_write(dev, E1000_TIPG,
-		    E1000_TIPG_IPGT | E1000_TIPG_IPGR1 | E1000_TIPG_IPGR2);
+		    (e1000_is_fiber(dev->device_id) ? 9u : 8u) | (8u << 10) |
+			    (6u << 20));
+
+	/* Transmit interrupt delay: descriptors carry IDE (e1000_xmit), TXDW
+	 * waits TIDV for more completions, TADV bounds the wait. */
+	e1000_write(dev, E1000_TIDV_REG, 8);
+	e1000_write(dev, E1000_TADV_REG, 32);
 
 	// Configure transmit control
 	uint32_t tctl =
@@ -307,92 +384,354 @@ static int e1000_init_tx(e1000_dev_t *dev)
 	e1000_write(dev, E1000_TCTL, tctl);
 
 	dev->tx_tail = 0;
+	dev->tx_clean = 0;
 	return 0;
 }
 
 // ============================================================================
-// E1000 Send Packet (net_device_t callback)
+// Transmit (net_device_t xmit hook)
 // ============================================================================
-static int e1000_send(net_device_t *ndev, const uint8_t *data, uint16_t len)
+#define E1000_TX_WAKE_THRESH 32
+#define E1000_IMS_NAPI                                        \
+	(E1000_ICR_RXT0 | E1000_ICR_TXDW | E1000_ICR_RXDMT0 | \
+	 E1000_ICR_RXO)
+#define E1000_IMS_ALL (E1000_IMS_NAPI | E1000_ICR_LSC)
+
+static uint32_t e1000_tx_unused(const e1000_dev_t *dev)
 {
-	BUG_ON(ndev == NULL);
+	return nic_ring_unused(dev->tx_tail, dev->tx_clean, E1000_NUM_TX_DESC);
+}
+
+/* Reclaim written-back descriptors, oldest first.  Caller holds tx_lock. */
+static uint32_t e1000_tx_clean_locked(e1000_dev_t *dev)
+{
+	uint32_t n = 0;
+
+	while (dev->tx_clean != dev->tx_tail) {
+		volatile e1000_tx_desc_legacy_t *d =
+			&dev->tx_descs[dev->tx_clean];
+		uint8_t st = d->status;
+
+		if (!(st & E1000_TXD_STAT_DD))
+			break;
+		if (st & (E1000_TXD_STAT_EC | E1000_TXD_STAT_LC))
+			dev->net_dev.tx_errors++;
+		dev->itr_tx_packets++;
+		dev->itr_tx_bytes += d->length;
+		d->cmd = 0;
+		d->status = 0;
+		dev->tx_stamp[dev->tx_clean] = 0;
+		dev->tx_clean =
+			(uint16_t)((dev->tx_clean + 1) % E1000_NUM_TX_DESC);
+		n++;
+	}
+	return n;
+}
+
+static void e1000_tx_maybe_wake_locked(e1000_dev_t *dev)
+{
+	if (netif_queue_stopped(&dev->net_dev) &&
+	    e1000_tx_unused(dev) >= E1000_TX_WAKE_THRESH)
+		netif_wake_queue(&dev->net_dev);
+}
+
+/* One frame to the hardware (the core calls this one CPU at a time; tx_lock
+ * orders it against the poll's reclaim and the watchdog's ring reset). */
+static int e1000_xmit(sk_buff_t *skb, net_device_t *ndev)
+{
+	e1000_dev_t *dev = (e1000_dev_t *)ndev->driver_data;
+	uint32_t len = skb->len;
+	uint64_t f;
+	uint16_t i;
+
+	BUG_ON(dev == NULL);
 	BUILD_BUG_ON(sizeof(e1000_rx_desc_legacy_t) != 16);
 	BUILD_BUG_ON(sizeof(e1000_tx_desc_legacy_t) != 16);
-	e1000_dev_t *dev = (e1000_dev_t *)ndev->driver_data;
-	BUG_ON(dev == NULL);
+	if (len == 0 || len > E1000_RX_BUF_SIZE) {
+		ndev->tx_dropped++;
+		skb_put(skb);
+		return NETDEV_TX_OK;
+	}
 
-	if (len > E1000_RX_BUF_SIZE)
-		return -1;
-
-	// Serialize across CPUs: tx_tail, descriptor slot, and TDT MMIO write
-	// form one critical section; any two CPUs racing here would otherwise
-	// (a) read the same tx_tail, (b) write the same descriptor slot, and
-	// (c) lose one packet to the duplicate-tail-bump.  Hold IRQs disabled
-	// for the few MMIO cycles so an IRQ-tail TX (e.g. softirq sending a
-	// TCP ACK) cannot preempt user-context TX from the same CPU mid-slot.
-	uint64_t txflags;
-	spin_lock_irqsave(&dev->tx_lock, &txflags);
-
-	uint16_t tail = dev->tx_tail;
-
-	// Check if descriptor is available (DD bit set means hardware is done with it)
-	volatile e1000_tx_desc_legacy_t *desc = &dev->tx_descs[tail];
-	if (tail != 0 || desc->cmd != 0) {
-		if (!(desc->status & E1000_TXD_STAT_DD) && desc->cmd != 0) {
-			ndev->tx_errors++;
-			spin_unlock_irqrestore(&dev->tx_lock, txflags);
-			return -1;
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	if (e1000_tx_unused(dev) == 0) {
+		e1000_tx_clean_locked(dev);
+		if (e1000_tx_unused(dev) == 0) {
+			netif_stop_queue(ndev);
+			spin_unlock_irqrestore(&dev->tx_lock, f);
+			return NETDEV_TX_BUSY;
 		}
 	}
 
-	// Copy data to TX buffer (rep movs — was a byte loop under tx_lock
-	// IRQs-off, which also throttled ACK emission and fed back into
-	// receiver flow control).
-	mm_memcpy(dev->tx_bufs[tail], data, len);
+	i = dev->tx_tail;
+	volatile e1000_tx_desc_legacy_t *desc = &dev->tx_descs[i];
 
-	// Set up legacy TX descriptor
-	desc->buffer_addr = dev->tx_bufs_phys[tail];
-	desc->length = len;
+	mm_memcpy(dev->tx_bufs[i], skb->data, len);
+	desc->buffer_addr = dev->tx_bufs_phys[i];
+	desc->length = (uint16_t)len;
 	desc->cso = 0;
-	desc->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS;
 	desc->status = 0;
 	desc->css = 0;
 	desc->special = 0;
+	desc->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS |
+		    E1000_TXD_CMD_IDE;
+	{
+		uint64_t now = timer_ticks();
 
-	// Memory barrier before advancing tail
+		dev->tx_stamp[i] = now ? now : 1;
+	}
+
+	// Descriptor and buffer before the doorbell
 	__asm__ volatile("mfence" ::: "memory");
 
-	// Advance tail
-	dev->tx_tail = (tail + 1) % E1000_NUM_TX_DESC;
+	dev->tx_tail = (uint16_t)((i + 1) % E1000_NUM_TX_DESC);
 	e1000_write(dev, E1000_TDT, dev->tx_tail);
 
 	ndev->tx_packets++;
 	ndev->tx_bytes += len;
-	spin_unlock_irqrestore(&dev->tx_lock, txflags);
-	return 0;
+	if (e1000_tx_unused(dev) == 0)
+		netif_stop_queue(ndev);
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+	skb_put(skb);
+	return NETDEV_TX_OK;
+}
+
+/* Throw away what the transmit ring holds and restart it empty (link lost
+ * with frames pending, or a transmit hang).  Only TCTL.EN and the ring
+ * registers are touched -- never CTRL.RST, which breaks reception on the
+ * VirtualBox e1000. */
+static void e1000_tx_ring_reset(e1000_dev_t *dev)
+{
+	uint64_t f;
+	uint32_t pending;
+
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	e1000_tx_clean_locked(dev);
+	pending = (uint32_t)((dev->tx_tail + E1000_NUM_TX_DESC -
+			      dev->tx_clean) %
+			     E1000_NUM_TX_DESC);
+	if (!pending) {
+		spin_unlock_irqrestore(&dev->tx_lock, f);
+		return;
+	}
+	uint32_t tctl = e1000_read(dev, E1000_TCTL);
+	e1000_write(dev, E1000_TCTL, tctl & ~E1000_TCTL_EN);
+	(void)e1000_read(dev, E1000_STATUS);
+	e1000_delay_us(100);
+	for (int i = 0; i < E1000_NUM_TX_DESC; i++) {
+		volatile e1000_tx_desc_legacy_t *d = &dev->tx_descs[i];
+
+		d->cmd = 0;
+		d->status = 0;
+		d->length = 0;
+		dev->tx_stamp[i] = 0;
+	}
+	__asm__ volatile("mfence" ::: "memory");
+	dev->tx_tail = 0;
+	dev->tx_clean = 0;
+	e1000_write(dev, E1000_TDH, 0);
+	e1000_write(dev, E1000_TDT, 0);
+	e1000_write(dev, E1000_TCTL, tctl);
+	dev->net_dev.tx_errors += pending;
+	e1000_tx_maybe_wake_locked(dev);
+	spin_unlock_irqrestore(&dev->tx_lock, f);
 }
 
 // ============================================================================
-// E1000 Link Status (net_device_t callback)
+// Link state, receive filter, statistics, watchdog
 // ============================================================================
-// Polled by userland (ifconfig etc.).  Also acts as a hot-plug fallback
-// when the LSC IRQ has not yet fired: detects the edge against the
-// cached dev->link_up, prints UP/DOWN, and on a DOWN edge invalidates
-// the DHCP lease so the next dhclient invocation does a full DISCOVER
-// against the new network instead of a (stale) unicast renewal.
-static int e1000_link_status(net_device_t *ndev)
+static uint32_t e1000_status_speed(uint32_t status)
 {
-	e1000_dev_t *dev = (e1000_dev_t *)ndev->driver_data;
+	switch ((status >> 6) & 0x3) {
+	case 0:
+		return 10;
+	case 1:
+		return 100;
+	default:
+		return 1000;
+	}
+}
+
+/* Act on a link change: carrier, the DHCP lease, the transmit ring.  The
+ * LSC interrupt only flags it; this runs in the watchdog (CPU 0). */
+static void e1000_link_state_poll(e1000_dev_t *dev)
+{
 	uint32_t status = e1000_read(dev, E1000_STATUS);
 	int now_up = (status & E1000_STATUS_LU) ? 1 : 0;
 	int was_up = dev->link_up;
-	if (now_up != was_up) {
-		dev->link_up = now_up;
-		kprintf("E1000: Link %s\n", now_up ? "UP" : "DOWN");
-		if (!now_up)
-			dhcp_invalidate(ndev);
+	int pending = __atomic_exchange_n(&dev->link_change_pending, 0,
+					  __ATOMIC_ACQ_REL);
+
+	if (now_up == was_up && !pending)
+		return;
+	if (!now_up) {
+		if (was_up) {
+			dev->link_up = 0;
+			dev->link_speed = 0;
+			kprintf("E1000: Link DOWN\n");
+			netif_carrier_off(&dev->net_dev);
+			// The network may be another one when the link
+			// returns (cable moved, bridged<->NAT): full DISCOVER.
+			dhcp_invalidate(&dev->net_dev);
+		}
+		e1000_tx_ring_reset(dev);
+		return;
 	}
-	return now_up;
+	dev->link_speed = e1000_status_speed(status);
+	if (!was_up) {
+		dev->link_up = 1;
+		kprintf("E1000: Link UP (%u Mb/s, %s duplex)\n",
+			dev->link_speed,
+			(status & E1000_STATUS_FD) ? "full" : "half");
+	}
+	netif_carrier_on(&dev->net_dev);
+}
+
+static void e1000_apply_rx_mode(e1000_dev_t *dev)
+{
+	uint8_t mc[NETDEV_MC_MAX][6];
+	uint32_t mta[128];
+	int all = 0;
+	int n = dev_mc_snapshot(&dev->net_dev, mc, NETDEV_MC_MAX, &all);
+	uint32_t flags = __atomic_load_n(&dev->net_dev.flags, __ATOMIC_ACQUIRE);
+
+	for (int r = 0; r < 128; r++)
+		mta[r] = 0;
+	for (int i = 0; i < n; i++) {
+		uint32_t h = nic_mta_hash(mc[i], 128);
+
+		mta[h >> 5] |= 1u << (h & 31);
+	}
+	for (int r = 0; r < 128; r++)
+		e1000_write(dev, E1000_MTA + r * 4, mta[r]);
+
+	uint32_t rctl = e1000_read(dev, E1000_RCTL) &
+			~(E1000_RCTL_UPE | E1000_RCTL_MPE);
+	if (flags & IFF_PROMISC)
+		rctl |= E1000_RCTL_UPE | E1000_RCTL_MPE;
+	else if (all || (flags & IFF_ALLMULTI))
+		rctl |= E1000_RCTL_MPE;
+	e1000_write(dev, E1000_RCTL, rctl);
+}
+
+static void e1000_set_rx_mode(net_device_t *ndev)
+{
+	e1000_dev_t *dev = (e1000_dev_t *)ndev->driver_data;
+
+	__atomic_store_n(&dev->rx_mode_pending, 1, __ATOMIC_RELEASE);
+	net_housekeeping_kick();
+}
+
+static void e1000_update_stats(e1000_dev_t *dev)
+{
+	dev->st_crc += e1000_read(dev, E1000_ST_CRCERRS);
+	dev->st_align += e1000_read(dev, E1000_ST_ALGNERRC);
+	dev->st_rxerr += e1000_read(dev, E1000_ST_RXERRC);
+	dev->st_missed += e1000_read(dev, E1000_ST_MPC);
+	dev->st_colls += e1000_read(dev, E1000_ST_COLC);
+	dev->st_latecol += e1000_read(dev, E1000_ST_LATECOL);
+	dev->st_ecol += e1000_read(dev, E1000_ST_ECOL);
+	dev->st_tncrs += e1000_read(dev, E1000_ST_TNCRS);
+	dev->st_rlen += e1000_read(dev, E1000_ST_RLEC) +
+			e1000_read(dev, E1000_ST_RUC) +
+			e1000_read(dev, E1000_ST_ROC);
+	dev->st_nobuf += e1000_read(dev, E1000_ST_RNBC);
+}
+
+static void e1000_get_stats64(net_device_t *ndev, struct net_device_stats64 *s)
+{
+	e1000_dev_t *dev = (e1000_dev_t *)ndev->driver_data;
+
+	s->rx_crc_errors = dev->st_crc;
+	s->rx_frame_errors = dev->st_align;
+	s->rx_missed_errors = dev->st_missed;
+	s->rx_length_errors = dev->st_rlen + dev->st_rx_frag;
+	s->rx_fifo_errors = dev->st_nobuf;
+	s->collisions = dev->st_colls;
+	s->tx_aborted_errors = dev->st_ecol;
+	s->tx_carrier_errors = dev->st_tncrs;
+	s->rx_errors += dev->st_crc + dev->st_align + dev->st_rxerr +
+			dev->st_rlen;
+	s->tx_errors += dev->st_ecol + dev->st_latecol;
+}
+
+/* The oldest transmit descriptor not done for longer than the link speed
+ * allows (link up, transmitter not paused): restart the transmit ring. */
+static void e1000_check_tx_hang(e1000_dev_t *dev)
+{
+	static uint32_t reported;
+	uint64_t now = timer_ticks(), f;
+	uint32_t limit_ms;
+	int hang = 0;
+
+	if (!dev->link_up)
+		return;
+	limit_ms = dev->link_speed == 1000 ? 2000 :
+		   dev->link_speed == 100  ? 10000 :
+					     16000;
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	if (dev->tx_clean != dev->tx_tail) {
+		uint64_t stamp = dev->tx_stamp[dev->tx_clean];
+
+		if (stamp && now - stamp > net_ms_to_ticks(limit_ms) &&
+		    !(e1000_read(dev, E1000_STATUS) & E1000_STATUS_TXOFF))
+			hang = 1;
+	}
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+	if (!hang)
+		return;
+	dev->st_tx_hangs++;
+	if (reported < 5) {
+		reported++;
+		kprintf("E1000: transmit unit hang (TDH=%u TDT=%u), restarting the transmit ring\n",
+			e1000_read(dev, E1000_TDH), e1000_read(dev, E1000_TDT));
+	}
+	e1000_tx_ring_reset(dev);
+}
+
+static void e1000_tx_timeout(net_device_t *ndev)
+{
+	e1000_dev_t *dev = (e1000_dev_t *)ndev->driver_data;
+
+	dev->st_tx_hangs++;
+	e1000_tx_ring_reset(dev);
+}
+
+// Network housekeeping softirq, CPU 0, ~10 Hz and after an LSC interrupt.
+static void e1000_watchdog(net_device_t *ndev)
+{
+	e1000_dev_t *dev = (e1000_dev_t *)ndev->driver_data;
+	uint64_t f;
+
+	if (!dev || !g_e1000_initialized)
+		return;
+	e1000_link_state_poll(dev);
+	if (__atomic_exchange_n(&dev->rx_mode_pending, 0, __ATOMIC_ACQ_REL))
+		e1000_apply_rx_mode(dev);
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	e1000_tx_clean_locked(dev);
+	e1000_tx_maybe_wake_locked(dev);
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+	e1000_check_tx_hang(dev);
+	if (timer_ticks() - dev->stats_tick >= net_ms_to_ticks(2000)) {
+		dev->stats_tick = timer_ticks();
+		e1000_update_stats(dev);
+	}
+}
+
+// Polled by userland (ifconfig etc.): STATUS.LU is the ground truth; a
+// change is handed to the watchdog, which does the edge work.
+static int e1000_link_status(net_device_t *ndev)
+{
+	e1000_dev_t *dev = (e1000_dev_t *)ndev->driver_data;
+	int up = (e1000_read(dev, E1000_STATUS) & E1000_STATUS_LU) ? 1 : 0;
+
+	if (up != dev->link_up) {
+		__atomic_store_n(&dev->link_change_pending, 1,
+				 __ATOMIC_RELEASE);
+		net_housekeeping_kick();
+	}
+	return up;
 }
 
 // Quiesce the controller ahead of an ACPI S5 transition.  Per the
@@ -431,14 +770,155 @@ static void e1000_shutdown(net_device_t *ndev)
 }
 
 // ============================================================================
-// E1000 IRQ Handler
+// Receive (NAPI poll)
 // ============================================================================
-void e1000_irq_handler(void)
+static void e1000_rx_deliver(e1000_dev_t *dev, const uint8_t *buf,
+			     uint32_t len, uint8_t status, uint8_t errors)
 {
-	if (!g_e1000_initialized) {
-		lapic_eoi();
+	net_device_t *nd = &dev->net_dev;
+	sk_buff_t *skb = skb_alloc(len);
+	int cs;
+
+	if (!skb) {
+		nd->rx_dropped++;
 		return;
 	}
+	skb->dev = nd;
+	mm_memcpy(skb_append(skb, len), buf, len);
+	// the 8254x folds UDP into TCPCS and reports IP errors apart
+	cs = nic_e1000_rx_csum(status, errors, 0, 0);
+	if (cs == NIC_CSUM_OK && (nd->features & NETIF_F_RXCSUM))
+		skb->ip_summed = CHECKSUM_UNNECESSARY;
+	else if (cs == NIC_CSUM_BAD)
+		dev->st_csum_err++;
+	nd->rx_packets++;
+	nd->rx_bytes += len;
+	if (nic_is_multicast(buf))
+		nd->multicast++;
+	dev->itr_rx_packets++;
+	dev->itr_rx_bytes += len;
+	napi_gro_receive(&dev->napi, skb);
+}
+
+static int e1000_rx_clean(e1000_dev_t *dev, int budget)
+{
+	uint16_t ntc = (uint16_t)((dev->rx_tail + 1) % E1000_NUM_RX_DESC);
+	uint16_t last = dev->rx_tail;
+	int work = 0, refill = 0;
+
+	while (work < budget) {
+		volatile e1000_rx_desc_legacy_t *d = &dev->rx_descs[ntc];
+		uint8_t status = d->status;
+
+		if (!(status & E1000_RXD_STAT_DD))
+			break;
+		// the rest of the descriptor only after DD (volatile, in order)
+		uint8_t errors = d->errors;
+		uint16_t len = d->length;
+
+		switch (nic_e1000_rx_verdict(status, errors, len,
+					     E1000_RX_BUF_SIZE,
+					     &dev->rx_discarding)) {
+		case NIC_RXV_DELIVER:
+			e1000_rx_deliver(dev, dev->rx_bufs[ntc], len, status,
+					 errors);
+			break;
+		case NIC_RXV_ERROR:
+			dev->net_dev.rx_errors++;
+			break;
+		default:
+			dev->st_rx_frag++;
+			break;
+		}
+		d->status = 0;
+		d->errors = 0;
+		last = ntc;
+		ntc = (uint16_t)((ntc + 1) % E1000_NUM_RX_DESC);
+		work++;
+		/* Batch the RDT MMIO write (one PCIe round trip) per 32
+		 * descriptors rather than one per descriptor. */
+		if (++refill >= 32) {
+			__asm__ volatile("mfence" ::: "memory");
+			dev->rx_tail = last;
+			e1000_write(dev, E1000_RDT, last);
+			refill = 0;
+		}
+	}
+	if (refill) {
+		__asm__ volatile("mfence" ::: "memory");
+		dev->rx_tail = last;
+		e1000_write(dev, E1000_RDT, last);
+	}
+	return work;
+}
+
+static void e1000_update_itr(e1000_dev_t *dev, uint32_t txp, uint32_t txb)
+{
+	uint32_t target;
+
+	if (dev->link_speed != 1000) {
+		target = NIC_ITR_RATE_BULK;
+	} else {
+		int cls;
+
+		dev->itr_rx_class = nic_itr_classify(dev->itr_rx_class,
+						     dev->itr_rx_packets,
+						     dev->itr_rx_bytes);
+		dev->itr_tx_class =
+			nic_itr_classify(dev->itr_tx_class, txp, txb);
+		cls = dev->itr_rx_class > dev->itr_tx_class ?
+			      dev->itr_rx_class :
+			      dev->itr_tx_class;
+		target = nic_itr_class_rate(cls, 1);
+	}
+	dev->itr_rx_packets = 0;
+	dev->itr_rx_bytes = 0;
+	if (target != dev->itr_rate) {
+		dev->itr_rate = nic_itr_next_rate(dev->itr_rate, target);
+		e1000_write(dev, E1000_ITR, nic_itr_reg(dev->itr_rate));
+	}
+}
+
+static int e1000_poll(struct napi_struct *n, int budget)
+{
+	e1000_dev_t *dev = (e1000_dev_t *)n->dev->driver_data;
+	uint64_t f;
+	int work;
+
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	e1000_tx_clean_locked(dev);
+	e1000_tx_maybe_wake_locked(dev);
+	dev->itr_tx_acc_packets += dev->itr_tx_packets;
+	dev->itr_tx_acc_bytes += dev->itr_tx_bytes;
+	dev->itr_tx_packets = 0;
+	dev->itr_tx_bytes = 0;
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+
+	work = e1000_rx_clean(dev, budget);
+	if (work < budget) {
+		e1000_update_itr(dev, dev->itr_tx_acc_packets,
+				 dev->itr_tx_acc_bytes);
+		dev->itr_tx_acc_packets = 0;
+		dev->itr_tx_acc_bytes = 0;
+		if (napi_complete_done(n, work))
+			e1000_write(dev, E1000_IMS, E1000_IMS_NAPI);
+	}
+	return work;
+}
+
+// ============================================================================
+// E1000 IRQ Handler
+// ============================================================================
+/* Acknowledge the causes; receive and transmit completion go to the NAPI
+ * poll (their causes masked until it is done), link changes to the
+ * watchdog.  Returns 1 when the interrupt was this device's (a cause it
+ * has enabled was pending: nic_e1000_irq_ours), 0 when it was not -- on a
+ * shared legacy line the dispatcher then offers it to the next handler.
+ * The dispatcher, not the handler, acknowledges the local APIC. */
+int e1000_irq_handler(void)
+{
+	if (!g_e1000_initialized)
+		return 0;
 
 	// Feed entropy from NIC interrupt timing
 	{
@@ -450,80 +930,25 @@ void e1000_irq_handler(void)
 
 	e1000_dev_t *dev = &g_e1000;
 	uint32_t icr = e1000_read(dev, E1000_ICR);
+	int handled;
 	WARN_ON_ONCE(icr == 0xFFFFFFFF); /* ICR all-ones: MMIO bus error */
 
-	if (icr == 0) {
-		// Spurious - no cause bits set
-		lapic_eoi();
-		return;
-	}
+	if (icr == 0 || icr == 0xFFFFFFFF)
+		return 0; // no cause: not ours (or spurious)
+	handled = nic_e1000_irq_ours(icr, e1000_read(dev, E1000_IMS));
 
 	if (icr & E1000_ICR_LSC) {
-		// Link status change
-		uint32_t status = e1000_read(dev, E1000_STATUS);
-		int now_up = (status & E1000_STATUS_LU) ? 1 : 0;
-		int was_up = dev->link_up;
-		dev->link_up = now_up;
-		if (now_up != was_up) {
-			kprintf("E1000: Link %s\n", now_up ? "UP" : "DOWN");
-			if (!now_up) {
-				// Link dropped: invalidate the DHCP lease so the next
-				// dhclient invocation does a full DISCOVER instead of
-				// unicast-renewing against the previous network's
-				// server (which is unreachable when bridged<->NAT or
-				// the cable moved to a different switch).
-				dhcp_invalidate(&dev->net_dev);
-			}
-		}
+		dev->link_change_pending = 1;
+		net_housekeeping_kick();
 	}
-
-	if (icr & (E1000_ICR_RXT0 | E1000_ICR_RXDMT0 | E1000_ICR_RXO)) {
-		// Process received packets (legacy descriptors)
-		uint16_t tail = (dev->rx_tail + 1) % E1000_NUM_RX_DESC;
-		uint16_t last_processed = dev->rx_tail;
-		int processed_any = 0;
-
-		while (1) {
-			volatile e1000_rx_desc_legacy_t *desc =
-				&dev->rx_descs[tail];
-			if (!(desc->status & E1000_RXD_STAT_DD))
-				break;
-
-			uint16_t len = desc->length;
-			if ((desc->status & E1000_RXD_STAT_EOP) && len > 0 &&
-			    len <= E1000_RX_BUF_SIZE) {
-				net_rx_packet(&dev->net_dev, dev->rx_bufs[tail],
-					      len);
-			} else {
-				dev->net_dev.rx_errors++;
-			}
-
-			// Reset descriptor for reuse
-			desc->buffer_addr = dev->rx_bufs_phys[tail];
-			desc->status = 0;
-
-			last_processed = tail;
-			processed_any = 1;
-
-			tail = (tail + 1) % E1000_NUM_RX_DESC;
-		}
-
-		/* Batch the RDT MMIO write: instead of one PCIe round-trip per
-         * descriptor (~1 µs each — ~1 ms/s of IRQ-context MMIO at line
-         * rate), write RDT once at the end of the drain loop with the
-         * last descriptor we processed.  This is the standard pattern
-         * mature drivers use. */
-		if (processed_any) {
-			dev->rx_tail = last_processed;
-			e1000_write(dev, E1000_RDT, last_processed);
-		}
+	/* Receive/transmit work also when the interrupt was another
+	 * device's: the read consumed the cause, and a poll about to
+	 * re-enable its interrupts would not hear of it otherwise. */
+	if (icr & E1000_IMS_NAPI) {
+		e1000_write(dev, E1000_IMC, E1000_IMS_NAPI);
+		napi_schedule(&dev->napi);
 	}
-
-	if (icr & E1000_ICR_TXDW) {
-		// TX descriptor written back - descriptors reclaimed via DD bit check in send
-	}
-
-	lapic_eoi();
+	return handled;
 }
 
 // ============================================================================
@@ -549,21 +974,16 @@ static int e1000_map_bar(e1000_dev_t *dev)
 	dev->mmio_phys = phys;
 	dev->mmio_size = 128 * 1024; // E1000 MMIO is typically 128KB
 
-	// Map MMIO pages
-	uint64_t virt_base = (uint64_t)phys_to_virt(phys);
+	/* Strictly uncached, also where the BAR lies inside the write-back
+	 * direct map (a write-back alias of device registers lets writes
+	 * be combined and reordered). */
 	uint32_t num_pages = (dev->mmio_size + PAGE_SIZE - 1) / PAGE_SIZE;
-
-	for (uint32_t i = 0; i < num_pages; i++) {
-		uint64_t page_phys = phys + i * PAGE_SIZE;
-		uint64_t page_virt = virt_base + i * PAGE_SIZE;
-		if (!mm_is_page_mapped(page_virt)) {
-			mm_map_page(page_virt, page_phys,
-				    PAGE_PRESENT | PAGE_WRITABLE |
-					    PAGE_CACHE_DISABLE |
-					    PAGE_WRITE_THROUGH);
-		}
+	uint64_t virt_base = mm_map_device_mmio(phys, num_pages);
+	if (!virt_base) {
+		kprintf("E1000: Failed to map BAR0 MMIO (phys=%llx)\n",
+			(unsigned long long)phys);
+		return -1;
 	}
-
 	dev->mmio_base = (volatile uint8_t *)virt_base;
 	return 0;
 }
@@ -766,12 +1186,12 @@ void e1000_init(void)
 		dev->net_dev.rx_errors = 0;
 		dev->net_dev.tx_errors = 0;
 		dev->net_dev.rx_dropped = 0;
+		dev->net_dev.driver_data = dev;
+		// the poll exists before the handler can be called
+		netif_napi_add(&dev->net_dev, &dev->napi, e1000_poll,
+			       NAPI_POLL_WEIGHT);
+		napi_enable(&dev->napi);
 		g_e1000_initialized = 1;
-
-		// Enable interrupts: RXT0, TXDW, LSC
-		e1000_write(dev, E1000_IMS,
-			    E1000_ICR_RXT0 | E1000_ICR_TXDW | E1000_ICR_LSC |
-				    E1000_ICR_RXDMT0 | E1000_ICR_RXO);
 
 		// Check link status.  After a CTRL.RST, VirtualBox's E1000
 		// emulation can take several seconds to bring the link back up.
@@ -789,7 +1209,14 @@ void e1000_init(void)
 			}
 		}
 		dev->link_up = (status & E1000_STATUS_LU) ? 1 : 0;
-		kprintf("E1000: Link %s\n", dev->link_up ? "UP" : "DOWN");
+		if (dev->link_up) {
+			dev->link_speed = e1000_status_speed(status);
+			kprintf("E1000: Link UP (%u Mb/s, %s duplex)\n",
+				dev->link_speed,
+				(status & E1000_STATUS_FD) ? "full" : "half");
+		} else {
+			kprintf("E1000: Link DOWN\n");
+		}
 
 		// Set up net_device_t
 		dev->net_dev.name = "eth0";
@@ -800,16 +1227,27 @@ void e1000_init(void)
 		dev->net_dev.netmask = 0;
 		dev->net_dev.gateway = 0;
 		dev->net_dev.dns_server = 0;
-		dev->net_dev.send = e1000_send;
+		dev->net_dev.send = NULL;
+		dev->net_dev.xmit = e1000_xmit;
 		dev->net_dev.link_status = e1000_link_status;
 		dev->net_dev.shutdown = e1000_shutdown;
-		dev->net_dev.driver_data = dev;
+		dev->net_dev.watchdog = e1000_watchdog;
+		dev->net_dev.tx_timeout = e1000_tx_timeout;
+		dev->net_dev.set_rx_mode = e1000_set_rx_mode;
+		dev->net_dev.get_stats64 = e1000_get_stats64;
+		dev->net_dev.features |= NETIF_F_RXCSUM;
+		dev->stats_tick = timer_ticks();
 		// Note: lock and statistics counters are initialised earlier (before
-		// we enable device interrupts) so the IRQ handler always sees a
-		// valid net_device_t.
+		// the handler can run) so the IRQ handler always sees a valid
+		// net_device_t.
 
 		// Register with network subsystem
 		net_register(&dev->net_dev);
+		if (!dev->link_up)
+			netif_carrier_off(&dev->net_dev);
+
+		// Enable interrupts: receive/transmit (NAPI) and link change
+		e1000_write(dev, E1000_IMS, E1000_IMS_ALL);
 
 		kprintf("E1000: Driver initialized successfully\n");
 		return; // Only handle first device

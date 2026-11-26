@@ -1,9 +1,12 @@
-// LikeOS Poll / Select / Epoll Implementation
-// Multiplexed I/O for sockets, pipes, and regular file descriptors
+// LikeOS Poll / Select
+// Multiplexed I/O over every kind of descriptor: sockets, pipes, terminals,
+// devices and regular files.  epoll lives in eventpoll.c and shares the
+// per-object readiness questions answered here (poll_entry()).
 //
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/net/net.h>
+#include <kernel/net/eventpoll.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/ke/timer.h>
@@ -20,111 +23,76 @@
 #include <kernel/ke/waitq.h>
 #include <kernel/fs/file.h>
 
-// ============================================================================
-// Epoll instance table
-// ============================================================================
-epoll_instance_t epoll_instances[MAX_EPOLL_INSTANCES];
-static spinlock_t epoll_lock = SPINLOCK_INIT("epoll");
-
-// Stable address used as a wake channel for tasks sleeping in poll/select/
-// epoll_wait.  Any I/O producer (TTY key press, TCP data arrival, pipe write)
-// that should unblock a multiplexed waiter calls poll_notify_io_ready(), which
-// fires sched_wake_channel on this address.  The value of the variable itself
-// is never read; only its address matters as the channel key.
-static int g_poll_io_ready;
-
-// Wake all tasks currently parked in poll_sleep_until_next_tick.  Called from
-// every I/O path that can make a polled fd ready: TTY input, TCP receive, pipe
-// write, etc.  This replaces the old tick-granularity wakeup for interactive
-// workloads, giving sub-millisecond response to keyboard input.
-/* Bumped by every notify.  A poller samples it before scanning its fds and
- * re-checks it after publishing its blocked state; if it moved, an event
- * arrived during the scan and the poller re-scans instead of sleeping through
- * it.  That makes the wake below best-effort rather than load-bearing: no
- * event can be lost because a producer failed to find the poller parked. */
-static volatile uint64_t g_poll_io_seq;
-
-static inline uint64_t poll_io_seq(void)
-{
-	return __atomic_load_n(&g_poll_io_seq, __ATOMIC_ACQUIRE);
-}
-
-/* How many tasks are parked below.  Read first by the notify so the common
- * case -- an I/O completion with nobody multiplexing -- costs one atomic load
- * instead of a scan of the whole task list under its global lock.  That path
- * is now taken by every AF_UNIX and pipe transfer, so it has to be cheap. */
-static volatile int g_poll_sleepers;
-
 /* ---------------------------------------------------------------------------
  * Registering a poller on the objects it is waiting for.
  *
- * The conventional arrangement: while a poller scans its descriptors it is
- * added to the wait queue of every object it asks about, so a readiness change
- * wakes exactly the tasks that asked about THAT object.  The alternative --
- * one global channel that every poll(), select() and epoll_wait() parks on --
- * turns each I/O event into a wakeup for every poller on the machine and a
- * walk of the whole task list with interrupts disabled.  Measured on an
- * ordinary desktop: ten wakeups per event, sixteen thousand a second, each
- * followed by a full descriptor re-scan that found nothing.  The cost grew
- * with the number of PROCESSES, so an idle window cost as much as a busy one,
- * and the interrupt-off walks showed up as a stuttering mouse pointer.
+ * While a poller scans its descriptors it is added to the wait queue of every
+ * object it asks about, so a readiness change wakes exactly the tasks that
+ * asked about THAT object -- never every poller on the machine.
  *
- * The table is allocated once per poll() call and reused across the scan/sleep
+ * Each registration is a wait-queue entry with a wake CALLBACK (pollwake):
+ * a wake marks the whole poll table `triggered' and makes the task runnable.
+ * The poller clears `triggered' before it scans, and after a scan that found
+ * nothing it publishes its sleep and only then looks at the flag.  An object
+ * registers (poll_wait) BEFORE it reads its own state, and its producer
+ * changes the state BEFORE it wakes the queue, so an event can only land in
+ * one of two places: before the read (the scan sees it) or after the
+ * registration (the callback sets the flag, or finds the task parked and
+ * wakes it).  Nothing global is consulted: an event on an unrelated object
+ * costs this poller nothing.
+ *
+ * The table is allocated once per call and reused across the scan/sleep
  * iterations; each iteration unregisters before it re-registers, because the
- * set of interesting objects can change between scans (a descriptor closed and
- * reopened) and an entry may be on only one queue at a time.
+ * set of objects can change between scans (a descriptor closed and reopened)
+ * and an entry may be on one queue at a time.
  * ------------------------------------------------------------------------ */
 
-struct poll_table {
-	struct wait_queue_head **heads; /* which queue entry i sits on */
-	struct wait_queue_entry *ents;
-	/* The descriptor entry that OWNS heads[i], with a reference held for
-	 * as long as the wait-queue entry is linked to it.
-	 *
-	 * The scan holds the descriptor only while it is looking at it, and
-	 * drops that hold before the sleep -- but the registration outlives
-	 * the scan by design, which is the whole point of registering.  With
-	 * only the scan's hold, a sibling thread closing the last descriptor
-	 * frees the pipe or socket while this poller is still on its queue,
-	 * and the wq_remove() below then writes through a pprev that points
-	 * into freed memory.  So the registration takes a reference of its
-	 * own, and the object cannot go away underneath it.
-	 *
-	 * NULL for a queue that belongs to something with no descriptor to
-	 * hold -- the console tty, which is never freed. */
-	void **held;
-	int n;   /* entries in use */
-	int cap; /* 0 when the allocation failed -- see poll_wait() */
-	/* Set when a registration was refused (no table, table full, object
-	 * already gone).  A poller that is not on every queue it asked about
-	 * cannot be woken by all of them, so the sleep falls back to the
-	 * one-tick re-scan for that iteration instead of sleeping until a
-	 * wake that may never come. */
-	int unregistered;
+struct poll_table_entry {
+	struct wait_queue_entry wait;
+	struct wait_queue_head *head; /* the queue `wait' sits on */
+	/* The descriptor entry that OWNS `head', with a reference held for
+	 * as long as `wait' is linked there.  The scan's own hold ends before
+	 * the sleep, but the registration outlives it: without this hold a
+	 * sibling thread closing the last descriptor frees the object while
+	 * this poller is still on its queue.  NULL for a queue in something
+	 * that is never freed (the console tty). */
+	void *held;
+	/* The events asked for on this descriptor (plus the ones always
+	 * reported): a wake whose key says something else is ignored. */
+	unsigned key;
 };
+
+static int pollwake(struct wait_queue_entry *e, unsigned key,
+		    struct wq_wake_ctx *ctx)
+{
+	struct poll_table *pt = (struct poll_table *)e->priv;
+	struct poll_table_entry *pe = (struct poll_table_entry *)e;
+
+	if (key && !(key & pe->key))
+		return 0;
+	/* The flag first, sequentially consistent: the poller publishes its
+	 * sleep and then reads the flag, this sets the flag and then looks
+	 * at the task's state -- one of the two sees the other. */
+	__atomic_store_n(&pt->triggered, 1, __ATOMIC_SEQ_CST);
+	wq_ctx_claim(ctx, e->task);
+	return 1;
+}
 
 static void poll_table_init(struct poll_table *pt, int cap)
 {
-	pt->heads = NULL;
+	pt->qproc = NULL;
+	pt->nopoll = 0;
+	pt->key = 0;
 	pt->ents = NULL;
-	pt->held = NULL;
 	pt->n = 0;
 	pt->cap = 0;
 	pt->unregistered = 0;
+	pt->triggered = 0;
 	if (cap <= 0)
 		return;
-	pt->heads = kalloc((size_t)cap * sizeof(*pt->heads));
 	pt->ents = kalloc((size_t)cap * sizeof(*pt->ents));
-	pt->held = kalloc((size_t)cap * sizeof(*pt->held));
-	if (!pt->heads || !pt->ents || !pt->held) {
-		kfree(pt->heads);
-		kfree(pt->ents);
-		kfree(pt->held);
-		pt->heads = NULL;
-		pt->ents = NULL;
-		pt->held = NULL;
-		return; /* cap stays 0: poll_wait becomes a no-op */
-	}
+	if (!pt->ents)
+		return; /* cap stays 0: poll_wait refuses, see below */
 	pt->cap = cap;
 }
 
@@ -134,13 +102,12 @@ static void poll_table_init(struct poll_table *pt, int cap)
 static void poll_table_reset(struct poll_table *pt)
 {
 	for (int i = 0; i < pt->n; i++) {
-		/* Off the queue FIRST, then let go of what owns the queue.
-		 * The other order drops the last reference while this entry is
-		 * still linked, so the object -- and the head this is about to
-		 * unlink from -- can be freed between the two lines. */
-		wq_remove(pt->heads[i], &pt->ents[i]);
-		fdput(pt->held[i]);
-		pt->held[i] = NULL;
+		/* Off the queue FIRST, then let go of what owns the queue:
+		 * the other order can free the object -- and the head this is
+		 * about to unlink from -- between the two lines. */
+		wq_remove(pt->ents[i].head, &pt->ents[i].wait);
+		fdput(pt->ents[i].held);
+		pt->ents[i].held = NULL;
 	}
 	pt->n = 0;
 	pt->unregistered = 0;
@@ -149,33 +116,32 @@ static void poll_table_reset(struct poll_table *pt)
 static void poll_table_free(struct poll_table *pt)
 {
 	poll_table_reset(pt);
-	kfree(pt->heads);
 	kfree(pt->ents);
-	kfree(pt->held);
-	pt->heads = NULL;
 	pt->ents = NULL;
-	pt->held = NULL;
 	pt->cap = 0;
 }
 
 /* Register the calling task on `h', which belongs to `owner'.
  *
  * `owner' is the descriptor entry the queue lives inside, and this takes a
- * reference on it that lasts until poll_table_reset() unlinks the entry
- * again -- see the note on poll_table::held.  Pass NULL only for a queue in
- * an object that is never freed.
+ * reference on it that lasts until poll_table_reset() unlinks the entry again.
+ * Pass NULL only for a queue in an object that is never freed.
  *
- * A no-op when there is no table (the caller only wants the readiness mask, as
- * epoll_ctl does) or when the table is full or could not be allocated.  That
- * is safe rather than merely tolerable: a poller that fails to register still
- * re-scans on the periodic wakeup below, so the worst outcome is the latency
- * this whole change is removing, not a missed event. */
+ * A no-op without a table (the caller only wants the readiness mask).  A
+ * table that is full or could not be allocated refuses, and the poller then
+ * re-scans on the next tick for that iteration instead of sleeping until a
+ * wake that may never come.  An epoll table (qproc) does its own thing. */
 void poll_wait(struct poll_table *pt, void *owner, struct wait_queue_head *h)
 {
 	task_t *cur;
+	struct poll_table_entry *pe;
 
 	if (!pt || !h)
 		return;
+	if (pt->qproc) {
+		pt->qproc(pt, owner, h);
+		return;
+	}
 	if (pt->n >= pt->cap) {
 		pt->unregistered = 1;
 		return;
@@ -185,66 +151,43 @@ void poll_wait(struct poll_table *pt, void *owner, struct wait_queue_head *h)
 		return;
 	/* Before the entry goes on the queue, never after: the moment it is
 	 * linked, an unreferenced owner can be freed with this entry still on
-	 * it.  A refused hold means the object is already gone, so there is
-	 * nothing to register on. */
+	 * it.  A refused hold means the object is already gone. */
 	if (owner && !fdhold((vfs_file_t *)owner)) {
 		pt->unregistered = 1;
 		return;
 	}
-	wq_entry_init(&pt->ents[pt->n], cur);
-	pt->held[pt->n] = owner;
-	wq_add(h, &pt->ents[pt->n]);
-	pt->heads[pt->n] = h;
+	pe = &pt->ents[pt->n];
+	wq_entry_init_func(&pe->wait, cur, pollwake, pt);
+	pe->held = owner;
+	pe->head = h;
+	/* The events asked of this descriptor (fd_scan_one) and the ones
+	 * always reported. */
+	pe->key = pt->key | POLLERR | POLLHUP | POLLNVAL;
+	wq_add(h, &pe->wait);
 	pt->n++;
 }
 
-/* Report that `h' has become ready.
- *
- * The sequence counter is bumped for every notify, whether or not anything is
- * queued: a poller between its scan and its park is not yet findable on any
- * queue, and comparing this counter is how it learns to re-scan instead of
- * sleeping through the event.  The wake itself touches only this object's
- * waiters. */
+/* Report that `h' has become ready: wake its pollers (and one exclusive
+ * epoll set).  `key' names the POLL* bits that changed, 0 when unknown. */
+void poll_notify_wq_key(struct wait_queue_head *h, unsigned key)
+{
+	if (h)
+		wq_wake_poll(h, key);
+}
+
 void poll_notify_wq(struct wait_queue_head *h)
 {
-	__atomic_fetch_add(&g_poll_io_seq, 1, __ATOMIC_RELEASE);
 	if (h)
-		wq_wake_all(h);
+		wq_wake_poll(h, 0);
 }
 
-/* The object-less form, for a readiness change with no queue to name.
- *
- * Bumping the counter is all it can do, so a poller learns about it on its
- * next scan rather than immediately.  Every caller that CAN name an object
- * should use poll_notify_wq() instead; this exists so that a path which has
- * not been converted still cannot lose an event outright. */
+/* The object-less form.  A readiness change with no queue to name concerns
+ * nobody: a poller is registered on an object's queue before it reads the
+ * object's state, so an object without a queue has no pollers to tell. */
 void poll_notify_io_ready(void)
 {
-	__atomic_fetch_add(&g_poll_io_seq, 1, __ATOMIC_RELEASE);
 }
 
-// Block the calling task until one of the wait queues it registered on
-// during the scan (poll_wait) is notified, or `deadline` is reached.  Used by
-// select/poll/epoll_wait between scan iterations.
-//
-// Until 2026-09 this ALSO armed `wakeup_tick = now + 1' on every call, so a
-// task parked in poll()/select()/epoll_wait() woke on every timer tick,
-// re-scanned every descriptor, found nothing and went back to sleep.  That
-// was a safety net from the days when readiness producers had no queue to
-// wake; every one of them now calls poll_notify_wq() on the object's own
-// queue, and the sequence check below closes the scan-then-park race, so the
-// periodic re-scan carried no events -- only cost.  The cost scaled with the
-// number of multiplexing THREADS on the machine, not with I/O: one heavy
-// browser tab holds 150-200 GLib main loops, which at 100 Hz meant 20,000
-// wakeups, descriptor re-scans and context switches per second, plus several
-// full task-list walks per tick in sched_wake_expired_sleepers() to hand them
-// out.  Seen as ~60% total CPU on an 8-processor machine with the page idle.
-//
-// A poller with no deadline now sleeps until it is woken (`wakeup_tick = 0');
-// signals still break the wait because the sleeper sweep checks
-// signal_pending() regardless of the deadline.  The one-tick re-scan is kept
-// only for a poller that could not register on every object it asked about
-// (pt->unregistered), since nothing else can be relied on to wake that one.
 /* A timeout's absolute deadline on the nanosecond clock; one too large to
  * add is as good as forever. */
 static uint64_t poll_deadline_ns(uint64_t timeout_ns)
@@ -254,10 +197,13 @@ static uint64_t poll_deadline_ns(uint64_t timeout_ns)
 	return timeout_ns > ~0ULL - now ? ~0ULL : now + timeout_ns;
 }
 
-static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
-				       uint64_t deadline_ns,
-				       int have_deadline, uint64_t seq_before,
-				       const struct poll_table *pt)
+/* Block the calling task until one of the queues it registered on during the
+ * scan is woken, or the deadline.  A poller with no deadline sleeps until
+ * woken (signals still end the sleep: the sleeper sweep checks
+ * signal_pending() whatever the deadline).  The one-tick re-scan is used only
+ * by a poller that could not register on every object it asked about. */
+static void poll_sleep(uint64_t deadline_ticks, uint64_t deadline_ns,
+		       int have_deadline, struct poll_table *pt)
 {
 	task_t *cur = sched_current();
 	if (!cur) {
@@ -265,16 +211,14 @@ static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
 		return;
 	}
 	uint64_t now = timer_ticks();
-	uint64_t wake = 0; /* no deadline: sleep until notified */
+	uint64_t wake = 0; /* no deadline: sleep until woken */
 	/* The tick count is advanced by one processor's tick and can stand
-	 * behind the clock; a tick deadline taken from it then reads as passed
-	 * while the timeout itself is still ahead, and this poller would spin
-	 * through the rest of it instead of sleeping.  Only the nanosecond
-	 * deadline ends a wait early; the tick is its backstop. */
+	 * behind the clock; only the nanosecond deadline ends a wait early,
+	 * the tick is its backstop. */
 	if (have_deadline && deadline_ticks <= now &&
 	    hrtimer_now_ns() < deadline_ns)
 		deadline_ticks = now + 1;
-	if (!pt || pt->unregistered)
+	if (pt->unregistered)
 		wake = now + 1; /* fallback: re-scan next tick */
 	if (have_deadline && (wake == 0 || deadline_ticks < wake))
 		wake = deadline_ticks;
@@ -283,23 +227,17 @@ static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
 		return;
 	}
 
-	__atomic_fetch_add(&g_poll_sleepers, 1, __ATOMIC_ACQ_REL);
-	cur->wait_channel = (void *)&g_poll_io_ready;
+	cur->wait_channel = (void *)pt;
 	cur->wakeup_tick = wake;
 	task_set_blocked(cur);
 
-	/* Re-check AFTER publishing TASK_BLOCKED, which is the whole point of
-	 * the ordering: a producer that bumps the counter from here on finds
-	 * this task parked and wakes it, and one that bumped it earlier -- while
-	 * the caller was scanning its descriptors, when this task was still
-	 * RUNNING and could not be found -- is caught right here. */
-	if (poll_io_seq() != seq_before) {
-		/* Un-park.  CAS rather than a plain store: a waker may already
-		 * have claimed this task (BLOCKED -> READY) and be about to
-		 * enqueue it, and overwriting its state would leave it READY
-		 * and on a run queue while also running here.  If the CAS
-		 * fails the waker won, so fall through to sched_schedule(),
-		 * which handles being enqueued already. */
+	/* Re-check AFTER publishing TASK_BLOCKED: a wake that came during the
+	 * scan, while this task was still running and could not be claimed,
+	 * left the flag behind. */
+	if (__atomic_load_n(&pt->triggered, __ATOMIC_SEQ_CST)) {
+		/* Un-park by CAS: a waker may already have claimed this task
+		 * (BLOCKED -> READY) and be about to enqueue it.  If the CAS
+		 * fails the waker won; sched_schedule() consumes that. */
 		task_state_t expected = TASK_BLOCKED;
 		if (__atomic_compare_exchange_n(&cur->state, &expected,
 						TASK_RUNNING, false,
@@ -307,22 +245,17 @@ static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
 						__ATOMIC_ACQUIRE)) {
 			cur->wakeup_tick = 0;
 			cur->wait_channel = NULL;
-			__atomic_fetch_sub(&g_poll_sleepers, 1,
-					   __ATOMIC_ACQ_REL);
 			return;
 		}
 	}
 
 	/* The timeout's own deadline, to the microsecond; the tick deadline
-	 * above only backs it up.  On its own it ended every timeout at the
-	 * next scheduler tick, so an event loop's short timers -- a browser's
-	 * frame scheduling among them -- all ran up to a tick late. */
+	 * above only backs it up. */
 	if (have_deadline)
 		hrtimer_wait_arm(cur, deadline_ns);
 	sched_schedule();
 	if (have_deadline)
 		hrtimer_wait_disarm(cur);
-	__atomic_fetch_sub(&g_poll_sleepers, 1, __ATOMIC_ACQ_REL);
 	cur->wakeup_tick = 0;
 	cur->wait_channel = NULL;
 	if (cur->state != TASK_RUNNING)
@@ -330,119 +263,66 @@ static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
 }
 
 // ============================================================================
-// fd_poll_one - Poll a single fd for events (internal helper)
-// Returns revents mask. Works for sockets, pipes, regular files, console.
+// poll_entry - the readiness of one descriptor-table entry
 // ============================================================================
-static short fd_poll_one(int fd, short events, struct poll_table *pt)
+
+/* The console: an empty slot at 0/1/2 that the process still has open, or one
+ * of the 1..3 dup markers -- all the bidirectional /dev/console. */
+static short poll_console(task_t *cur, short events, struct poll_table *pt)
 {
-	/* One exit, so the hold taken below is released whichever way this
-	 * descriptor is answered.  `entry' is declared HERE rather than at the
-	 * lookup: the early answers jump to that exit before the lookup runs,
-	 * and the exit reads it. */
-	void *entry = NULL;
-	short rev_out;
+	short rev = 0;
+	tty_t *tty = cur && cur->ctty ? cur->ctty : tty_get_console();
 
+	if (tty)
+		poll_wait(pt, NULL, &tty->poll_wq);
+	if (events & (POLLIN | POLLRDNORM)) {
+		if (tty && tty->read_count > 0)
+			rev |= POLLIN | POLLRDNORM;
+	}
+	if (events & (POLLOUT | POLLWRNORM))
+		rev |= POLLOUT | POLLWRNORM;
+	return rev;
+}
+
+short poll_entry(void *entry, int fd, short events, struct poll_table *pt,
+		 int depth)
+{
 	task_t *cur = sched_current();
-	if (!cur) {
-		rev_out = POLLNVAL;
-		goto out;
-	}
-	if (fd < 0) {
-		rev_out = POLLNVAL;
-		goto out;
-	}
 
-	if ((unsigned)fd >= TASK_MAX_FDS) {
-		rev_out = POLLNVAL;
-		goto out;
-	}
-
-	/* Held while this descriptor is examined.  Every arm below reaches
-	 * into the object -- a socket's state, a pipe end's magic, a wait
-	 * queue to register on -- and a sibling thread closing the
-	 * descriptor mid-scan would otherwise destroy it underneath. */
-	entry = fdget(cur, fd);
-
-	/* The console is an EMPTY fd_table slot at 0/1/2 (the 1..3 dup markers
-	 * are handled further down).  It must be selected by the slot's
-	 * CONTENT, never by the descriptor NUMBER: deciding by number polled
-	 * the terminal even for a descriptor that had been redirected
-	 * elsewhere, so a program that polls its own stdin waited on the
-	 * console forever while its real input sat unread in a socket or pipe
-	 * (this is what hung sftp-server, whose stdin is an AF_UNIX socket).
-	 * /dev/console is bidirectional, so any of 0/1/2 may be polled for
-	 * both POLLIN and POLLOUT. */
+	/* The console is an EMPTY fd_table slot at 0/1/2.  It must be
+	 * selected by the slot's CONTENT, never by the descriptor number:
+	 * deciding by number polled the terminal for a descriptor that had
+	 * been redirected elsewhere (this hung sftp-server, whose stdin is an
+	 * AF_UNIX socket). */
 	if (!entry) {
-		/* An empty slot at 0/1/2 is the console only while the process
-		 * still has it open; once closed it is an invalid descriptor
-		 * like any other, and must not be reported as ready. */
-		if (!task_fd_is_console(cur, fd)) {
-			rev_out = POLLNVAL;
-			goto out;
-		}
-		short rev = 0;
-		tty_t *tty = cur->ctty ? cur->ctty : tty_get_console();
-
-		if (tty)
-			poll_wait(pt, NULL, &tty->poll_wq);
-		if (events & (POLLIN | POLLRDNORM)) {
-			if (tty && tty->read_count > 0)
-				rev |= POLLIN | POLLRDNORM;
-		}
-		if (events & (POLLOUT | POLLWRNORM))
-			rev |= POLLOUT | POLLWRNORM;
-		rev_out = rev;
-		goto out;
+		if (!cur || fd < 0 || !task_fd_is_console(cur, (uint64_t)fd))
+			return POLLNVAL;
+		return poll_console(cur, events, pt);
 	}
 
-	// Socket fd marker
 	if (IS_SOCKET_FD(entry)) {
 		net_socket_t *ns = sock_get(SOCKET_FD_IDX(entry));
 
 		if (ns)
 			poll_wait(pt, entry, &ns->poll_wq);
-		rev_out = (short)sock_poll(SOCKET_FD_IDX(entry), events);
-		goto out;
+		return (short)sock_poll(SOCKET_FD_IDX(entry), events);
 	}
 
-	// UNIX socket fd marker
 	if (unix_sock_is(entry)) {
 		poll_wait(pt, entry, &((unix_socket_t *)entry)->poll_wq);
-		rev_out = (short)unix_poll((unix_socket_t *)entry, events);
-		goto out;
+		return (short)unix_poll((unix_socket_t *)entry, events);
 	}
 
-	// Epoll fd marker
-	if (IS_EPOLL_FD(entry)) {
-		// Epoll fds are not themselves pollable in a meaningful way
-		WARN_RATELIMIT(
-			1,
-			"poll: epoll fd %d passed to fd_poll_one - epoll instances cannot be nested via poll()",
-			fd);
-		rev_out = POLLNVAL;
-		goto out;
-	}
+	/* An epoll set: readable while it has an event to report.  It may
+	 * itself watch epoll sets; `depth' bounds how far that is followed. */
+	if (IS_EPOLL_FD(entry))
+		return ep_eventpoll_poll(EPOLL_FD_IDX(entry), events, pt,
+					 depth);
 
-	// Console dup markers (1, 2, 3) — all reference the bidirectional
-	// /dev/console device, so each is both readable and writable.
 	uintptr_t marker = (uintptr_t)entry;
-	if (marker >= 1 && marker <= 3) {
-		short rev = 0;
-		tty_t *tty = cur->ctty ? cur->ctty : tty_get_console();
+	if (marker >= 1 && marker <= 3)
+		return poll_console(cur, events, pt);
 
-		if (tty)
-			poll_wait(pt, NULL, &tty->poll_wq);
-		if (events & (POLLIN | POLLRDNORM)) {
-			if (tty && tty->read_count > 0)
-				rev |= POLLIN | POLLRDNORM;
-		}
-		if (events & (POLLOUT | POLLWRNORM))
-			rev |= POLLOUT | POLLWRNORM;
-		rev_out = rev;
-		goto out;
-	}
-
-	// Pipe fd
 	if (pipe_is_end(entry)) {
 		pipe_end_t *pe = (pipe_end_t *)entry;
 		pipe_t *p = pe->pipe;
@@ -463,8 +343,7 @@ static short fd_poll_one(int fd, short events, struct poll_table *pt)
 			if (p->readers == 0)
 				rev |= POLLERR;
 		}
-		rev_out = rev;
-		goto out;
+		return rev;
 	}
 
 	// Pty master (opened via /dev/ptmx): readable when slave wrote bytes,
@@ -473,8 +352,7 @@ static short fd_poll_one(int fd, short events, struct poll_table *pt)
 		int pid = devfs_get_pty_master_id((vfs_file_t *)entry);
 		if (pid >= 0) {
 			poll_wait(pt, entry, tty_pty_master_pollq(pid));
-			rev_out = (short)tty_pty_master_poll(pid, events);
-			goto out;
+			return (short)tty_pty_master_poll(pid, events);
 		}
 	}
 
@@ -483,8 +361,7 @@ static short fd_poll_one(int fd, short events, struct poll_table *pt)
 		int unit = devfs_evdev_unit((vfs_file_t *)entry);
 		if (unit >= 0) {
 			poll_wait(pt, entry, evdev_pollq(unit));
-			rev_out = evdev_poll(unit, events);
-			goto out;
+			return evdev_poll(unit, events);
 		}
 	}
 
@@ -500,8 +377,7 @@ static short fd_poll_one(int fd, short events, struct poll_table *pt)
 				rev |= POLLIN | POLLRDNORM;
 			if (events & (POLLOUT | POLLWRNORM))
 				rev |= POLLOUT | POLLWRNORM;
-			rev_out = rev;
-			goto out;
+			return rev;
 		}
 	}
 
@@ -510,38 +386,123 @@ static short fd_poll_one(int fd, short events, struct poll_table *pt)
 	{
 		short rev_dev;
 		if (devfs_device_poll((vfs_file_t *)entry, events, pt,
-				      &rev_dev) == 0) {
-			rev_out = rev_dev;
-			goto out;
-		}
+				      &rev_dev) == 0)
+			return rev_dev;
 	}
 
-	// Regular file - always ready for read/write
+	/* A regular file: always ready for read and write, with nothing to
+	 * wait on.  epoll refuses such a file (EPERM), as everywhere. */
+	if (pt)
+		pt->nopoll = 1;
 	short rev = 0;
 	if (events & (POLLIN | POLLRDNORM))
 		rev |= POLLIN | POLLRDNORM;
 	if (events & (POLLOUT | POLLWRNORM))
 		rev |= POLLOUT | POLLWRNORM;
-	rev_out = rev;
-	goto out;
+	return rev;
+}
 
-out:
+/* One descriptor of a poll()/select() scan.  Held while it is examined:
+ * every arm reaches into the object, and a sibling thread closing the
+ * descriptor mid-scan would otherwise destroy it underneath. */
+static short fd_scan_one(int fd, short events, struct poll_table *pt)
+{
+	task_t *cur = sched_current();
+	void *entry;
+	short rev;
+
+	if (!cur || fd < 0 || (unsigned)fd >= TASK_MAX_FDS)
+		return POLLNVAL;
+	entry = fdget(cur, fd);
+	pt->key = (unsigned)(unsigned short)events;
+	rev = poll_entry(entry, fd, events, pt, 0);
 	if (entry)
 		fdput(entry);
-	return rev_out;
+	return rev;
+}
+
+// ============================================================================
+// The lifetime of the object behind an entry, for epoll items
+// ============================================================================
+
+int poll_obj_tryhold(void *entry)
+{
+	uintptr_t marker = (uintptr_t)entry;
+
+	if (!entry)
+		return 0;
+	if (marker >= 1 && marker <= 3)
+		return 1; /* the console: never freed */
+	if (IS_SOCKET_FD(entry))
+		return sock_tryhold(SOCKET_FD_IDX(entry));
+	if (IS_EPOLL_FD(entry))
+		return epoll_tryget(EPOLL_FD_IDX(entry));
+	/* A UNIX socket's memory is kept by the item itself (see
+	 * poll_obj_item_hold); what is asked here is whether any descriptor
+	 * still names it. */
+	if (unix_sock_is(entry))
+		return !poll_obj_closed(entry);
+	if (pipe_is_end(entry))
+		return pipe_end_tryhold((pipe_end_t *)entry);
+	return vfs_tryget((vfs_file_t *)entry);
+}
+
+void poll_obj_put(void *entry)
+{
+	uintptr_t marker = (uintptr_t)entry;
+
+	if (!entry || (marker >= 1 && marker <= 3))
+		return;
+	if (!IS_SOCKET_FD(entry) && !IS_EPOLL_FD(entry) &&
+	    unix_sock_is(entry))
+		return; /* nothing was taken, see poll_obj_tryhold */
+	fdput((vfs_file_t *)entry);
+}
+
+/* What an epoll item keeps.  Every kind of object removes the items watching
+ * it from its final release (eventpoll_release) -- except a UNIX socket,
+ * whose code has no such hook; for it the item holds the socket's memory
+ * (not a descriptor: closing every descriptor still hangs it up), and the set
+ * drops the item once poll_obj_closed() says the last descriptor is gone. */
+int poll_obj_item_hold(void *entry)
+{
+	if (!entry || IS_SOCKET_FD(entry) || IS_EPOLL_FD(entry))
+		return 1;
+	if ((uintptr_t)entry <= 3)
+		return 1;
+	if (unix_sock_is(entry))
+		return unix_sock_lookup_hold((unix_socket_t *)entry) ? 2 : 0;
+	return 1;
+}
+
+void poll_obj_item_put(void *entry)
+{
+	if (!entry || IS_SOCKET_FD(entry) || IS_EPOLL_FD(entry) ||
+	    (uintptr_t)entry <= 3)
+		return;
+	if (unix_sock_is(entry))
+		unix_sock_put_ref((unix_socket_t *)entry);
+}
+
+int poll_obj_closed(void *entry)
+{
+	if (!entry || IS_SOCKET_FD(entry) || IS_EPOLL_FD(entry) ||
+	    (uintptr_t)entry <= 3)
+		return 0;
+	if (unix_sock_is(entry))
+		return __atomic_load_n(&((unix_socket_t *)entry)->ref_count,
+				       __ATOMIC_ACQUIRE) <= 0;
+	return 0;
 }
 
 // ============================================================================
 // sys_select_internal - select() implementation
-// Scans readfds/writefds/exceptfds for ready file descriptors.
-// timeout_ns (nanoseconds): 0 = poll (non-blocking), (uint64_t)-1 = block forever
+// timeout_ns: 0 = poll (non-blocking), (uint64_t)-1 = block forever
 // Returns number of ready fds, or negative errno.
 // ============================================================================
-/* The body runs with a poll table; this wrapper owns it.
- *
- * Split so the table is released in exactly ONE place: the body returns from a
- * dozen points, and a queue left holding a pointer into a freed table is a use
- * after free on the next wakeup. */
+/* The body runs with a poll table; this wrapper owns it.  Split so the table
+ * is released in exactly ONE place: a queue left holding a pointer into a
+ * freed table is a use after free on the next wakeup. */
 static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
 			     fd_set *exceptfds, uint64_t timeout_ns,
 			     struct poll_table *pt);
@@ -554,10 +515,10 @@ int sys_select_internal(int nfds, fd_set *readfds, fd_set *writefds,
 
 	if (nfds < 0 || nfds > FD_SETSIZE)
 		return -EINVAL;
-	/* Three sets, so at worst three registrations per descriptor -- but a
-	 * descriptor is only ever registered once per scan, so nfds is the
-	 * bound. */
-	poll_table_init(&pt, nfds);
+	/* One queue per descriptor is the rule; a few objects name two (a
+	 * sound device), and a table that runs out only costs the tick
+	 * re-scan for that wait. */
+	poll_table_init(&pt, nfds + 4);
 	r = sys_select_locked(nfds, readfds, writefds, exceptfds, timeout_ns,
 			      &pt);
 	poll_table_free(&pt);
@@ -568,7 +529,6 @@ static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
 			     fd_set *exceptfds, uint64_t timeout_ns,
 			     struct poll_table *pt)
 {
-
 	fd_set r_in, w_in, e_in;
 	if (readfds)
 		r_in = *readfds;
@@ -584,31 +544,21 @@ static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
 		FD_ZERO(&e_in);
 
 	uint64_t deadline = 0, deadline_ns = 0;
-	if (timeout_ns == 0) {
-		// Non-blocking poll
-	} else if (timeout_ns != (uint64_t)-1) {
-		/* +1 for the tick already in progress: timer_ticks() was read
-		 * at some unknown fraction into the current tick, so without it
-		 * the wake lands up to one tick early and the timeout expires
-		 * short of what was asked for.  A timeout may fire late, never
-		 * early; the futex and sleep paths arm their deadlines the same
-		 * way. */
+	if (timeout_ns != 0 && timeout_ns != (uint64_t)-1) {
+		/* +1 for the tick already in progress: a timeout may fire
+		 * late, never early. */
 		deadline_ns = poll_deadline_ns(timeout_ns);
 		deadline = timer_ticks() + timer_ns_to_ticks(timeout_ns) + 1;
 	}
 
 	while (1) {
-		/* Sampled BEFORE the scan below.  An event that arrives while
-		 * the scan is running finds this task still RUNNING and cannot
-		 * park it, so the wake would be lost; the sleep path compares
-		 * this against the counter after publishing its blocked state
-		 * and re-scans instead of sleeping through the event. */
 		/* Off every queue from the previous iteration before going
-		 * back on: an entry may be on one queue at a time, and the set
-		 * of interesting descriptors can change between scans. */
+		 * back on, and the wake flag cleared BEFORE the scan: a wake
+		 * from here on is either seen by the scan or leaves the flag
+		 * set for the sleep to find. */
 		poll_table_reset(pt);
+		__atomic_store_n(&pt->triggered, 0, __ATOMIC_SEQ_CST);
 
-		uint64_t seq_before = poll_io_seq();
 		int count = 0;
 		fd_set r_out, w_out, e_out;
 		FD_ZERO(&r_out);
@@ -627,19 +577,24 @@ static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
 			if (events == 0)
 				continue;
 
-			short rev = fd_poll_one(fd, events, pt);
+			short rev = fd_scan_one(fd, events, pt);
 
-			if ((rev & (POLLIN | POLLRDNORM | POLLHUP | POLLERR)) &&
+			/* The sets as everywhere: readable is data, a
+			 * hangup or an error; writable is room or an error;
+			 * exceptional is urgent data. */
+			if ((rev & (POLLIN | POLLRDNORM | POLLRDBAND |
+				    POLLHUP | POLLERR)) &&
 			    readfds && FD_ISSET(fd, &r_in)) {
 				FD_SET(fd, &r_out);
 				count++;
 			}
-			if ((rev & (POLLOUT | POLLWRNORM)) && writefds &&
-			    FD_ISSET(fd, &w_in)) {
+			if ((rev & (POLLOUT | POLLWRNORM | POLLWRBAND |
+				    POLLERR)) &&
+			    writefds && FD_ISSET(fd, &w_in)) {
 				FD_SET(fd, &w_out);
 				count++;
 			}
-			if ((rev & (POLLERR | POLLPRI)) && exceptfds &&
+			if ((rev & POLLPRI) && exceptfds &&
 			    FD_ISSET(fd, &e_in)) {
 				FD_SET(fd, &e_out);
 				count++;
@@ -656,7 +611,6 @@ static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
 			return count;
 		}
 
-		// Block until deadline or forever
 		if (timeout_ns != (uint64_t)-1 &&
 		    hrtimer_now_ns() >= deadline_ns) {
 			if (readfds)
@@ -668,37 +622,25 @@ static int sys_select_locked(int nfds, fd_set *readfds, fd_set *writefds,
 			return 0;
 		}
 
-		/* A deliverable signal must break the wait: a signal handler only
-		 * runs on the way back to user mode, so a task that just keeps
-		 * sleeping here never runs it.  This silently broke every
-		 * event-driven program — a terminal app blocked in poll() never
-		 * saw SIGWINCH (window resizes were ignored) and a server never
-		 * saw SIGCHLD (children were never reaped, so a session never
-		 * closed).  signal_pending() ignores masked signals, so a
-		 * blocked signal cannot spin us here. */
+		/* A deliverable signal must break the wait: a handler only
+		 * runs on the way back to user mode (SIGWINCH, SIGCHLD).
+		 * signal_pending() ignores masked signals. */
 		{
 			task_t *_cur = sched_current();
 			if (_cur && signal_pending(_cur))
 				return -EINTR;
 		}
 
-		poll_sleep_until_next_tick(deadline, deadline_ns,
-					   timeout_ns != (uint64_t)-1,
-					   seq_before, pt);
+		poll_sleep(deadline, deadline_ns, timeout_ns != (uint64_t)-1,
+			   pt);
 	}
 }
 
 // ============================================================================
 // sys_poll_internal - poll() implementation
-// Scans array of pollfd structs for ready fds.
-// timeout_ns (nanoseconds): 0 = non-blocking, (uint64_t)-1 = block forever
+// timeout_ns: 0 = non-blocking, (uint64_t)-1 = block forever
 // Returns number of ready fds, or negative errno.
 // ============================================================================
-/* The body runs with a poll table; this wrapper owns it.
- *
- * Split so the table is released in exactly ONE place: the body returns from a
- * dozen points, and a queue left holding a pointer into a freed table is a use
- * after free on the next wakeup. */
 static int sys_poll_locked(struct pollfd *fds, int nfds,
 			   uint64_t timeout_ns, struct poll_table *pt);
 
@@ -709,7 +651,7 @@ int sys_poll_internal(struct pollfd *fds, int nfds, uint64_t timeout_ns)
 
 	if (nfds < 0 || !fds)
 		return -EINVAL;
-	poll_table_init(&pt, nfds);
+	poll_table_init(&pt, nfds + 4);
 	r = sys_poll_locked(fds, nfds, timeout_ns, &pt);
 	poll_table_free(&pt);
 	return r;
@@ -722,35 +664,25 @@ static int sys_poll_locked(struct pollfd *fds, int nfds,
 		TASK_MAX_FDS); /* poll() with nfds > TASK_MAX_FDS: kernel cannot have that many open fds */
 
 	uint64_t deadline = 0, deadline_ns = 0;
-	if (timeout_ns == 0) {
-		// Non-blocking poll
-	} else if (timeout_ns != (uint64_t)-1) {
-		/* +1 for the tick already in progress: timer_ticks() was read
-		 * at some unknown fraction into the current tick, so without it
-		 * the wake lands up to one tick early and the timeout expires
-		 * short of what was asked for.  A timeout may fire late, never
-		 * early; the futex and sleep paths arm their deadlines the same
-		 * way. */
+	if (timeout_ns != 0 && timeout_ns != (uint64_t)-1) {
 		deadline_ns = poll_deadline_ns(timeout_ns);
 		deadline = timer_ticks() + timer_ns_to_ticks(timeout_ns) + 1;
 	}
 
 	while (1) {
-		/* Sampled BEFORE the scan below.  An event that arrives while
-		 * the scan is running finds this task still RUNNING and cannot
-		 * park it, so the wake would be lost; the sleep path compares
-		 * this against the counter after publishing its blocked state
-		 * and re-scans instead of sleeping through the event. */
-		/* Off every queue from the previous iteration before going
-		 * back on: an entry may be on one queue at a time, and the set
-		 * of interesting descriptors can change between scans. */
 		poll_table_reset(pt);
+		__atomic_store_n(&pt->triggered, 0, __ATOMIC_SEQ_CST);
 
-		uint64_t seq_before = poll_io_seq();
 		int count = 0;
 
 		for (int i = 0; i < nfds; i++) {
-			fds[i].revents = fd_poll_one(fds[i].fd, fds[i].events, pt);
+			/* A negative descriptor is skipped, revents 0. */
+			if (fds[i].fd < 0) {
+				fds[i].revents = 0;
+				continue;
+			}
+			short rev = fd_scan_one(fds[i].fd, fds[i].events, pt);
+			fds[i].revents = rev;
 			if (fds[i].revents != 0)
 				count++;
 		}
@@ -761,369 +693,30 @@ static int sys_poll_locked(struct pollfd *fds, int nfds,
 		if (timeout_ns != (uint64_t)-1 && hrtimer_now_ns() >= deadline_ns)
 			return 0;
 
-		/* A deliverable signal must break the wait: a signal handler only
-		 * runs on the way back to user mode, so a task that just keeps
-		 * sleeping here never runs it.  This silently broke every
-		 * event-driven program — a terminal app blocked in poll() never
-		 * saw SIGWINCH (window resizes were ignored) and a server never
-		 * saw SIGCHLD (children were never reaped, so a session never
-		 * closed).  signal_pending() ignores masked signals, so a
-		 * blocked signal cannot spin us here. */
 		{
 			task_t *_cur = sched_current();
 			if (_cur && signal_pending(_cur))
 				return -EINTR;
 		}
 
-		poll_sleep_until_next_tick(deadline, deadline_ns,
-					   timeout_ns != (uint64_t)-1,
-					   seq_before, pt);
+		poll_sleep(deadline, deadline_ns, timeout_ns != (uint64_t)-1,
+			   pt);
 	}
-}
-
-// ============================================================================
-// Epoll implementation
-// ============================================================================
-
-int epoll_create_internal(int flags)
-{
-	(void)flags;
-	uint64_t fl;
-	spin_lock_irqsave(&epoll_lock, &fl);
-
-	int idx = -1;
-	for (int i = 0; i < MAX_EPOLL_INSTANCES; i++) {
-		if (!epoll_instances[i].active) {
-			idx = i;
-			break;
-		}
-	}
-
-	if (idx < 0) {
-		spin_unlock_irqrestore(&epoll_lock, fl);
-		return -ENFILE;
-	}
-
-	epoll_instance_t *ep = &epoll_instances[idx];
-	ep->active = 1;
-	ep->ref_count = 1; /* the descriptor about to be returned */
-	ep->nentries = 0;
-	ep->lock = (spinlock_t)SPINLOCK_INIT("epoll_inst");
-
-	spin_unlock_irqrestore(&epoll_lock, fl);
-	return idx;
-}
-
-/*
- * Take and drop a reference on an epoll instance.
- *
- * Called from the descriptor lifetime paths -- fork duplicates a task's fd
- * table, close releases one entry, exec closes the FD_CLOEXEC ones.  The
- * instance outlives any single descriptor and is only released when the last
- * one goes.
- */
-void epoll_get(int idx)
-{
-	uint64_t fl;
-
-	if (idx < 0 || idx >= MAX_EPOLL_INSTANCES)
-		return;
-	spin_lock_irqsave(&epoll_lock, &fl);
-	if (epoll_instances[idx].active)
-		epoll_instances[idx].ref_count++;
-	spin_unlock_irqrestore(&epoll_lock, fl);
-}
-
-void epoll_put(int idx)
-{
-	uint64_t fl;
-
-	if (idx < 0 || idx >= MAX_EPOLL_INSTANCES)
-		return;
-	spin_lock_irqsave(&epoll_lock, &fl);
-	if (epoll_instances[idx].active) {
-		if (--epoll_instances[idx].ref_count <= 0) {
-			epoll_instances[idx].active = 0;
-			epoll_instances[idx].nentries = 0;
-			epoll_instances[idx].ref_count = 0;
-		}
-	}
-	spin_unlock_irqrestore(&epoll_lock, fl);
-}
-
-int epoll_ctl_internal(int epfd_idx, int op, int fd, struct epoll_event *event)
-{
-	if (epfd_idx < 0 || epfd_idx >= MAX_EPOLL_INSTANCES)
-		return -EBADF;
-	epoll_instance_t *ep = &epoll_instances[epfd_idx];
-	if (!ep->active)
-		return -EBADF;
-
-	uint64_t fl;
-	spin_lock_irqsave(&ep->lock, &fl);
-
-	switch (op) {
-	case EPOLL_CTL_ADD: {
-		if (!event) {
-			spin_unlock_irqrestore(&ep->lock, fl);
-			return -EINVAL;
-		}
-		// Check for duplicate
-		for (int i = 0; i < ep->nentries; i++) {
-			if (ep->entries[i].fd == fd) {
-				spin_unlock_irqrestore(&ep->lock, fl);
-				return -EEXIST;
-			}
-		}
-		if (ep->nentries >= MAX_EPOLL_ENTRIES) {
-			spin_unlock_irqrestore(&ep->lock, fl);
-			return -ENOMEM;
-		}
-		int idx = ep->nentries++;
-		ep->entries[idx].fd = fd;
-		ep->entries[idx].events = event->events;
-		ep->entries[idx].data = event->data.u64;
-		ep->entries[idx].oneshot_triggered = 0;
-		break;
-	}
-	case EPOLL_CTL_DEL: {
-		int found = -1;
-		for (int i = 0; i < ep->nentries; i++) {
-			if (ep->entries[i].fd == fd) {
-				found = i;
-				break;
-			}
-		}
-		if (found < 0) {
-			spin_unlock_irqrestore(&ep->lock, fl);
-			return -ENOENT;
-		}
-		// Shift entries down
-		for (int i = found; i < ep->nentries - 1; i++)
-			ep->entries[i] = ep->entries[i + 1];
-		ep->nentries--;
-		WARN_ON(ep->nentries <
-			0); /* epoll nentries went negative after DEL - double-delete or accounting bug */
-		break;
-	}
-	case EPOLL_CTL_MOD: {
-		if (!event) {
-			spin_unlock_irqrestore(&ep->lock, fl);
-			return -EINVAL;
-		}
-		int found = -1;
-		for (int i = 0; i < ep->nentries; i++) {
-			if (ep->entries[i].fd == fd) {
-				found = i;
-				break;
-			}
-		}
-		if (found < 0) {
-			spin_unlock_irqrestore(&ep->lock, fl);
-			return -ENOENT;
-		}
-		ep->entries[found].events = event->events;
-		ep->entries[found].data = event->data.u64;
-		ep->entries[found].oneshot_triggered = 0;
-		break;
-	}
-	default:
-		spin_unlock_irqrestore(&ep->lock, fl);
-		return -EINVAL;
-	}
-
-	spin_unlock_irqrestore(&ep->lock, fl);
-	return 0;
-}
-
-/* The body runs with a poll table; this wrapper owns it -- see the note on
- * sys_select_internal() for why the split. */
-static int epoll_wait_locked(epoll_instance_t *ep, struct epoll_event *events,
-			     int maxevents, uint64_t timeout_ns,
-			     struct poll_table *pt);
-
-int epoll_wait_internal(int epfd_idx, struct epoll_event *events, int maxevents,
-			uint64_t timeout_ns)
-{
-	struct poll_table pt;
-	int r;
-
-	if (epfd_idx < 0 || epfd_idx >= MAX_EPOLL_INSTANCES)
-		return -EBADF;
-	epoll_instance_t *ep = &epoll_instances[epfd_idx];
-	if (!ep->active)
-		return -EBADF;
-	if (maxevents <= 0 || !events)
-		return -EINVAL;
-
-	/* Sized to the whole watch list rather than to maxevents: the scan
-	 * registers on every watched descriptor, not just the ones it will
-	 * report. */
-	poll_table_init(&pt, ep->nentries > 0 ? ep->nentries : 1);
-	r = epoll_wait_locked(ep, events, maxevents, timeout_ns, &pt);
-	poll_table_free(&pt);
-	return r;
-}
-
-static int epoll_wait_locked(epoll_instance_t *ep, struct epoll_event *events,
-			     int maxevents, uint64_t timeout_ns,
-			     struct poll_table *pt)
-{
-
-	uint64_t deadline = 0, deadline_ns = 0;
-	if (timeout_ns == 0) {
-		// Non-blocking
-	} else if (timeout_ns != (uint64_t)-1) {
-		/* +1 for the tick already in progress: timer_ticks() was read
-		 * at some unknown fraction into the current tick, so without it
-		 * the wake lands up to one tick early and the timeout expires
-		 * short of what was asked for.  A timeout may fire late, never
-		 * early; the futex and sleep paths arm their deadlines the same
-		 * way. */
-		deadline_ns = poll_deadline_ns(timeout_ns);
-		deadline = timer_ticks() + timer_ns_to_ticks(timeout_ns) + 1;
-	}
-
-	while (1) {
-		/* Sampled BEFORE the scan below.  An event that arrives while
-		 * the scan is running finds this task still RUNNING and cannot
-		 * park it, so the wake would be lost; the sleep path compares
-		 * this against the counter after publishing its blocked state
-		 * and re-scans instead of sleeping through the event. */
-		/* Off every queue from the previous iteration before going
-		 * back on: an entry may be on one queue at a time, and the set
-		 * of interesting descriptors can change between scans. */
-		poll_table_reset(pt);
-
-		uint64_t seq_before = poll_io_seq();
-		int count = 0;
-
-		uint64_t fl;
-		spin_lock_irqsave(&ep->lock, &fl);
-
-		for (int i = 0; i < ep->nentries && count < maxevents; i++) {
-			if (ep->entries[i].oneshot_triggered &&
-			    (ep->entries[i].events & EPOLLONESHOT))
-				continue;
-
-			short poll_events = 0;
-			if (ep->entries[i].events & (EPOLLIN | EPOLLRDNORM))
-				poll_events |= POLLIN;
-			if (ep->entries[i].events & (EPOLLOUT | EPOLLWRNORM))
-				poll_events |= POLLOUT;
-			if (ep->entries[i].events & EPOLLPRI)
-				poll_events |= POLLPRI;
-
-			short rev = fd_poll_one(ep->entries[i].fd, poll_events, pt);
-			if (rev == 0)
-				continue;
-
-			uint32_t ep_events = 0;
-			if (rev & (POLLIN | POLLRDNORM))
-				ep_events |= EPOLLIN;
-			if (rev & (POLLOUT | POLLWRNORM))
-				ep_events |= EPOLLOUT;
-			if (rev & POLLERR)
-				ep_events |= EPOLLERR;
-			if (rev & POLLHUP)
-				ep_events |= EPOLLHUP;
-			if (rev & POLLPRI)
-				ep_events |= EPOLLPRI;
-
-			ep_events &=
-				(ep->entries[i].events | EPOLLERR | EPOLLHUP);
-			if (ep_events == 0)
-				continue;
-
-			events[count].events = ep_events;
-			events[count].data.u64 = ep->entries[i].data;
-			count++;
-
-			if (ep->entries[i].events & EPOLLONESHOT)
-				ep->entries[i].oneshot_triggered = 1;
-		}
-
-		spin_unlock_irqrestore(&ep->lock, fl);
-
-		WARN_ON(count >
-			maxevents); /* epoll_wait returned more events than maxevents - loop bound violated */
-		if (count > 0 || timeout_ns == 0)
-			return count;
-
-		if (timeout_ns != (uint64_t)-1 && hrtimer_now_ns() >= deadline_ns)
-			return 0;
-
-		/* A deliverable signal must break the wait: a signal handler only
-		 * runs on the way back to user mode, so a task that just keeps
-		 * sleeping here never runs it.  This silently broke every
-		 * event-driven program — a terminal app blocked in poll() never
-		 * saw SIGWINCH (window resizes were ignored) and a server never
-		 * saw SIGCHLD (children were never reaped, so a session never
-		 * closed).  signal_pending() ignores masked signals, so a
-		 * blocked signal cannot spin us here. */
-		{
-			task_t *_cur = sched_current();
-			if (_cur && signal_pending(_cur))
-				return -EINTR;
-		}
-
-		poll_sleep_until_next_tick(deadline, deadline_ns,
-					   timeout_ns != (uint64_t)-1,
-					   seq_before, pt);
-	}
-}
-
-// Helper: extract epoll index from a process fd
-/* Resolve an epoll descriptor, taking a reference on the instance so it
- * survives the operation.  Release it with epoll_idx_release().
- *
- * The reference is the point: the index alone says nothing about whether the
- * instance is still there, and a sibling thread closing the descriptor while
- * the operation ran would destroy it underneath. */
-static int epoll_idx_from_fd(uint64_t fd)
-{
-	task_t *cur = sched_current();
-	void *entry;
-	int idx;
-
-	if (!cur || fd >= TASK_MAX_FDS)
-		return -EBADF;
-	entry = fdget(cur, (int)fd);
-	if (!entry)
-		return -EBADF;
-	if (!IS_EPOLL_FD(entry)) {
-		fdput(entry);
-		return -EBADF;
-	}
-	idx = EPOLL_FD_IDX(entry);
-	/* fdget's hold IS the instance reference: fdput on an epoll marker is
-	 * epoll_put, so the pairing below releases exactly this. */
-	return idx;
-}
-
-static void epoll_idx_release(int idx)
-{
-	epoll_put(idx);
 }
 
 // ---------------------------------------------------------------------------
-// Noinline helpers for syscalls with large stack-allocated buffers.
-// Keeping these out of syscall_handler_inner prevents the compiler from
-// reserving stack space for ALL local arrays at function entry, which was
-// blowing past the 8 KB kernel stack.
+// Noinline helpers for syscalls with large stack-allocated buffers, kept out
+// of syscall_handler_inner so its frame stays small.
 // ---------------------------------------------------------------------------
 
-/* ppoll()/pselect() take a signal mask that must be installed for exactly the
- * duration of the wait and restored afterwards.  Ignoring it broke the
- * standard "block the signal, then let ppoll unblock it while waiting" idiom:
- * the signal stayed blocked, signal_pending() correctly skipped it, the wait
- * was never interrupted and the handler never ran.  sshd uses precisely that
- * idiom for SIGCHLD, so exited sessions were left unreaped as zombies until
- * some unrelated event happened to wake the listener.
+/* ppoll()/pselect()/epoll_pwait() take a signal mask that must be installed
+ * for exactly the duration of the wait and restored afterwards (the "block
+ * the signal, then let ppoll unblock it while waiting" idiom; sshd uses it
+ * for SIGCHLD).
  *
- * Returns 1 if a mask was installed (caller must restore `saved`), 0 if none
- * was supplied, or a negative errno. */
-static int poll_sigmask_install(uint64_t umask_ptr, kernel_sigset_t *saved)
+ * Returns 1 if a mask was installed (the restore happens after signal
+ * delivery), 0 if none was supplied, or a negative errno. */
+int poll_sigmask_install(uint64_t umask_ptr, kernel_sigset_t *saved)
 {
 	task_t *cur = sched_current();
 	if (!cur || umask_ptr == 0)
@@ -1180,9 +773,6 @@ sys_select(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 		uint64_t tv_sec = 0, tv_usec = 0;
 		copy_from_user(&tv_sec, (void *)a5, 8);
 		copy_from_user(&tv_usec, (void *)(a5 + 8), 8);
-		/* Converted at the measured tick rate.  This used to assume
-		 * 100Hz, so on a machine whose calibrated rate is ~200Hz every
-		 * select() timeout expired in half the requested time. */
 		timeout_ns = (tv_sec * 1000000ULL + tv_usec) * 1000ULL;
 		if (tv_sec == 0 && tv_usec == 0)
 			timeout_ns = 0;
@@ -1221,9 +811,6 @@ sys_pselect6(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 		long tv_nsec = 0;
 		copy_from_user(&tv_sec, (void *)a5, 8);
 		copy_from_user(&tv_nsec, (void *)(a5 + 8), 8);
-		/* Measured tick rate, rounded up.  `tv_sec * 100 + tv_nsec/1e7'
-		 * assumed a 10ms tick and truncated the remainder, so this
-		 * expired early on both counts. */
 		timeout_ns = tv_sec * 1000000000ULL + (uint64_t)tv_nsec;
 		if (tv_sec == 0 && tv_nsec == 0)
 			timeout_ns = 0;
@@ -1244,19 +831,9 @@ sys_pselect6(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 	return ret;
 }
 
-/* The descriptor set of poll()/ppoll().
- *
- * Both used to take at most 256 entries and answer EINVAL above that, from a
- * 256-entry array on the 16 KB kernel stack.  A GLib main loop polls one
- * descriptor per open connection, and WebKit's network process keeps up to
- * 256 connections open (idle ones for 115 s) plus its wake-up descriptors, so
- * it crossed 256 a few seconds into a page load.  GLib treats a failed poll
- * as "nothing ready" and goes straight around again, dispatching no
- * descriptor event at all until the set shrinks: the browser froze for as
- * long as the connection count stayed high, and the only trace was
- * "poll(2) failed due to: Invalid argument" on the console.  Now the limit is
- * the descriptor table itself: a small set stays on the stack as before, a
- * larger one is copied through the heap. */
+/* The descriptor set of poll()/ppoll().  The limit is the descriptor table
+ * itself (a browser's network process polls hundreds of connections): a
+ * small set stays on the stack, a larger one is copied through the heap. */
 #define POLL_STACK_FDS 256
 
 struct poll_fds {
@@ -1307,9 +884,6 @@ sys_poll(uint64_t a1, uint64_t a2, uint64_t a3)
 	else if (timeout_ms == 0)
 		timeout_ns = 0;
 	else
-		/* Measured tick rate, rounded up: `ms / 10' assumed a 10ms tick
-		 * AND discarded the remainder, so this returned early twice
-		 * over -- a 200ms poll() came back in about 129ms. */
 		timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
 	int ret = sys_poll_internal(pf.fds, nfds, timeout_ns);
 	poll_fds_put(&pf, a1);
@@ -1330,9 +904,6 @@ sys_ppoll(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 		long tv_nsec = 0;
 		copy_from_user(&tv_sec, (void *)a3, 8);
 		copy_from_user(&tv_nsec, (void *)(a3 + 8), 8);
-		/* Measured tick rate, rounded up.  `tv_sec * 100 + tv_nsec/1e7'
-		 * assumed a 10ms tick and truncated the remainder, so this
-		 * expired early on both counts. */
 		timeout_ns = tv_sec * 1000000000ULL + (uint64_t)tv_nsec;
 		if (tv_sec == 0 && tv_nsec == 0)
 			timeout_ns = 0;
@@ -1348,119 +919,5 @@ sys_ppoll(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 	 * delivery (poll_sigmask_restore_pending). */
 	(void)saved_mask;
 	poll_fds_put(&pf, a1);
-	return ret;
-}
-
-__attribute__((noinline)) int64_t
-sys_epoll_wait(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
-{
-	int64_t ret;
-	/* Resolving the descriptor takes a reference on the epoll instance, so
-	 * from here every way out has to give it back -- but NOT this one:
-	 * a failed resolution holds nothing, and releasing a negative index
-	 * would drop a reference belonging to some unrelated instance. */
-	int ep_idx = epoll_idx_from_fd(a1);
-
-	if (ep_idx < 0)
-		return ep_idx;
-	int maxevents = (int)a3;
-	if (maxevents <= 0 || maxevents > 256) {
-		ret = -EINVAL;
-		goto out;
-	}
-	size_t sz = (size_t)maxevents * sizeof(struct epoll_event);
-	if (!validate_user_ptr(a2, sz)) {
-		ret = -EFAULT;
-		goto out;
-	}
-	struct epoll_event kevs[256];
-	int timeout_ms = (int)(int64_t)a4;
-	uint64_t timeout_ns;
-	if (timeout_ms < 0)
-		timeout_ns = (uint64_t)-1;
-	else if (timeout_ms == 0)
-		timeout_ns = 0;
-	else
-		/* Measured tick rate, rounded up: `ms / 10' assumed a 10ms tick
-		 * AND discarded the remainder, so this returned early twice
-		 * over -- a 200ms poll() came back in about 129ms. */
-		timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
-	int got = epoll_wait_internal(ep_idx, kevs, maxevents, timeout_ns);
-
-	if (got > 0)
-		copy_to_user((void *)a2, kevs,
-			     (size_t)got * sizeof(struct epoll_event));
-	ret = got;
-
-out:
-	epoll_idx_release(ep_idx);
-	return ret;
-}
-
-int64_t sys_epoll_create(void)
-{
-	int ep_idx = epoll_create_internal(0);
-	if (ep_idx < 0)
-		return ep_idx;
-	task_t *cur = sched_current();
-	if (!cur)
-		return -EFAULT;
-	/* fd_install_from, not a hand-rolled scan: it claims the slot under
-	 * the descriptor-table lock, so two threads creating epoll sets at the
-	 * same moment cannot be handed the same number -- and it clears the
-	 * slot's stale flag byte, which a recycled slot would otherwise keep. */
-	{
-		int fd = fd_install_from(cur, MAKE_EPOLL_FD(ep_idx), 3);
-
-		if (fd < 0) {
-			/* No descriptor for it: give the instance back rather
-			 * than leaving one nothing can ever reach. */
-			epoll_put(ep_idx);
-			return fd;
-		}
-		return fd;
-	}
-}
-
-int64_t sys_epoll_create1(uint64_t a1)
-{
-	int ep_idx = epoll_create_internal((int)a1);
-	if (ep_idx < 0)
-		return ep_idx;
-	task_t *cur = sched_current();
-	if (!cur)
-		return -EFAULT;
-	{
-		int fd = fd_install_from(cur, MAKE_EPOLL_FD(ep_idx), 3);
-
-		if (fd < 0) {
-			epoll_put(ep_idx);
-			return fd;
-		}
-		/* EPOLL_CLOEXEC has to be RECORDED, not just accepted.  An
-		 * epoll set is private to the process that built it, and every
-		 * caller asks for it -- letting the descriptor survive exec()
-		 * hands an unrelated program a handle onto it, and the
-		 * reference it drops on exit is one the creator was still
-		 * using. */
-		if ((int)a1 & EPOLL_CLOEXEC)
-			task_set_fd_flags(cur, (unsigned)fd, FD_CLOEXEC);
-		return fd;
-	}
-}
-
-int64_t sys_epoll_ctl(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
-{
-	int ep_idx = epoll_idx_from_fd(a1);
-	struct epoll_event kev;
-	int64_t ret;
-
-	if (ep_idx < 0)
-		return ep_idx;
-	if (a4 && validate_user_ptr(a4, sizeof(struct epoll_event)))
-		copy_from_user(&kev, (void *)a4,
-			       sizeof(struct epoll_event));
-	ret = epoll_ctl_internal(ep_idx, (int)a2, (int)a3, a4 ? &kev : NULL);
-	epoll_idx_release(ep_idx);
 	return ret;
 }

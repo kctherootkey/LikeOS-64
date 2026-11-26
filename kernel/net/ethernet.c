@@ -3,88 +3,127 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/net/net.h>
+#include <kernel/net/ip.h>
+#include <kernel/net/netdevice.h>
 #include <kernel/io/console.h>
 #include <kernel/net/skb.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/mm/memory.h>
 
-// Build and send an Ethernet frame.  The TX buffer is a per-call sk_buff
-// from the size-classed pool, so no global TX spinlock is held across the
-// underlying NIC submit -- callers' interrupts stay enabled long enough
-// for TLB-shootdown IPIs and other priority work.
+// Build an Ethernet frame around `payload' and queue it on the device
+// (dev_queue_xmit: the driver is never entered under a protocol lock).
 int eth_send(net_device_t *dev, const uint8_t dst_mac[ETH_ALEN],
 	     uint16_t ethertype, const uint8_t *payload, uint16_t len)
 {
 	BUG_ON(dev == NULL);
 	BUILD_BUG_ON(ETH_HLEN != 14);
-	if (!dev || !dev->send)
+	if (!dev || (!dev->send && !dev->xmit))
 		return -1;
 	if (len > dev->mtu)
 		return -1;
 	WARN_ON(len == 0); /* eth_send: zero-length payload */
 
-	uint16_t frame_len = ETH_HLEN + len;
-
-	sk_buff_t *skb = skb_alloc(frame_len);
+	sk_buff_t *skb = skb_alloc(len);
 	if (!skb)
 		return -1;
-	skb->dev = dev;
-
-	uint8_t *p = skb_append(skb, frame_len);
-	eth_header_t *hdr = (eth_header_t *)p;
+	if (len)
+		mm_memcpy(skb_append(skb, len), payload, len);
+	skb_reset_network_header(skb);
+	eth_header_t *hdr = (eth_header_t *)skb_push(skb, ETH_HLEN);
 	mm_memcpy(hdr->dst, dst_mac, ETH_ALEN);
 	mm_memcpy(hdr->src, dev->mac_addr, ETH_ALEN);
 	hdr->ethertype = net_htons(ethertype);
-	if (len)
-		mm_memcpy(p + ETH_HLEN, payload, len);
-
-	int ret = dev->send(dev, skb->data, skb->len);
-	skb_put(skb);
-	return ret;
+	skb_reset_mac_header(skb);
+	skb->protocol = ethertype;
+	skb->dev = dev;
+	return dev_queue_xmit(skb) == NET_XMIT_SUCCESS ? 0 : -1;
 }
 
-// Process received Ethernet frame
+// How a frame was addressed: to us, to everyone, to a group, to another
+// station (a NIC in promiscuous mode, a shared medium).
+static uint8_t eth_pkt_type(const net_device_t *dev, const uint8_t *dst)
+{
+	if (dst[0] & 0x01) {
+		for (int i = 0; i < ETH_ALEN; i++)
+			if (dst[i] != 0xFF)
+				return PACKET_MULTICAST;
+		return PACKET_BROADCAST;
+	}
+	for (int i = 0; i < ETH_ALEN; i++)
+		if (dst[i] != dev->mac_addr[i])
+			return PACKET_OTHERHOST;
+	return PACKET_HOST;
+}
+
+/* A received frame (skb->data at the Ethernet header): classified by
+ * its destination address, the header pulled, and handed to ARP or IPv4.
+ * Consumes the skb. */
+int eth_rcv(sk_buff_t *skb)
+{
+	net_device_t *dev = skb->dev;
+	const eth_header_t *hdr;
+	uint16_t ethertype;
+
+	BUG_ON(dev == NULL);
+	if (skb->len < ETH_HLEN) {
+		skb_put(skb);
+		return NET_RX_DROP;
+	}
+	skb_reset_mac_header(skb);
+	hdr = (const eth_header_t *)skb->data;
+	ethertype = net_ntohs(hdr->ethertype);
+	skb->pkt_type = eth_pkt_type(dev, hdr->dst);
+
+	/* A group address as the source: no station sends that (IEEE 802.3
+	 * 3.2.3); bad input from the wire, dropped and counted. */
+	if (hdr->src[0] & 0x01) {
+		dev->rx_dropped++;
+		dev->rx_bad_src++;
+		skb_put(skb);
+		return NET_RX_DROP;
+	}
+
+	/* A frame for another station is not ours to process (the address
+	 * filter let it through: promiscuous mode). */
+	if (skb->pkt_type == PACKET_OTHERHOST) {
+		skb_put(skb);
+		return NET_RX_DROP;
+	}
+	if (skb->pkt_type == PACKET_MULTICAST)
+		dev->multicast++;
+	skb_pull(skb, ETH_HLEN);
+	skb->protocol = ethertype;
+
+	switch (ethertype) {
+	case ETH_P_ARP:
+		arp_rcv(dev, skb->data,
+			(uint16_t)(skb->len > 0xFFFF ? 0xFFFF : skb->len),
+			skb->pkt_type);
+		skb_put(skb);
+		return NET_RX_SUCCESS;
+	case ETH_P_IP:
+		/* No address learning here: the neighbour table learns from
+		 * address resolution only (arp.c). */
+		return ip_rcv(skb);
+	default:
+		skb_put(skb); // unknown ethertype
+		return NET_RX_DROP;
+	}
+}
+
+// A received frame from a byte buffer.
 void eth_rx(net_device_t *dev, const uint8_t *frame, uint16_t len)
 {
+	sk_buff_t *skb;
+
 	BUG_ON(dev == NULL);
 	BUG_ON(frame == NULL);
 	if (len < ETH_HLEN)
 		return;
-
-	const eth_header_t *hdr = (const eth_header_t *)frame;
-	uint16_t ethertype = net_ntohs(hdr->ethertype);
-	const uint8_t *payload = frame + ETH_HLEN;
-	uint16_t payload_len = len - ETH_HLEN;
-	/* Multicast source MAC is a network-layer bug: destination can be multicast, source must be unicast */
-	WARN_RATELIMIT(
-		hdr->src[0] & 0x01,
-		"eth_rx: multicast source MAC %02x:%02x:%02x:%02x:%02x:%02x",
-		hdr->src[0], hdr->src[1], hdr->src[2], hdr->src[3], hdr->src[4],
-		hdr->src[5]);
-
-	switch (ethertype) {
-	case ETH_P_ARP:
-		arp_rx(dev, payload, payload_len);
-		break;
-	case ETH_P_IP:
-		// Snoop the source IP/MAC binding from the IPv4 header so any reply
-		// we send (echo reply, RST, ICMP error) hits the ARP cache and does
-		// not have to busy-wait on arp_resolve from softirq context.
-		if (payload_len >= sizeof(ipv4_header_t)) {
-			const ipv4_header_t *ip =
-				(const ipv4_header_t *)payload;
-			uint32_t src_ip = net_ntohl(ip->src_addr);
-			// Don't snoop multicast / broadcast / zero source addresses.
-			if (src_ip != 0 &&
-			    (src_ip & 0xF0000000U) != 0xE0000000U &&
-			    src_ip != 0xFFFFFFFFU) {
-				arp_add_entry(src_ip, hdr->src);
-			}
-		}
-		ipv4_rx(dev, payload, payload_len);
-		break;
-	default:
-		// Unknown ethertype, drop
-		break;
-	}
+	skb = skb_alloc(len);
+	if (!skb)
+		return;
+	mm_memcpy(skb_append(skb, len), frame, len);
+	skb->dev = dev;
+	eth_rcv(skb);
 }

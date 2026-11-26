@@ -244,10 +244,9 @@ int devfs_open_perm(task_t *cur, const char *path, uint64_t flags)
 	if (cur->cred.euid == 0)
 		return 0;
 	/* /dev/tty is the caller's controlling terminal, and a caller without
-	 * one has none to open.  devfs falls back to the console for root;
-	 * for anyone else that fallback would be the console's keyboard and
-	 * screen, to a process the console has nothing to do with -- any
-	 * account's setsid()'d process, a network login's included. */
+	 * one -- or with one its session no longer holds -- has none to open.
+	 * devfs refuses the first case for everyone; the second is refused
+	 * here for anyone but root. */
 	if (kstrcmp(path, "/dev/tty") == 0 &&
 	    (!cur->ctty || cur->ctty->sid != cur->sid))
 		return -ENXIO;

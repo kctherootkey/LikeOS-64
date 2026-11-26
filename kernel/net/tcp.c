@@ -1,84 +1,158 @@
-// LikeOS TCP (Transmission Control Protocol)
+// LikeOS TCP (Transmission Control Protocol): sockets
+//
+// The socket side of TCP: allocation and lifetime of connections, the
+// calls the socket layer makes (connect, listen, accept, send, receive,
+// close, shutdown, options), memory accounting and auto-tuning of the
+// send buffer, and the diagnostics.  The protocol itself is in
+// tcp_input.c, tcp_output.c, tcp_timer.c, tcp_ipv4.c and tcp_minisocks.c;
+// the lock order and the refcount rules are described in tcp.h.
 //
 // Copyright (C) 2026 The LikeOS Project
 
-#include <kernel/net/net.h>
+#include <kernel/net/tcp.h>
 #include <kernel/io/console.h>
 #include <kernel/io/tty.h>
 #include <kernel/mm/slab.h>
-#include <kernel/ke/timer.h>
-#include <kernel/ke/syscall.h>
-#include <kernel/dev/rand/random.h>
-#include <kernel/net/softirq.h>
-#include <kernel/net/ratelimit.h>
-#include <kernel/net/stats.h>
-#include <kernel/uapi/bug.h>
 #include <kernel/mm/memory.h>
-#include <kernel/net/skb.h>
+#include <kernel/ke/syscall.h>
+#include <kernel/ke/sched.h>
+#include <kernel/net/softirq.h>
+#include <kernel/dev/rand/random.h>
 
-// Global lock protecting the connection list and publish/unlink operations.
-static spinlock_t tcp_lock = SPINLOCK_INIT("tcp");
-
-// Forward decl: wake any task sleeping in poll/select/epoll_wait immediately
-// when TCP socket data (or connection state change) becomes available.
 extern void poll_notify_io_ready(void);
 extern void poll_notify_wq(struct wait_queue_head *);
+extern void poll_notify_wq_key(struct wait_queue_head *, unsigned key);
 
-/* Wake whoever is polling the SOCKET this connection belongs to.
- *
- * A connection has no waiters of its own -- poll() is called on a descriptor,
- * and the descriptor names a net_socket_t.  owner_socket is that socket, or
- * the self-pointer sentinel while the tcp layer still owns the connection and
- * no socket can be polling it, or NULL once the socket has let go.
- *
- * With no socket there is nobody to wake, so only the sequence counter is
- * bumped: that is what a poller between its scan and its park compares, and
- * skipping it would let such a poller sleep through the event. */
-static void tcp_poll_notify(tcp_conn_t *conn)
+volatile uint64_t tcp_xmib[TCPX_MAX];
+int tcp_sysctl_mtu_probing; // black-hole detection off, as by default
+int tcp_sysctl_ecn = 2; // ECN accepted when the peer asks, never requested
+/* TCP's own pacing for every connection (1), or only where
+ * SO_MAX_PACING_RATE asks for it (0, the default: segments leave as the
+ * window allows, a pacing qdisc's job is not TCP's). */
+int tcp_sysctl_internal_pacing;
+BUILD_BUG_ON(sizeof(struct tcp_info) != 248);
+
+static const char *const tcp_xmib_names[TCPX_MAX] = {
+	[TCPX_DELAYEDACKS] = "DelayedACKs",
+	[TCPX_QUICKACKS] = "QuickACKs",
+	[TCPX_HPHITS] = "TCPHPHits",
+	[TCPX_HPACKS] = "TCPHPAcks",
+	[TCPX_PUREACKS] = "TCPPureAcks",
+	[TCPX_OFOQUEUE] = "TCPOFOQueue",
+	[TCPX_OFODROP] = "TCPOFODrop",
+	[TCPX_OFOMERGE] = "TCPOFOMerge",
+	[TCPX_DSACKSENT] = "TCPDSACKOldSent",
+	[TCPX_DSACKOFOSENT] = "TCPDSACKOfoSent",
+	[TCPX_PRUNECALLED] = "PruneCalled",
+	[TCPX_RCVPRUNED] = "RcvPruned",
+	[TCPX_OFOPRUNED] = "OfoPruned",
+	[TCPX_RCVCOLLAPSED] = "TCPRcvCollapsed",
+	[TCPX_RCVQDROP] = "TCPRcvQDrop",
+	[TCPX_ZEROWINDOWDROP] = "TCPZeroWindowDrop",
+	[TCPX_LISTENOVERFLOWS] = "ListenOverflows",
+	[TCPX_LISTENDROPS] = "ListenDrops",
+	[TCPX_REQQFULLDOCOOKIES] = "TCPReqQFullDoCookies",
+	[TCPX_REQQFULLDROP] = "TCPReqQFullDrop",
+	[TCPX_SYNRETRANS] = "TCPSynRetrans",
+	[TCPX_ABORTONDATA] = "TCPAbortOnData",
+	[TCPX_ABORTONCLOSE] = "TCPAbortOnClose",
+	[TCPX_ABORTONMEMORY] = "TCPAbortOnMemory",
+	[TCPX_ABORTONTIMEOUT] = "TCPAbortOnTimeout",
+	[TCPX_ABORTONLINGER] = "TCPAbortOnLinger",
+	[TCPX_ABORTFAILED] = "TCPAbortFailed",
+	[TCPX_MEMORYPRESSURES] = "TCPMemoryPressures",
+	[TCPX_MEMRECLAIMS] = "TCPMemoryReclaims",
+	[TCPX_TWCREATED] = "TW",
+	[TCPX_TWKILLED] = "TWKilled",
+	[TCPX_TWRECYCLED] = "TWRecycled",
+	[TCPX_TWREUSED] = "TWReused",
+	[TCPX_PAWSESTAB] = "PAWSEstab",
+	[TCPX_PAWSACTIVE] = "PAWSActive",
+	[TCPX_CHALLENGEACK] = "TCPChallengeACK",
+	[TCPX_SYNCHALLENGE] = "TCPSYNChallenge",
+	[TCPX_ACKSKIPPEDCHALLENGE] = "TCPACKSkippedChallenge",
+	[TCPX_ACKSKIPPEDSYNRECV] = "TCPACKSkippedSynRecv",
+	[TCPX_ACKSKIPPEDPAWS] = "TCPACKSkippedPAWS",
+	[TCPX_ACKSKIPPEDSEQ] = "TCPACKSkippedSeq",
+	[TCPX_ACKSKIPPEDFINWAIT2] = "TCPACKSkippedFinWait2",
+	[TCPX_ACKSKIPPEDTIMEWAIT] = "TCPACKSkippedTimeWait",
+	[TCPX_DEFERACCEPTDROP] = "TCPDeferAcceptDrop",
+	[TCPX_TIMEOUTS] = "TCPTimeouts",
+	[TCPX_FASTRETRANS] = "TCPFastRetrans",
+	[TCPX_SLOWSTARTRETRANS] = "TCPSlowStartRetrans",
+	[TCPX_PARTIALRECOVERY] = "TCPPartialUndo",
+	[TCPX_TSQDEFER] = "TCPTSQDefer",
+	[TCPX_AUTOCORKING] = "TCPAutoCorking",
+	[TCPX_WINPROBE] = "TCPWinProbe",
+	[TCPX_KEEPALIVE] = "TCPKeepAlive",
+	[TCPX_RCVBUFGROW] = "TCPRcvBufGrow",
+	[TCPX_SNDBUFGROW] = "TCPSndBufGrow",
+	[TCPX_FINWAIT2TIMEOUT] = "TCPFinWait2Timeout",
+	[TCPX_ORPHANS_KILLED] = "TCPOrphansKilled",
+	[TCPX_MTUREDUCED] = "TCPMTUReduced",
+	[TCPX_SYNCOOKIESENT] = "SyncookiesSent",
+	[TCPX_SYNCOOKIERECV] = "SyncookiesRecv",
+	[TCPX_SYNCOOKIEFAILED] = "SyncookiesFailed",
+	[TCPX_LOSSPROBES] = "TCPLossProbes",
+	[TCPX_LOSSPROBERECOVERY] = "TCPLossProbeRecovery",
+	[TCPX_SACKRECOVERY] = "TCPSackRecovery",
+	[TCPX_RENORECOVERY] = "TCPRenoRecovery",
+	[TCPX_SACKRENEGING] = "TCPSACKReneging",
+	[TCPX_DSACKRECV] = "TCPDSACKRecv",
+	[TCPX_DSACKOFORECV] = "TCPDSACKOfoRecv",
+	[TCPX_DSACKIGNOREDOLD] = "TCPDSACKIgnoredOld",
+	[TCPX_DSACKIGNOREDNOUNDO] = "TCPDSACKIgnoredNoUndo",
+	[TCPX_DSACKIGNOREDDUBIOUS] = "TCPDSACKIgnoredDubious",
+	[TCPX_DSACKUNDO] = "TCPDSACKUndo",
+	[TCPX_FULLUNDO] = "TCPFullUndo",
+	[TCPX_LOSSUNDO] = "TCPLossUndo",
+	[TCPX_SPURIOUSRTOS] = "TCPSpuriousRTOs",
+	[TCPX_SACKREORDER] = "TCPSACKReorder",
+	[TCPX_TSREORDER] = "TCPTSReorder",
+	[TCPX_RENOREORDER] = "TCPRenoReorder",
+	[TCPX_LOSTRETRANSMIT] = "TCPLostRetransmit",
+	[TCPX_SACKDISCARD] = "TCPSackDiscard",
+	[TCPX_HYSTARTDELAYDETECT] = "TCPHystartDelayDetect",
+	[TCPX_HYSTARTDELAYCWND] = "TCPHystartDelayCwnd",
+	[TCPX_HYSTARTCSSRESUME] = "TCPHystartCSSResume",
+	[TCPX_DELIVEREDCE] = "TCPDeliveredCE",
+	[TCPX_ECNNEGOTIATED] = "TCPECNNegotiated",
+	[TCPX_PACINGDEFER] = "TCPPacingDefer",
+	[TCPX_MTUPFAIL] = "TCPMTUPFail",
+};
+
+static int tcp_streq(const char *a, const char *b)
 {
-	net_socket_t *s = conn ? (net_socket_t *)conn->owner_socket : NULL;
-
-	if (s && (void *)s != (void *)conn)
-		poll_notify_wq(&s->poll_wq);
-	else
-		poll_notify_io_ready();
+	while (*a && *a == *b) {
+		a++;
+		b++;
+	}
+	return *a == *b;
 }
 
-/* A listener's accept queue just gained a connection: wake whoever polls
- * the listening socket.  `owner' is the listener's owner_socket, read while
- * its lock was held -- the listener can be closed the moment the lock is
- * dropped, the socket slot it named cannot go away (see tcp_poll_notify()).
- * Without this a server waiting in poll() on its listening socket -- sshd's
- * accept loop -- slept through every connection while the peer, its
- * handshake complete, waited for a banner that never came. */
-static void tcp_listener_notify(const tcp_conn_t *listener, void *owner)
+uint64_t tcp_xmib_read(const char *name)
 {
-	if (owner && owner != (const void *)listener)
-		poll_notify_wq(&((net_socket_t *)owner)->poll_wq);
-	else
-		poll_notify_io_ready();
+	for (int i = 0; i < TCPX_MAX; i++)
+		if (tcp_xmib_names[i] && tcp_streq(tcp_xmib_names[i], name))
+			return __atomic_load_n(&tcp_xmib[i], __ATOMIC_RELAXED);
+	return ~0ULL;
 }
 
 // ---------------------------------------------------------------------------
-// IRQ-friendly blocking acquire of a per-connection spinlock.
+// The socket lock.
 //
 // Plain spin_lock_irqsave() spins with IRQs disabled.  Under heavy SMP
-// contention (e.g. ksoftirqd on CPU 0 holding conn->lock to deliver a
-// burst of TCP segments while another CPU's user task tries to recv from
-// the same conn) the waiter can sit IRQs-off long enough to miss a TLB
-// shootdown IPI from a third CPU doing slab_free() — the symptom is
-// `SMP: TLB shootdown sync timeout (ack=N expect=N+1)` followed by an
-// OS-wide multi-second freeze.
-//
-// Mirrors the trylock-with-IRQ-window pattern in smp_tlb_shootdown_sync():
-// while the lock is contended, IRQs are enabled briefly between attempts
-// so this CPU can ACK any pending IPIs.  Once acquired, IRQs are disabled
-// (matching spin_lock_irqsave semantics).  Safe to use from any process
-// or softirq context — DO NOT use from hard-IRQ context, where you
-// must already be using spin_trylock-and-skip (see tcp_timer_tick).
-static inline void tcp_lock_acquire(spinlock_t *lock, uint64_t *flags_out)
+// contention (the receive softirq holding conn->lock to deliver a burst
+// while another CPU's task tries to recv from the same conn) the waiter
+// could sit with interrupts off long enough to miss a TLB shootdown IPI
+// from a third CPU, which freezes the system.  While the lock is
+// contended, interrupts are therefore enabled briefly between attempts.
+// Process or softirq context only -- never from a hard interrupt.
+// ---------------------------------------------------------------------------
+void tcp_lock_acquire(spinlock_t *lock, uint64_t *flags_out)
 {
 	uint64_t f = local_irq_save();
+
 	while (!spin_trylock(lock)) {
 		local_irq_restore(f);
 		__asm__ volatile("pause" ::: "memory");
@@ -87,108 +161,30 @@ static inline void tcp_lock_acquire(spinlock_t *lock, uint64_t *flags_out)
 	*flags_out = f;
 }
 
-static inline void tcp_lock_release(spinlock_t *lock, uint64_t flags)
+void tcp_lock_release(spinlock_t *lock, uint64_t flags)
 {
 	spin_unlock(lock);
 	local_irq_restore(flags);
+	/* The outermost interrupts-off section is over: send now what the
+	 * device layer had to queue while the lock was held (the transmit
+	 * contract in netdevice.h). */
+	if (flags & (1ULL << 9))
+		net_tx_flush_local();
 }
 
 // ---------------------------------------------------------------------------
-// Connection lifetime: dynamic allocation + reference counting.
-//
-// Every connection is individually slab-allocated and linked into a single
-// global list (g_tcp_conn_list) protected by tcp_lock.  A bare tcp_conn_t* is
-// therefore a stable identity: the memory is never recycled into a different
-// connection while any reference is held, which eliminates the whole class of
-// "slot freed and reused out from under a pointer" races that the old fixed
-// array + generation counter existed to paper over.
-//
-// A reference is held by:
-//   * the protocol state machine, while the connection is not terminally dead
-//     (the "proto ref", tracked by conn->proto_ref and dropped exactly once);
-//   * the owning socket (net_socket_t::tcp);
-//   * each accept-queue entry on a listener;
-//   * transiently, any lookup (tcp_find_conn_hold) or the timer sweep.
-//
-// The last put queues the connection for physical free.  Because a connection
-// at refcount 0 can never be revived (tcp_conn_tryhold refuses it), the free
-// can be deferred to softirq/process context with no generation validation —
-// this keeps slab_free (which may fire a TLB-shootdown IPI) out of any
-// hard-IRQ path.
+// References and the reap list.
 // ---------------------------------------------------------------------------
+static struct tcp_skc *g_reap_list;
+static spinlock_t g_reap_lock = SPINLOCK_INIT("tcp_reap");
+static volatile uint32_t g_conn_count; // full sockets in existence
 
-static tcp_conn_t *g_tcp_conn_list; // head of the all-connections list
-
-/* Demux hash: connections by 4-tuple.
- *
- * The list above is walked in full by every path that has to find a
- * connection, and the receive path is one of them -- so demultiplexing a
- * single packet cost one comparison per LIVE CONNECTION, under tcp_lock,
- * with interrupts disabled.  That is affordable with a handful of
- * connections and ruinous with thousands, and thousands is exactly what a
- * browser produces: every closed connection sits in TIME_WAIT for a minute
- * (TCP_TIME_WAIT_TICKS), so a few hundred requests a second leaves tens of
- * thousands of dead entries for each arriving packet to walk past.
- *
- * The cost does not stay in the walk.  It is paid with interrupts off, so
- * the network card's receive interrupt is not serviced while it runs; the
- * card's ring overflows, the packets in it are lost, and the peers
- * retransmit -- which produces more packets, each walking the same longer
- * list.  What the user sees is a stack that works well at low connection
- * counts and collapses into multi-second stalls and timeouts at high ones,
- * with the network never actually saturated.
- *
- * So connections are also chained by a hash of their 4-tuple, and every
- * lookup that has the tuple uses that instead: one short bucket rather
- * than the whole table, regardless of how many connections are dying.  The
- * list itself stays -- the timer sweep and the diagnostics want to visit
- * everything -- and both are edited together under tcp_lock.
- *
- * The local address is deliberately NOT part of the key: a connection may
- * be bound to the wildcard address, which a lookup for a specific local
- * address must still find (see tcp_find_conn_locked), and a key that
- * included it would put the two in different buckets. */
-#define TCP_EHASH_BUCKETS 1024
-static tcp_conn_t *g_tcp_ehash[TCP_EHASH_BUCKETS];
-
-static inline uint32_t tcp_ehash_key(uint16_t local_port, uint32_t remote_ip,
-				     uint16_t remote_port)
+int tcp_skc_tryhold(struct tcp_skc *skc)
 {
-	/* Multiplicative mix of the three fields; the high bits of the
-	 * product are the ones that carry every input bit. */
-	uint64_t x = ((uint64_t)remote_ip << 32) ^
-		     ((uint32_t)local_port << 16) ^ remote_port;
+	int old = __atomic_load_n(&skc->refcount, __ATOMIC_RELAXED);
 
-	x *= 0x9E3779B97F4A7C15ULL;
-	return (uint32_t)(x >> 52) & (TCP_EHASH_BUCKETS - 1);
-}
-static uint32_t g_tcp_conn_count; // number of live connections (bounded)
-
-static void tcp_conn_final_free(tcp_conn_t *conn); // forward
-
-// Reap list: connections whose refcount reached 0, awaiting physical free in
-// softirq/process context.  Intrusive singly-linked list (chained by
-// conn->reap_next) so it needs no fixed capacity.  No generation needed — a
-// 0-refcount connection is stable (nothing can re-reference it).
-static tcp_conn_t *g_tcp_reap_list;
-static spinlock_t tcp_reap_lock = SPINLOCK_INIT("tcp_reap");
-
-// Increment a reference the caller already holds one of.
-static inline void tcp_conn_hold(tcp_conn_t *conn)
-{
-	__atomic_fetch_add(&conn->refcount, 1, __ATOMIC_ACQ_REL);
-}
-
-// Increment iff the connection is still referenced (refcount > 0).  MUST be
-// called with tcp_lock held so the connection cannot be unlinked/freed under
-// the caller: physical free removes the connection from the list under
-// tcp_lock, so a list walker holding tcp_lock sees only valid memory, and a
-// refcount that has already reached 0 makes this refuse (return 0).
-static inline int tcp_conn_tryhold(tcp_conn_t *conn)
-{
-	int old = __atomic_load_n(&conn->refcount, __ATOMIC_RELAXED);
 	while (old > 0) {
-		if (__atomic_compare_exchange_n(&conn->refcount, &old, old + 1,
+		if (__atomic_compare_exchange_n(&skc->refcount, &old, old + 1,
 						1, __ATOMIC_ACQ_REL,
 						__ATOMIC_RELAXED))
 			return 1;
@@ -196,30 +192,30 @@ static inline int tcp_conn_tryhold(tcp_conn_t *conn)
 	return 0;
 }
 
-// Drop a reference.  On reaching 0, queue the connection for physical free.
-// Safe from ANY context (never blocks, never slab_frees inline): a 0-refcount
-// connection cannot be re-referenced, so deferring the free is race-free.
-static void tcp_conn_put(tcp_conn_t *conn)
+/* Drop a reference.  At zero the object goes on the reap list; the memory
+ * is freed by tcp_reap_pending() in process or softirq context.  Safe in
+ * any context and under any TCP lock (it never frees inline). */
+void tcp_skc_put(struct tcp_skc *skc)
 {
-	if (!conn)
+	uint64_t f;
+	int n;
+
+	if (!skc)
 		return;
-	if (__atomic_sub_fetch(&conn->refcount, 1, __ATOMIC_ACQ_REL) != 0)
+	n = __atomic_sub_fetch(&skc->refcount, 1, __ATOMIC_ACQ_REL);
+	BUG_ON(n < 0);
+	if (n != 0)
 		return;
-	uint64_t flags;
-	spin_lock_irqsave(&tcp_reap_lock, &flags);
-	if (!conn->on_reap_queue) {
-		conn->on_reap_queue = 1;
-		conn->reap_next = g_tcp_reap_list;
-		g_tcp_reap_list = conn;
+	spin_lock_irqsave(&g_reap_lock, &f);
+	if (!skc->skc_reaping) {
+		skc->skc_reaping = 1;
+		skc->skc_reap_next = g_reap_list;
+		g_reap_list = skc;
 	}
-	spin_unlock_irqrestore(&tcp_reap_lock, flags);
-	// Wake ksoftirqd to drain the reap list in process/softirq context.
+	spin_unlock_irqrestore(&g_reap_lock, f);
 	softirq_raise(SOFTIRQ_TIMER);
 }
 
-// Public reference-count wrappers for the socket layer (which cannot see the
-// static primitives).  tcp_conn_get adds the owning socket's reference;
-// tcp_conn_release drops it.
 void tcp_conn_get(tcp_conn_t *conn)
 {
 	tcp_conn_hold(conn);
@@ -230,4146 +226,1860 @@ void tcp_conn_release(tcp_conn_t *conn)
 	tcp_conn_put(conn);
 }
 
-// Softirq handler bound to SOFTIRQ_TIMER (registered in tcp_init).  Runs in
-// process / ksoftirqd context with IRQs enabled, so slab_free (which can fire
-// a TLB-shootdown IPI) is safe here.
+void tcp_purge_queues(tcp_conn_t *c)
+{
+	sk_buff_t *skb;
+
+	while ((skb = __skb_dequeue(&c->write_queue)) != NULL) {
+		tcp_wmem_uncharge(c, skb);
+		skb_put(skb);
+	}
+	while ((skb = __skb_dequeue(&c->rtx_queue)) != NULL) {
+		tcp_wmem_uncharge(c, skb);
+		skb_put(skb);
+	}
+	while ((skb = __skb_dequeue(&c->rcv_queue)) != NULL) {
+		tcp_rmem_uncharge(c, skb);
+		skb_put(skb);
+	}
+	c->rcvq_bytes = 0;
+	tcp_ofo_purge(c);
+	c->packets_out = 0;
+	c->retrans_out = 0;
+	c->sacked_out = 0;
+	c->lost_out = 0;
+	c->retransmit_skb_hint = NULL;
+	tcp_tsorted_reset(c);
+	tcp_rtx_idx_reset(c);
+}
+
+static void tcp_conn_free(tcp_conn_t *c)
+{
+	BUG_ON(c->skc_hashed || c->skc_bound);
+	WARN_ON(net_timer_pending(&c->retransmit_timer) ||
+		net_timer_pending(&c->delack_timer) ||
+		net_timer_pending(&c->keepalive_timer) ||
+		net_timer_pending(&c->pacing_timer));
+	tcp_ca_release(c);
+	tcp_purge_queues(c);
+	dst_cache_reset(&c->dst_cache);
+	c->active = 0;
+	c->skc_kind = 0;
+	slab_free(c);
+	__atomic_fetch_sub(&g_conn_count, 1, __ATOMIC_ACQ_REL);
+}
+
 static void tcp_pending_softirq(void)
 {
 	tcp_reap_pending();
+	tcp_minisocks_maintain();
+	tcp_mem_reclaim();
 }
 
-// Drain the reap list: unlink each 0-refcount connection from the global list
-// and physically free it.  Process/softirq context only (slab_free).
+// Free everything whose last reference is gone.  Process/softirq context
+// with interrupts enabled (slab_free).
 void tcp_reap_pending(void)
 {
 	for (;;) {
-		tcp_conn_t *conn = NULL;
-		uint64_t flags;
-		spin_lock_irqsave(&tcp_reap_lock, &flags);
-		if (g_tcp_reap_list) {
-			conn = g_tcp_reap_list;
-			g_tcp_reap_list = conn->reap_next;
-			conn->reap_next = NULL;
-		}
-		spin_unlock_irqrestore(&tcp_reap_lock, flags);
-		if (!conn)
-			break;
-		tcp_conn_final_free(conn);
-	}
-}
+		struct tcp_skc *skc;
+		uint64_t f;
 
-// Forward declarations needed by helpers defined before their original sites.
-static uint32_t ring_used(uint32_t head, uint32_t tail, uint32_t size);
-static uint32_t ring_free(uint32_t head, uint32_t tail, uint32_t size);
-int tcp_send_segment(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
-		     uint16_t src_port, uint16_t dst_port, uint32_t seq,
-		     uint32_t ack, uint8_t flags, uint16_t window,
-		     const uint8_t *data, uint16_t data_len);
-static void tcp_send_ack(tcp_conn_t *conn);
-
-// ISN secret key (generated once at init, 128-bit for SipHash-2-4)
-static uint8_t tcp_isn_secret[16];
-
-// SYN cookie secret (separate from ISN secret)
-static uint8_t tcp_syncookie_secret[16];
-
-static uint16_t tcp_local_mss(net_device_t *dev)
-{
-	uint16_t mtu = (dev && dev->mtu >= sizeof(ipv4_header_t) +
-						   sizeof(tcp_header_t)) ?
-			       dev->mtu :
-			       NET_MTU_DEFAULT;
-	uint16_t mss =
-		(uint16_t)(mtu - sizeof(ipv4_header_t) - sizeof(tcp_header_t));
-	if (mss > TCP_MSS)
-		mss = TCP_MSS;
-	if (mss < 536)
-		mss = 536;
-	return mss;
-}
-
-static uint16_t tcp_effective_mss(tcp_conn_t *conn)
-{
-	uint16_t mss = conn->max_seg_size ? conn->max_seg_size : TCP_MSS;
-	if (mss > TCP_MSS)
-		mss = TCP_MSS;
-	if (mss < 536)
-		mss = 536;
-	return mss;
-}
-
-// ============================================================================
-// RFC 7323 / RFC 2018 — Unified TCP option parser
-// ============================================================================
-typedef struct {
-	uint16_t mss; // 0 if absent
-	int8_t wscale; // -1 if absent (else 0..14, RFC 7323 caps at 14)
-	uint8_t sack_perm; // 1 if SACK Permitted seen
-	uint8_t ts_present; // 1 if Timestamp option seen
-	uint32_t tsval;
-	uint32_t tsecr;
-	uint8_t sack_count; // number of (left,right) pairs found
-	struct {
-		uint32_t left, right;
-	} sack[TCP_MAX_SACK_BLOCKS];
-} tcp_parsed_opts_t;
-
-static void tcp_parse_options(const tcp_header_t *tcp, uint8_t data_offset,
-			      tcp_parsed_opts_t *out)
-{
-	out->mss = 0;
-	out->wscale = -1;
-	out->sack_perm = 0;
-	out->ts_present = 0;
-	out->tsval = 0;
-	out->tsecr = 0;
-	out->sack_count = 0;
-
-	if (data_offset <= sizeof(tcp_header_t))
-		return;
-	const uint8_t *opts = ((const uint8_t *)tcp) + sizeof(tcp_header_t);
-	uint8_t opt_len = (uint8_t)(data_offset - sizeof(tcp_header_t));
-	uint8_t i = 0;
-	while (i < opt_len) {
-		uint8_t k = opts[i];
-		if (k == TCP_OPT_END)
+		spin_lock_irqsave(&g_reap_lock, &f);
+		skc = g_reap_list;
+		if (skc)
+			g_reap_list = skc->skc_reap_next;
+		spin_unlock_irqrestore(&g_reap_lock, f);
+		if (!skc)
+			return;
+		skc->skc_reap_next = NULL;
+		switch (skc->skc_kind) {
+		case TCP_SKC_FULL:
+			tcp_conn_free((tcp_conn_t *)skc);
 			break;
-		if (k == TCP_OPT_NOP) {
-			i++;
-			continue;
-		}
-		if (i + 1 >= opt_len)
+		case TCP_SKC_REQ:
+			tcp_reqsk_free((struct tcp_request_sock *)skc);
 			break;
-		uint8_t l = opts[i + 1];
-		if (l < 2 || i + l > opt_len)
+		case TCP_SKC_TW:
+			tcp_tw_free((struct tcp_tw_sock *)skc);
 			break;
-		switch (k) {
-		case TCP_OPT_MSS:
-			if (l == 4)
-				out->mss = (uint16_t)((opts[i + 2] << 8) |
-						      opts[i + 3]);
-			break;
-		case TCP_OPT_WSCALE:
-			if (l == 3) {
-				uint8_t s = opts[i + 2];
-				if (s > 14)
-					s = 14;
-				out->wscale = (int8_t)s;
-			}
-			break;
-		case TCP_OPT_SACK_PERM:
-			if (l == 2)
-				out->sack_perm = 1;
-			break;
-		case TCP_OPT_TIMESTAMP:
-			if (l == 10) {
-				out->ts_present = 1;
-				out->tsval = ((uint32_t)opts[i + 2] << 24) |
-					     ((uint32_t)opts[i + 3] << 16) |
-					     ((uint32_t)opts[i + 4] << 8) |
-					     ((uint32_t)opts[i + 5]);
-				out->tsecr = ((uint32_t)opts[i + 6] << 24) |
-					     ((uint32_t)opts[i + 7] << 16) |
-					     ((uint32_t)opts[i + 8] << 8) |
-					     ((uint32_t)opts[i + 9]);
-			}
-			break;
-		case TCP_OPT_SACK: {
-			// Each block is 8 bytes (left,right). Header is 2 bytes (kind,len).
-			uint8_t blocks = (l >= 2) ? (uint8_t)((l - 2) / 8) : 0;
-			if (blocks > TCP_MAX_SACK_BLOCKS)
-				blocks = TCP_MAX_SACK_BLOCKS;
-			for (uint8_t b = 0; b < blocks; b++) {
-				uint8_t off = (uint8_t)(i + 2 + b * 8);
-				out->sack[b].left =
-					((uint32_t)opts[off + 0] << 24) |
-					((uint32_t)opts[off + 1] << 16) |
-					((uint32_t)opts[off + 2] << 8) |
-					((uint32_t)opts[off + 3]);
-				out->sack[b].right =
-					((uint32_t)opts[off + 4] << 24) |
-					((uint32_t)opts[off + 5] << 16) |
-					((uint32_t)opts[off + 6] << 8) |
-					((uint32_t)opts[off + 7]);
-			}
-			out->sack_count = blocks;
-			break;
-		}
 		default:
+			WARN_ON_ONCE(1);
 			break;
 		}
-		i = (uint8_t)(i + l);
 	}
 }
 
-// Backwards-compat wrapper used by old callers.
-static uint16_t tcp_parse_mss_option(const tcp_header_t *tcp,
-				     uint8_t data_offset)
+// ---------------------------------------------------------------------------
+// Allocation.
+// ---------------------------------------------------------------------------
+tcp_conn_t *tcp_conn_alloc(void)
 {
-	tcp_parsed_opts_t p;
-	tcp_parse_options(tcp, data_offset, &p);
-	return p.mss;
+	tcp_conn_t *c;
+
+	WARN_ON_ONCE(irqs_disabled());
+	c = (tcp_conn_t *)slab_alloc(sizeof(*c));
+	if (!c)
+		return NULL;
+	mm_memset(c, 0, sizeof(*c));
+	__atomic_fetch_add(&g_conn_count, 1, __ATOMIC_ACQ_REL);
+	c->skc_kind = TCP_SKC_FULL;
+	c->state = TCP_STATE_CLOSED;
+	c->refcount = 1; // the protocol's reference
+	c->proto_ref = 1;
+	c->lock = (spinlock_t)SPINLOCK_INIT("tcp_conn");
+	c->active = 1;
+	skb_queue_init(&c->write_queue, "tcp_wq");
+	skb_queue_init(&c->rtx_queue, "tcp_rtxq");
+	skb_queue_init(&c->rcv_queue, "tcp_rcvq");
+	c->ooo_queue.rb_node = NULL;
+	tcp_init_xmit_timers(c);
+
+	c->tx_ready = 1;
+	c->rto_us = TCP_RTO_INITIAL_US;
+	c->cwnd = TCP_INIT_CWND;
+	c->ssthresh = TCP_INFINITE_SSTHRESH;
+	c->ca_ops = tcp_ca_default();
+	c->reordering = TCP_REORDERING;
+	c->rack.reo_wnd_steps = 1;
+	for (int i = 0; i < 3; i++)
+		c->min_rtt[i].v = ~0u;
+	c->inet_id = (uint16_t)random_u32();
+	c->peer_mss = TCP_MSS_DEFAULT;
+	c->mss_clamp = TCP_MSS_DEFAULT;
+	c->mss_cache = TCP_MSS_DEFAULT;
+	c->advmss = TCP_MSS;
+	c->tcp_header_len = sizeof(tcp_header_t);
+	c->rcv_mss = TCP_MSS_DEFAULT;
+	c->rcvbuf = TCP_RMEM_DEFAULT;
+	c->sndbuf = TCP_WMEM_DEFAULT;
+	c->scaling_ratio = TCP_DEFAULT_SCALING_RATIO;
+	/* Nagle is off by default here, as it always was: applications on
+	 * this system are written for a stack that never held a small
+	 * write back (TCP_NODELAY=0 turns it on). */
+	c->nodelay = 1;
+	c->nonagle = TCP_NAGLE_OFF;
+	c->keepidle_ticks = (uint32_t)timer_s_to_ticks(TCP_KEEPALIVE_TIME_S);
+	c->keepintvl_ticks = (uint32_t)timer_s_to_ticks(TCP_KEEPALIVE_INTVL_S);
+	c->keepcnt = TCP_KEEPALIVE_PROBES;
+	c->last_rx_tick = tcp_now();
+	c->notsent_lowat = TCP_NOTSENT_LOWAT_DEFAULT;
+	c->max_pacing_rate = ~0ULL;
+	return c;
 }
 
-// Encode 32-bit big-endian
-static inline void put_be32(uint8_t *p, uint32_t v)
+// ---------------------------------------------------------------------------
+// Notifications.
+// ---------------------------------------------------------------------------
+/* Wake whoever is polling the SOCKET this connection belongs to.  A
+ * connection has no waiters of its own; owner_socket is the socket, or the
+ * self sentinel / NULL when none can be polling it -- then only the global
+ * poll sequence is bumped, which a poller between its scan and its park
+ * compares. */
+/* `key': the POLL* events that became true (0: a state change, every
+ * poller looks).  Edge-triggered epoll items only fire for their own
+ * events: a reader is not woken by an ACK that freed send space. */
+void tcp_poll_notify_key(tcp_conn_t *c, unsigned key)
 {
-	p[0] = (uint8_t)(v >> 24);
-	p[1] = (uint8_t)(v >> 16);
-	p[2] = (uint8_t)(v >> 8);
-	p[3] = (uint8_t)v;
+	net_socket_t *s = c ? (net_socket_t *)c->owner_socket : NULL;
+
+	if (s && (void *)s != (void *)c)
+		poll_notify_wq_key(&s->poll_wq, key);
+	else
+		poll_notify_io_ready();
 }
 
-// "Timestamp" we send: derive from timer_ticks so each tick is one TS unit
-// (10ms, well within the RFC 7323 1ms-1s allowed range).
+void tcp_poll_notify(tcp_conn_t *c)
+{
+	tcp_poll_notify_key(c, 0);
+}
+
+/* New data is on the receive queue (rcvq_bytes already counts it).  A
+ * reader waiting for SO_RCVLOWAT clears rx_ready without the lock, then
+ * looks at rcvq_bytes (sock_recv); here rcvq_bytes was stored, then
+ * rx_ready is exchanged -- a full barrier -- so either the reader sees
+ * the new count, or the exchange sees its 0 and wakes it. */
+void tcp_wake_reader(tcp_conn_t *c)
+{
+	int was = __atomic_exchange_n(&c->rx_ready, 1, __ATOMIC_SEQ_CST);
+
+	tcp_poll_notify_key(c, POLLIN | POLLRDNORM);
+	if (!was)
+		sched_wake_channel((void *)&c->rx_ready);
+}
+
+void tcp_listener_notify(tcp_conn_t *l)
+{
+	tcp_poll_notify_key(l, POLLIN | POLLRDNORM);
+}
+
+// ---------------------------------------------------------------------------
+// Orphans: connections the application closed that still finish their
+// protocol.  They are bounded (TCP_MAX_ORPHANS); beyond it a closing
+// connection is reset instead of lingering.
+// ---------------------------------------------------------------------------
+static volatile uint32_t g_orphans;
+
+uint32_t tcp_orphan_count(void)
+{
+	return __atomic_load_n(&g_orphans, __ATOMIC_RELAXED);
+}
+
+int tcp_orphan_too_many(void)
+{
+	return tcp_orphan_count() > TCP_MAX_ORPHANS;
+}
+
+void tcp_orphan_inc(tcp_conn_t *c)
+{
+	if (!c->orphan_counted) {
+		c->orphan_counted = 1;
+		__atomic_fetch_add(&g_orphans, 1, __ATOMIC_RELAXED);
+	}
+}
+
+void tcp_orphan_dec(tcp_conn_t *c)
+{
+	if (c->orphan_counted) {
+		c->orphan_counted = 0;
+		__atomic_fetch_sub(&g_orphans, 1, __ATOMIC_RELAXED);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// State changes.
+// ---------------------------------------------------------------------------
+void tcp_set_state(tcp_conn_t *c, int state)
+{
+	int old = c->state;
+
+	if (state == TCP_STATE_CLOSED && old != TCP_STATE_CLOSED)
+		tcp_unhash(c);
+	c->state = state;
+	if (state == TCP_STATE_CLOSED)
+		tcp_orphan_dec(c);
+}
+
+/* The connection is over: CLOSED, off every table, no timer pending, the
+ * protocol's reference dropped.  Waiters are woken.  Called with
+ * conn->lock held by a caller that holds its own reference. */
+void tcp_done(tcp_conn_t *c)
+{
+	tcp_set_state(c, TCP_STATE_CLOSED);
+	tcp_clear_xmit_timers(c);
+	c->connect_done = 1;
+	c->tx_ready = 1;
+	c->rx_ready = 1;
+	tcp_poll_notify(c);
+	sched_wake_channel((void *)&c->rx_ready);
+	if (c->proto_ref) {
+		c->proto_ref = 0;
+		tcp_conn_put(c); // the caller's own reference keeps it alive
+	}
+}
+
+/* The pending hard error, taken: reported once (by recv() with nothing
+ * left to read, send(), or SO_ERROR), after which a reset connection reads
+ * end of file and refuses writes with EPIPE.  0 when none is pending.
+ * Any context, no lock. */
+int tcp_sock_error(tcp_conn_t *c)
+{
+	if (!c || !__atomic_load_n(&c->error, __ATOMIC_ACQUIRE))
+		return 0;
+	return __atomic_exchange_n(&c->error, 0, __ATOMIC_ACQ_REL);
+}
+
+/* The connection failed (reset by the peer, timed out, refused): record
+ * the error the application sees, drop what was still to be sent, and
+ * finish it.  What was received in order stays readable: the reader gets
+ * it before the error.  Caller holds conn->lock and a reference. */
+void tcp_reset(tcp_conn_t *c, int err)
+{
+	__atomic_store_n(&c->error, err, __ATOMIC_RELEASE);
+	while (!skb_queue_empty(&c->write_queue) ||
+	       !skb_queue_empty(&c->rtx_queue)) {
+		sk_buff_t *skb = __skb_dequeue(&c->write_queue);
+
+		if (!skb)
+			skb = __skb_dequeue(&c->rtx_queue);
+		tcp_wmem_uncharge(c, skb);
+		skb_put(skb);
+	}
+	c->packets_out = c->retrans_out = c->sacked_out = c->lost_out = 0;
+	c->retransmit_skb_hint = NULL;
+	tcp_tsorted_reset(c);
+	tcp_rtx_idx_reset(c);
+	c->last_rx_tick = tcp_now();
+	tcp_done(c);
+}
+
+// ---------------------------------------------------------------------------
+// Memory accounting.
 //
-// RFC 7323 §5.4 / Appendix A: exposing the raw boot-relative tick counter
-// in TSval lets any peer read this host's uptime and assists off-path
-// blind-injection attacks that need to predict TSval. Mitigation is a
-// random offset added to every emitted TSval; PAWS, RTTM and Karn rely on
-// differences only, so the offset is invisible to the protocol.
+// Every skb on a TCP queue is charged by its truesize to its connection
+// (rmem_alloc for the receive and out-of-order queues, wmem_queued for the
+// write and retransmit queues) and to the global total.  The global total
+// has three thresholds: below TCP_MEM_LOW nothing is limited; above
+// TCP_MEM_PRESSURE the buffers stop growing, the receive windows are held
+// at what they are and out-of-order data is pruned first -- the pressure
+// state is entered there and left only below TCP_MEM_LOW (hysteresis);
+// above TCP_MEM_HIGH new data is refused, except what keeps every
+// connection going: in-order data onto an empty receive queue, and up to
+// TCP_RMEM_MIN of it on any connection (tcp_input.c).
 //
-// We use TWO offsets:
-//   - a per-boot fallback (used when no conn context is available, e.g.
-//     RST, SYN cookie SYN+ACK)
-//   - a per-connection offset derived deterministically from the 4-tuple
-//     via SipHash with the ISN secret. Per-conn offsets give each flow an
-//     independent TS clock origin (best practice; defends against TS-based
-//     uptime fingerprinting and cross-flow correlation), and the
-//     deterministic 4-tuple derivation keeps SYN-cookie reconstruction
-//     possible without storing extra state.
-static uint32_t tcp_ts_offset = 0;
-static int tcp_ts_offset_set = 0;
+// Out-of-order data parked by peers that never fill the hole could hold
+// the total above the hard limit for as long as their connections live
+// (idle ones do not prune themselves: nothing arrives for them).  Above
+// TCP_MEM_HIGH the reclaim therefore takes the out-of-order queues of
+// every connection, from the reap softirq, until the total is below
+// TCP_MEM_PRESSURE again.
+// ---------------------------------------------------------------------------
+static volatile int64_t g_tcp_mem;
+static volatile int g_tcp_mem_pressure;
+static volatile int g_tcp_reclaim_pending;
+static uint64_t g_tcp_reclaim_tick; // the last reclaim pass (reap softirq)
+static net_timer_t g_tcp_reclaim_timer; // a deferred pass
 
-static uint32_t tcp_ts_offset_global(void)
+static void tcp_mem_reclaim_timer_fn(net_timer_t *t)
 {
-	if (!tcp_ts_offset_set) {
-		tcp_ts_offset = random_u32();
-		tcp_ts_offset_set = 1;
+	(void)t;
+	softirq_raise(SOFTIRQ_TIMER);
+}
+
+void tcp_mem_charge(int64_t bytes)
+{
+	int64_t v = __atomic_add_fetch(&g_tcp_mem, bytes, __ATOMIC_RELAXED);
+
+	if (v > (int64_t)TCP_MEM_PRESSURE) {
+		if (!__atomic_exchange_n(&g_tcp_mem_pressure, 1,
+					 __ATOMIC_RELAXED))
+			TCPX_INC(TCPX_MEMORYPRESSURES);
+		if (bytes > 0 && v > (int64_t)TCP_MEM_HIGH)
+			tcp_mem_reclaim_kick();
+	} else if (v < (int64_t)TCP_MEM_LOW) {
+		if (__atomic_load_n(&g_tcp_mem_pressure, __ATOMIC_RELAXED))
+			__atomic_store_n(&g_tcp_mem_pressure, 0,
+					 __ATOMIC_RELAXED);
 	}
-	return tcp_ts_offset;
 }
 
-// SipHash-2-4(secret, 4-tuple) truncated to 32 bits.  Reuses the ISN secret
-// since both serve identical "unpredictable per 4-tuple, stable for the
-// lifetime of the boot" requirements.
-static uint32_t tcp_compute_ts_offset(uint32_t local_ip, uint32_t remote_ip,
-				      uint16_t local_port, uint16_t remote_port)
+/* Ask for a reclaim pass (any context, under any TCP lock). */
+void tcp_mem_reclaim_kick(void)
 {
-	uint8_t data[12];
-	data[0] = (uint8_t)(local_ip >> 24);
-	data[1] = (uint8_t)(local_ip >> 16);
-	data[2] = (uint8_t)(local_ip >> 8);
-	data[3] = (uint8_t)(local_ip);
-	data[4] = (uint8_t)(remote_ip >> 24);
-	data[5] = (uint8_t)(remote_ip >> 16);
-	data[6] = (uint8_t)(remote_ip >> 8);
-	data[7] = (uint8_t)(remote_ip);
-	data[8] = (uint8_t)(local_port >> 8);
-	data[9] = (uint8_t)(local_port);
-	data[10] = (uint8_t)(remote_port >> 8);
-	data[11] = (uint8_t)(remote_port);
-	// Mix in a constant tag so this hash is domain-separated from the ISN.
-	uint64_t h = siphash_2_4(tcp_isn_secret, data, 12);
-	return (uint32_t)(h ^ 0x54534F46U /* 'TSOF' */);
+	if (!__atomic_exchange_n(&g_tcp_reclaim_pending, 1, __ATOMIC_ACQ_REL))
+		softirq_raise(SOFTIRQ_TIMER);
 }
 
-/* The timestamp clock runs in MILLISECONDS -- derived from the tick count
- * and the calibrated tick length, so it costs no timer read per segment.
- *
- * It used to be the raw tick count, i.e. a ~100 Hz clock.  RFC 7323 allows
- * any rate between 1 ms and 1 s per unit, so that was correct; but the
- * reference stack's clock is a millisecond one, and a passive observer can
- * measure a peer's timestamp rate from two segments.  A 100 Hz clock under a
- * User-Agent claiming that system is another line in the fingerprint that
- * says "not what it claims to be" -- see tcp_build_options() for what that
- * costs on the sites that check.  The granularity stays one tick; only the
- * unit changed. */
-static uint32_t tcp_ts_clock_ms(void)
+static int tcp_mem_reclaim_one(tcp_conn_t *c, void *arg)
 {
-	return (uint32_t)((timer_ticks() * timer_us_per_tick()) / 1000ULL);
+	uint64_t f;
+
+	(void)arg;
+	tcp_lock_acquire(&c->lock, &f);
+	if (c->state != TCP_STATE_CLOSED && c->state != TCP_STATE_LISTEN)
+		tcp_ofo_reclaim(c);
+	tcp_lock_release(&c->lock, f);
+	/* Done once below the pressure mark: what is left is ordinary
+	 * use; the hysteresis keeps the pressure state on until LOW. */
+	return tcp_mem_allocated() < TCP_MEM_PRESSURE;
 }
 
-static uint32_t tcp_ts_now_for(const tcp_conn_t *conn)
+/* The reclaim pass: from the reap softirq (interrupts on, no lock held),
+ * at most once per TCP_MEM_RECLAIM_MS -- a peer that keeps pushing the
+ * total over the limit costs one table walk per interval. */
+void tcp_mem_reclaim(void)
 {
-	uint32_t off = (conn && conn->ts_offset) ? conn->ts_offset :
-						   tcp_ts_offset_global();
-	return tcp_ts_clock_ms() + off;
-}
+	uint64_t now = tcp_now();
 
-// Backwards-compatible global accessor for paths with no conn (RST, etc.).
-__attribute__((unused)) static uint32_t tcp_ts_now(void)
-{
-	return tcp_ts_clock_ms() + tcp_ts_offset_global();
-}
-
-// Build TCP option block. Caller passes flags actually being sent.
-//   - SYN (no ACK): always offer MSS, WSCALE, SACK_PERM, TS (TSecr=0)
-//   - SYN+ACK:      mirror what we negotiated in conn (mss + ws/sack/ts iff peer offered)
-//   - non-SYN:      TS (if ts_enabled) + SACK blocks for OOO (if sack_ok)
-// Returns option byte count (already padded with NOPs to multiple of 4).
-static uint8_t tcp_build_options(tcp_conn_t *conn, uint8_t flags,
-				 uint16_t mss_to_advertise, uint8_t *buf)
-{
-	uint8_t n = 0;
-	int is_syn = (flags & TCP_SYN) != 0;
-	int is_synack = is_syn && (flags & TCP_ACK);
-
-	/* The option block is laid out EXACTLY as the reference stack lays out
-	 * its own, byte for byte:
-	 *
-	 *   SYN / SYN+ACK:  MSS(4)  SACK-permitted(2)+timestamps(10)  NOP WS(3)
-	 *                   = 20 bytes, with SACK-permitted and timestamps
-	 *                   packed into one aligned run when both go, and
-	 *                   either one preceded by two NOPs when it goes alone;
-	 *   later segments: NOP NOP timestamps(10), then any SACK blocks.
-	 *
-	 * It used to be MSS, NOP NOP SACK, NOP WS, NOP NOP TS -- 24 bytes, every
-	 * option correct, in an order no operating system uses.  The order is
-	 * not protocol: it is a fingerprint.  Every large site's bot manager
-	 * classifies the client operating system from the SYN -- option
-	 * order, window, scale, TTL, DF -- and compares it with what the
-	 * User-Agent claims; a SYN matching no known system under a User-Agent
-	 * that says "X11; Linux" is the classic sign of a tool, and those sites
-	 * answer it not with an error but with a degraded page: a shop that
-	 * calls a valid e-mail address invalid, a search that finds nothing, a
-	 * login that is simply refused.  The same engine under the real
-	 * system's stack, on the same machine, gets the real page.
-	 *
-	 * On SYN+ACK an option is answered only if the peer offered it (RFC
-	 * 7323 forbids answering timestamps to a peer that sent none); the
-	 * SYN offers all three. */
-	int want_sack = is_syn && (!is_synack || (conn && conn->sack_ok));
-	int want_ws = is_syn && (!is_synack || (conn && conn->ws_enabled));
-	int want_ts = is_syn ? (!is_synack || (conn && conn->ts_enabled)) :
-				 (conn && conn->ts_enabled);
-
-	if (is_syn) {
-		buf[n++] = TCP_OPT_MSS;
-		buf[n++] = TCP_OPT_MSS_LEN;
-		buf[n++] = (uint8_t)(mss_to_advertise >> 8);
-		buf[n++] = (uint8_t)mss_to_advertise;
+	if (!__atomic_load_n(&g_tcp_reclaim_pending, __ATOMIC_ACQUIRE) ||
+	    irqs_disabled())
+		return;
+	if (g_tcp_reclaim_tick &&
+	    now - g_tcp_reclaim_tick < tcp_ms(TCP_MEM_RECLAIM_MS)) {
+		// the pass is still owed: when the interval is over
+		net_timer_mod(&g_tcp_reclaim_timer,
+			      g_tcp_reclaim_tick + tcp_ms(TCP_MEM_RECLAIM_MS));
+		return;
 	}
-	if (want_ts) {
-		if (want_sack) {
-			buf[n++] = TCP_OPT_SACK_PERM;
-			buf[n++] = TCP_OPT_SACK_PERM_LEN;
-		} else {
-			buf[n++] = TCP_OPT_NOP;
-			buf[n++] = TCP_OPT_NOP;
-		}
-		buf[n++] = TCP_OPT_TIMESTAMP;
-		buf[n++] = TCP_OPT_TIMESTAMP_LEN;
-		put_be32(buf + n, tcp_ts_now_for(conn));
-		n += 4;
-		uint32_t tsecr =
-			(conn && conn->ts_enabled) ? conn->ts_recent : 0;
-		put_be32(buf + n, tsecr);
-		n += 4;
-	} else if (want_sack) {
-		buf[n++] = TCP_OPT_NOP;
-		buf[n++] = TCP_OPT_NOP;
-		buf[n++] = TCP_OPT_SACK_PERM;
-		buf[n++] = TCP_OPT_SACK_PERM_LEN;
-	}
-	if (want_ws) {
-		buf[n++] = TCP_OPT_NOP;
-		buf[n++] = TCP_OPT_WSCALE;
-		buf[n++] = TCP_OPT_WSCALE_LEN;
-		/* rcv_wscale 7 (128x, 8 MB max window) by default -- also what
-		 * the reference stack sends on a default configuration. */
-		buf[n++] = (conn && conn->rcv_wscale) ? conn->rcv_wscale : 7;
-	}
-
-	// SACK blocks on non-SYN when we have OOO data
-	if (!is_syn && conn && conn->sack_ok && conn->ooo_count > 0) {
-		// Build coalesced blocks from ooo[] (already sorted by seq on insert)
-		uint32_t blocks_l[TCP_MAX_SACK_BLOCKS];
-		uint32_t blocks_r[TCP_MAX_SACK_BLOCKS];
-		uint8_t bn = 0;
-		for (uint8_t i2 = 0;
-		     i2 < conn->ooo_count && bn < TCP_MAX_SACK_BLOCKS; i2++) {
-			uint32_t l = conn->ooo[i2].seq;
-			uint32_t r = l + conn->ooo[i2].len;
-			if (bn > 0 && blocks_r[bn - 1] == l) {
-				blocks_r[bn - 1] = r;
-			} else {
-				blocks_l[bn] = l;
-				blocks_r[bn] = r;
-				bn++;
-			}
-		}
-		if (bn > 0 && n + 2 + bn * 8 + 2 <= TCP_MAX_OPTIONS) {
-			buf[n++] = TCP_OPT_NOP;
-			buf[n++] = TCP_OPT_NOP;
-			buf[n++] = TCP_OPT_SACK;
-			buf[n++] = (uint8_t)(2 + bn * 8);
-			for (uint8_t b = 0; b < bn; b++) {
-				put_be32(buf + n, blocks_l[b]);
-				n += 4;
-				put_be32(buf + n, blocks_r[b]);
-				n += 4;
-			}
-		}
-	}
-
-	// Pad to 4-byte boundary with NOPs
-	while (n & 3)
-		buf[n++] = TCP_OPT_NOP;
-	return n;
+	__atomic_store_n(&g_tcp_reclaim_pending, 0, __ATOMIC_RELEASE);
+	g_tcp_reclaim_tick = now ? now : 1;
+	if (!tcp_mem_over_limit())
+		return;
+	TCPX_INC(TCPX_MEMRECLAIMS);
+	tcp_ehash_for_each_ofo(tcp_mem_reclaim_one, NULL);
 }
 
-// Window-scaling helper: clamp our advertised receive window so it fits in 16
-// bits after the rcv_wscale shift.
-static uint16_t tcp_advertised_window(tcp_conn_t *conn)
+int tcp_under_memory_pressure(void)
 {
-	// A TIME_WAIT connection has had its receive buffer shed — it advertises
-	// a zero window (it will not receive data).
-	if (!conn->rx_buf || conn->rx_buf_size == 0)
+	return __atomic_load_n(&g_tcp_mem_pressure, __ATOMIC_RELAXED);
+}
+
+int tcp_mem_over_limit(void)
+{
+	return __atomic_load_n(&g_tcp_mem, __ATOMIC_RELAXED) >
+	       (int64_t)TCP_MEM_HIGH;
+}
+
+uint64_t tcp_mem_allocated(void)
+{
+	int64_t v = __atomic_load_n(&g_tcp_mem, __ATOMIC_RELAXED);
+
+	return v > 0 ? (uint64_t)v : 0;
+}
+
+void tcp_rmem_charge(tcp_conn_t *c, sk_buff_t *skb)
+{
+	c->rmem_alloc += skb->truesize;
+	tcp_mem_charge(skb->truesize);
+}
+
+void tcp_rmem_uncharge(tcp_conn_t *c, sk_buff_t *skb)
+{
+	WARN_ON_ONCE(c->rmem_alloc < skb->truesize);
+	c->rmem_alloc -= tcp_min32(c->rmem_alloc, skb->truesize);
+	tcp_mem_charge(-(int64_t)skb->truesize);
+}
+
+void tcp_wmem_charge(tcp_conn_t *c, sk_buff_t *skb)
+{
+	c->wmem_queued += skb->truesize;
+	tcp_mem_charge(skb->truesize);
+}
+
+void tcp_wmem_uncharge(tcp_conn_t *c, sk_buff_t *skb)
+{
+	WARN_ON_ONCE(c->wmem_queued < skb->truesize);
+	c->wmem_queued -= tcp_min32(c->wmem_queued, skb->truesize);
+	tcp_mem_charge(-(int64_t)skb->truesize);
+}
+
+/* Room to queue more data: the send buffer is not full, not much is
+ * waiting unsent beyond TCP_NOTSENT_LOWAT, and the global limit holds. */
+int tcp_stream_memory_free(const tcp_conn_t *c)
+{
+	if (c->wmem_queued >= (uint32_t)c->sndbuf)
 		return 0;
-	uint32_t avail =
-		ring_free(conn->rx_head, conn->rx_tail, conn->rx_buf_size);
-	if (avail == 0)
+	if (c->notsent_lowat && tcp_notsent_bytes(c) >= c->notsent_lowat)
 		return 0;
-	// Only apply the receive window scale when window scaling was actually
-	// negotiated — mirror the send side, which gates the snd_wscale shift on
-	// ws_enabled (see the ESTABLISHED inbound-window handling).  A conn that
-	// never negotiated WS keeps the default rcv_wscale=7 from tcp_conn_alloc;
-	// the stateless SYN-cookie path in particular leaves rcv_wscale=7 while
-	// ws_enabled=0.  Shifting by it would advertise a 128x-too-small window to
-	// a peer that reads the field unscaled, throttling that peer to ~1/128 of
-	// the real buffer (the receive-side sibling of the tcp_syn_window bug).
-	uint32_t shifted =
-		conn->ws_enabled ? (avail >> conn->rcv_wscale) : avail;
-	if (shifted > 0xFFFFu)
-		shifted = 0xFFFFu;
-	return (uint16_t)shifted;
-}
-
-// Window for SYN+ACK segments.  RFC 7323 §2.2: the window field in a segment
-// with the SYN bit set is NEVER scaled — the peer reads it raw (our own
-// SYN_SENT handler does exactly that: "SYN window unscaled").  Advertising
-// tcp_advertised_window() here shipped the >>rcv_wscale value (131071 >> 7 =
-// 1023), so every peer started its transfer against a 1023-byte send window
-// instead of 64 KB.  A 4 KB client burst then needed multiple ACK-clocked
-// round-trips right at connection start, and one lost/late ACK under stress
-// cascaded into RTO backoff and the intermittent teststress recv failures.
-// The stateless SYN-cookie path always advertised TCP_WINDOW_SIZE correctly.
-static uint16_t tcp_syn_window(tcp_conn_t *conn)
-{
-	uint32_t avail =
-		ring_free(conn->rx_head, conn->rx_tail, conn->rx_buf_size);
-	return avail > 0xFFFFu ? (uint16_t)0xFFFFu : (uint16_t)avail;
-}
-
-/* Adaptive TCP receive buffer auto-tuning.
- *
- * Throughput is BDP-limited: max_rate = rx_buf_size / RTT.  A fixed
- * 128 KB rx ring caps a 481 ms transcontinental flow at ~280 KB/s.
- * Grow on demand instead of pre-allocating big buffers for every
- * connection: only connections that actually fill their ring (peer is
- * sending faster than we drain) pay the larger memory cost.
- *
- * Doubles the ring size up to TCP_RX_BUF_MAX.  Caller must hold
- * conn->lock.  Returns 1 if the ring was grown, 0 otherwise.
- */
-static int tcp_grow_rx_buf(tcp_conn_t *conn)
-{
-	if (!conn || !conn->rx_buf)
+	if (tcp_mem_over_limit() && c->wmem_queued > (uint32_t)TCP_WMEM_MIN)
 		return 0;
-	if (conn->rx_buf_size >= TCP_RX_BUF_MAX)
-		return 0;
-
-	uint32_t new_size = conn->rx_buf_size * 2;
-	if (new_size > TCP_RX_BUF_MAX)
-		new_size = TCP_RX_BUF_MAX;
-
-	uint8_t *new_buf = (uint8_t *)slab_alloc(new_size);
-	if (!new_buf)
-		return 0; // OOM — keep current buffer
-
-	/* Linearize the ring contents from rx_head..rx_tail into the new
-     * buffer starting at offset 0.  Handles the wrap case as two memcpys. */
-	uint32_t used = (conn->rx_tail - conn->rx_head + conn->rx_buf_size) %
-			conn->rx_buf_size;
-	if (used > 0) {
-		if (conn->rx_head + used <= conn->rx_buf_size) {
-			mm_memcpy(new_buf, conn->rx_buf + conn->rx_head, used);
-		} else {
-			uint32_t first = conn->rx_buf_size - conn->rx_head;
-			mm_memcpy(new_buf, conn->rx_buf + conn->rx_head, first);
-			mm_memcpy(new_buf + first, conn->rx_buf, used - first);
-		}
-	}
-
-	uint8_t *old_buf = conn->rx_buf;
-	conn->rx_buf = new_buf;
-	conn->rx_buf_size = new_size;
-	conn->rx_head = 0;
-	conn->rx_tail = used;
-
-	slab_free(old_buf);
 	return 1;
 }
 
-static int tcp_send_segment_ex(net_device_t *dev, uint32_t src_ip,
-			       uint32_t dst_ip, uint16_t src_port,
-			       uint16_t dst_port, uint32_t seq, uint32_t ack,
-			       uint8_t flags, uint16_t window,
-			       const uint8_t *data, uint16_t data_len,
-			       const uint8_t *options, uint8_t options_len)
+/* Writable for poll(): a third of the send buffer free (what sockets
+ * everywhere promise a POLLOUT means), and under the not-sent mark. */
+static int tcp_stream_is_writeable(const tcp_conn_t *c)
 {
-	uint8_t padded_options = options_len;
-	if (padded_options & 3)
-		padded_options = (uint8_t)((padded_options + 3) & ~3U);
-	if (padded_options > TCP_MAX_OPTIONS)
-		return -1;
+	uint32_t q = c->wmem_queued;
 
-	uint16_t tcp_len =
-		(uint16_t)(sizeof(tcp_header_t) + padded_options + data_len);
-	uint8_t pkt[sizeof(tcp_header_t) + TCP_MAX_OPTIONS + TCP_MSS];
-	if (tcp_len > sizeof(pkt))
-		return -1;
-
-	tcp_header_t *tcp = (tcp_header_t *)pkt;
-	tcp->src_port = net_htons(src_port);
-	tcp->dst_port = net_htons(dst_port);
-	tcp->seq_num = net_htonl(seq);
-	tcp->ack_num = net_htonl(ack);
-	tcp->data_offset =
-		(uint8_t)(((sizeof(tcp_header_t) + padded_options) / 4) << 4);
-	tcp->flags = flags;
-	tcp->window = net_htons(window);
-	tcp->checksum = 0;
-	tcp->urgent_ptr = 0;
-
-	uint8_t *opt_dst = pkt + sizeof(tcp_header_t);
-	if (padded_options)
-		mm_memset(opt_dst, 0, padded_options);
-	if (options_len)
-		mm_memcpy(opt_dst, options, options_len);
-
-	if (data_len)
-		mm_memcpy(pkt + sizeof(tcp_header_t) + padded_options, data,
-			  data_len);
-
-	uint8_t pseudo[12 + sizeof(tcp_header_t) + TCP_MAX_OPTIONS + TCP_MSS];
-	pseudo[0] = (src_ip >> 24) & 0xFF;
-	pseudo[1] = (src_ip >> 16) & 0xFF;
-	pseudo[2] = (src_ip >> 8) & 0xFF;
-	pseudo[3] = src_ip & 0xFF;
-	pseudo[4] = (dst_ip >> 24) & 0xFF;
-	pseudo[5] = (dst_ip >> 16) & 0xFF;
-	pseudo[6] = (dst_ip >> 8) & 0xFF;
-	pseudo[7] = dst_ip & 0xFF;
-	pseudo[8] = 0;
-	pseudo[9] = IP_PROTO_TCP;
-	pseudo[10] = (tcp_len >> 8) & 0xFF;
-	pseudo[11] = tcp_len & 0xFF;
-	mm_memcpy(pseudo + 12, pkt, tcp_len);
-
-	tcp->checksum = ipv4_checksum(pseudo, (uint16_t)(12 + tcp_len));
-
-	NET_STATS_INC(NET_MIB_TCP_OUTSEGS);
-	if (flags & TCP_RST)
-		NET_STATS_INC(NET_MIB_TCP_OUTRSTS);
-	return ipv4_send(dev, dst_ip, IP_PROTO_TCP, pkt, tcp_len);
-}
-
-static int tcp_queue_inflight(tcp_conn_t *conn, uint32_t seq, uint8_t flags,
-			      const uint8_t *data, uint16_t len)
-{
-	if (conn->inflight_count >= TCP_MAX_INFLIGHT) {
-		conn->tx_ready = 0;
-		return -1;
-	}
-
-	tcp_inflight_segment_t *seg = &conn->inflight[conn->inflight_count++];
-	WARN_ON(conn->inflight_count > TCP_MAX_INFLIGHT);
-	seg->seq = seq;
-	seg->len = len;
-	seg->flags = flags;
-	seg->retransmit_count = 0;
-	seg->send_us = timer_get_precise_us();
-	for (uint16_t i = 0; i < len; i++)
-		seg->data[i] = data[i];
-	conn->tx_ready = conn->inflight_count < TCP_MAX_INFLIGHT;
-	return 0;
-}
-
-static void tcp_drop_first_inflight(tcp_conn_t *conn)
-{
-	WARN_ON(conn->inflight_count ==
-		0); /* dropping from empty inflight queue: ACK accounting is off */
-	if (conn->inflight_count == 0)
-		return;
-	for (uint8_t i = 1; i < conn->inflight_count; i++)
-		conn->inflight[i - 1] = conn->inflight[i];
-	conn->inflight_count--;
-	conn->tx_ready = 1;
-}
-
-static void tcp_ack_inflight(tcp_conn_t *conn, uint32_t ack)
-{
-	while (conn->inflight_count > 0) {
-		tcp_inflight_segment_t *seg = &conn->inflight[0];
-		uint32_t seg_end =
-			seg->seq + seg->len +
-			((seg->flags & (TCP_SYN | TCP_FIN)) ? 1U : 0U);
-
-		if (ack >= seg_end) {
-			tcp_drop_first_inflight(conn);
-			continue;
-		}
-
-		if (ack > seg->seq && seg->len > 0 &&
-		    !(seg->flags & (TCP_SYN | TCP_FIN))) {
-			uint16_t trim = (uint16_t)(ack - seg->seq);
-			if (trim > seg->len) {
-				WARN_ON_ONCE(
-					trim >
-					seg->len); /* trim larger than segment length: ACK acknowledged bytes we never sent */
-				trim = seg->len;
-			}
-			for (uint16_t i = trim; i < seg->len; i++)
-				seg->data[i - trim] = seg->data[i];
-			seg->seq = ack;
-			seg->len = (uint16_t)(seg->len - trim);
-		}
-		break;
-	}
-	conn->tx_ready = conn->inflight_count < TCP_MAX_INFLIGHT;
-}
-
-static int tcp_send_syn_packet(net_device_t *dev, uint32_t src_ip,
-			       uint32_t dst_ip, uint16_t src_port,
-			       uint16_t dst_port, uint32_t seq, uint32_t ack,
-			       uint8_t flags, uint16_t window, tcp_conn_t *conn)
-{
-	uint8_t options[TCP_MAX_OPTIONS];
-	// Pass conn so the SYN's TSval uses the per-connection ts_offset; otherwise
-	// tcp_build_options(NULL, ...) falls back to the global offset and the peer
-	// saves a ts_recent that does not match the offset our later data segments
-	// will use, causing every data segment to be PAWS-rejected (RFC 7323 §5.3).
-	uint8_t opt_len =
-		tcp_build_options(conn, flags, tcp_local_mss(dev), options);
-	return tcp_send_segment_ex(dev, src_ip, dst_ip, src_port, dst_port, seq,
-				   ack, flags, window, NULL, 0, options,
-				   opt_len);
-}
-
-// SYN+ACK from a known conn so we can mirror negotiated options.
-static int tcp_send_synack_conn(tcp_conn_t *conn, uint16_t window)
-{
-	uint8_t options[TCP_MAX_OPTIONS];
-	uint8_t opt_len = tcp_build_options(conn, TCP_SYN | TCP_ACK,
-					    tcp_local_mss(conn->dev), options);
-	return tcp_send_segment_ex(conn->dev, conn->local_ip, conn->remote_ip,
-				   conn->local_port, conn->remote_port,
-				   conn->iss, conn->rcv_nxt, TCP_SYN | TCP_ACK,
-				   window, NULL, 0, options, opt_len);
-}
-
-// Forward decl: drop the protocol self-reference exactly once when a
-// connection becomes terminally dead.
-static void tcp_conn_kill(tcp_conn_t *conn);
-
-// Fail a connection: record the error, wake any waiters, and drop the
-// protocol self-reference.  The owning socket's reference (if any) keeps the
-// connection alive so it can still read SO_ERROR; the connection is freed once
-// that reference is also dropped.  Called under conn->lock.
-static void tcp_fail_connection(tcp_conn_t *conn, int error)
-{
-	conn->error = error;
-	conn->connect_done = 1;
-	conn->rx_ready = 1;
-	conn->tx_ready = 1;
-	conn->inflight_count = 0;
-	conn->last_rx_tick = timer_ticks();
-	tcp_conn_kill(conn); // sets state=CLOSED + drops the protocol reference
-	tcp_poll_notify(conn);
-	/* Wake any sock_recv blocked on this conn's rx_ready channel.  Otherwise
-     * a connection that fails (RST, timeout) leaves the reader sleeping
-     * forever instead of returning the error. */
-	sched_wake_channel((void *)&conn->rx_ready);
-}
-
-// RFC 6528: ISN = hash(secret, src_ip, dst_ip, src_port, dst_port) + time_counter
-// Time counter advances ~64K per second
-static uint32_t tcp_generate_isn(uint32_t src_ip, uint32_t dst_ip,
-				 uint16_t src_port, uint16_t dst_port)
-{
-	uint8_t data[12];
-	data[0] = (uint8_t)(src_ip >> 24);
-	data[1] = (uint8_t)(src_ip >> 16);
-	data[2] = (uint8_t)(src_ip >> 8);
-	data[3] = (uint8_t)(src_ip);
-	data[4] = (uint8_t)(dst_ip >> 24);
-	data[5] = (uint8_t)(dst_ip >> 16);
-	data[6] = (uint8_t)(dst_ip >> 8);
-	data[7] = (uint8_t)(dst_ip);
-	data[8] = (uint8_t)(src_port >> 8);
-	data[9] = (uint8_t)(src_port);
-	data[10] = (uint8_t)(dst_port >> 8);
-	data[11] = (uint8_t)(dst_port);
-
-	uint64_t hash = siphash_2_4(tcp_isn_secret, data, 12);
-
-	/* Time component: advance ~64K per second, whatever the tick rate.  The
-	 * old form assumed 100Hz (ticks/4 << 8) and so ran at the wrong speed
-	 * wherever the calibrated rate differs. */
-	uint64_t hz = timer_get_frequency();
-	if (hz == 0)
-		hz = 100;
-	uint32_t time_comp = (uint32_t)(timer_ticks() * 65536ULL / hz);
-
-	return (uint32_t)hash + time_comp;
-}
-
-// ============================================================================
-// SYN Cookies - RFC 4987
-// ============================================================================
-// Encode MSS option as 3-bit index
-static const uint16_t syncookie_mss_table[8] = { 536,  1024, 1460, 1480,
-						 4312, 8960, 1440, 1452 };
-
-static int mss_to_index(uint16_t mss)
-{
-	int best = 0;
-	for (int i = 0; i < 8; i++) {
-		if (syncookie_mss_table[i] <= mss &&
-		    syncookie_mss_table[i] >= syncookie_mss_table[best])
-			best = i;
-	}
-	return best;
-}
-
-static uint32_t tcp_syncookie_generate(uint32_t src_ip, uint32_t dst_ip,
-				       uint16_t src_port, uint16_t dst_port,
-				       uint32_t seq, uint16_t mss)
-{
-	(void)seq;
-	uint8_t data[16];
-	uint32_t time_slot = (uint32_t)(timer_ticks() / 600); // ~6 second slots
-
-	data[0] = (uint8_t)(src_ip >> 24);
-	data[1] = (uint8_t)(src_ip >> 16);
-	data[2] = (uint8_t)(src_ip >> 8);
-	data[3] = (uint8_t)(src_ip);
-	data[4] = (uint8_t)(dst_ip >> 24);
-	data[5] = (uint8_t)(dst_ip >> 16);
-	data[6] = (uint8_t)(dst_ip >> 8);
-	data[7] = (uint8_t)(dst_ip);
-	data[8] = (uint8_t)(src_port >> 8);
-	data[9] = (uint8_t)(src_port);
-	data[10] = (uint8_t)(dst_port >> 8);
-	data[11] = (uint8_t)(dst_port);
-	data[12] = (uint8_t)(time_slot >> 24);
-	data[13] = (uint8_t)(time_slot >> 16);
-	data[14] = (uint8_t)(time_slot >> 8);
-	data[15] = (uint8_t)(time_slot);
-
-	uint64_t hash = siphash_2_4(tcp_syncookie_secret, data, 16);
-	int mss_idx = mss_to_index(mss);
-	// Cookie = hash[31:3] | mss_idx[2:0]
-	return ((uint32_t)(hash) & ~7U) | (uint32_t)mss_idx;
-}
-
-static int tcp_syncookie_validate(uint32_t src_ip, uint32_t dst_ip,
-				  uint16_t src_port, uint16_t dst_port,
-				  uint32_t cookie, uint16_t *mss_out)
-{
-	int mss_idx = cookie & 7;
-
-	// Try current and previous time slots
-	for (int delta = 0; delta <= 1; delta++) {
-		uint8_t data[16];
-		uint32_t time_slot =
-			(uint32_t)(timer_ticks() / 600) - (uint32_t)delta;
-
-		data[0] = (uint8_t)(src_ip >> 24);
-		data[1] = (uint8_t)(src_ip >> 16);
-		data[2] = (uint8_t)(src_ip >> 8);
-		data[3] = (uint8_t)(src_ip);
-		data[4] = (uint8_t)(dst_ip >> 24);
-		data[5] = (uint8_t)(dst_ip >> 16);
-		data[6] = (uint8_t)(dst_ip >> 8);
-		data[7] = (uint8_t)(dst_ip);
-		data[8] = (uint8_t)(src_port >> 8);
-		data[9] = (uint8_t)(src_port);
-		data[10] = (uint8_t)(dst_port >> 8);
-		data[11] = (uint8_t)(dst_port);
-		data[12] = (uint8_t)(time_slot >> 24);
-		data[13] = (uint8_t)(time_slot >> 16);
-		data[14] = (uint8_t)(time_slot >> 8);
-		data[15] = (uint8_t)(time_slot);
-
-		uint64_t hash = siphash_2_4(tcp_syncookie_secret, data, 16);
-		uint32_t expected =
-			((uint32_t)(hash) & ~7U) | (uint32_t)mss_idx;
-		if (expected == cookie) {
-			if (mss_out)
-				*mss_out = syncookie_mss_table[mss_idx];
-			return 1; // Valid
-		}
-	}
-	return 0; // Invalid
-}
-
-void tcp_init(void)
-{
-	g_tcp_conn_list = NULL;
-	for (int i = 0; i < TCP_EHASH_BUCKETS; i++)
-		g_tcp_ehash[i] = NULL;
-	g_tcp_conn_count = 0;
-	// Generate ISN and SYN cookie secrets from CSPRNG
-	random_get_bytes(tcp_isn_secret, sizeof(tcp_isn_secret), 0);
-	random_get_bytes(tcp_syncookie_secret, sizeof(tcp_syncookie_secret), 0);
-	// Bind the deferred-free drain to a softirq vector so the timer
-	// can hand work off to ksoftirqd from hard-IRQ context.
-	softirq_register(SOFTIRQ_TIMER, tcp_pending_softirq);
-	// The per-connection timer sweep runs in softirq context (raised once
-	// per tick by the lowest online CPU) rather than in the hard-IRQ timer
-	// handler on every CPU: softirq context has interrupts enabled, so the
-	// sweep may block on conn->lock and slab_free directly.
-	softirq_register(SOFTIRQ_TCP_TIMER, tcp_timer_tick);
-}
-
-// ============================================================================
-// RFC 6298 RTT / RTO update.  Called whenever new ACK acknowledges a segment
-// for which we have a clean send-time sample (Karn: skip retransmitted segs).
-// All times in microseconds.
-// ============================================================================
-#define TCP_RTO_MIN_US (200000U) // 200 ms
-#define TCP_RTO_MAX_US (60000000U) // 60 s
-#define TCP_RTO_INITIAL_US (1000000U) // 1 s (RFC 6298 section 2.1)
-
-static void tcp_update_rtt(tcp_conn_t *conn, uint32_t r_us)
-{
-	if (r_us == 0)
-		return;
-	if (conn->srtt_us == 0) {
-		// First measurement (RFC 6298 section 2.2)
-		conn->srtt_us = r_us;
-		conn->rttvar_us = r_us / 2;
-	} else {
-		// RTT_VAR := (1-beta)*RTT_VAR + beta*|SRTT-R|, beta=1/4
-		uint32_t diff = (conn->srtt_us > r_us) ?
-					(conn->srtt_us - r_us) :
-					(r_us - conn->srtt_us);
-		conn->rttvar_us = (conn->rttvar_us * 3 + diff) / 4;
-		// SRTT := (1-alpha)*SRTT + alpha*R, alpha=1/8
-		conn->srtt_us = (conn->srtt_us * 7 + r_us) / 8;
-	}
-	// RTO = SRTT + max(G, 4*RTTVAR); all of it in microseconds, so this is
-	// independent of the tick rate (the conversion happens in tcp_rto_ticks)
-	uint64_t rto = (uint64_t)conn->srtt_us + 4ULL * conn->rttvar_us;
-	if (rto < TCP_RTO_MIN_US)
-		rto = TCP_RTO_MIN_US;
-	if (rto > TCP_RTO_MAX_US)
-		rto = TCP_RTO_MAX_US;
-	conn->rto_us = (uint32_t)rto;
-	conn->rto_backoff = 0;
-}
-
-static uint64_t tcp_rto_ticks(tcp_conn_t *conn)
-{
-	uint32_t rto = conn->rto_us ? conn->rto_us : TCP_RTO_INITIAL_US;
-	if (conn->rto_backoff) {
-		uint32_t shift = conn->rto_backoff > 6 ? 6 : conn->rto_backoff;
-		if (rto > (TCP_RTO_MAX_US >> shift))
-			rto = TCP_RTO_MAX_US;
-		else
-			rto <<= shift;
-	}
-	/* us_per_tick = 1000000 / hz; ticks = rto / us_per_tick = rto * hz / 1000000 */
-	uint32_t hz = timer_get_frequency();
-	if (hz == 0)
-		hz = 100;
-	uint64_t ticks = (uint64_t)rto * hz / 1000000ULL;
-	if (ticks < 1)
-		ticks = 1;
-	return ticks;
-}
-
-// Caller MUST hold tcp_lock.  Buffers MUST be pre-allocated by the caller
-// OUTSIDE tcp_lock and passed in via rx_buf / tx_buf — this function never
-// invokes the slab allocator.  This is non-negotiable: slab_alloc /
-// slab_free can trigger a TLB shootdown IPI that spins waiting for ACK
-// from every CPU; if any other CPU is spinning on tcp_lock with IRQs off
-// at that moment, it cannot service the IPI and the system hangs with
-// "TLB shootdown sync timeout".
-//
-// Returns a slot with active=0 still set; the caller is responsible for
-// filling in the 4-tuple (local_ip / local_port / remote_ip / remote_port)
-// and any state-specific fields, then calling tcp_publish_conn() to
-// atomically publish active=1 with a release barrier.  This split is
-// required because tcp_rx / tcp_find_conn / tcp_find_listener /
-// tcp_timer_tick walk the connection table WITHOUT taking tcp_lock, gating
-// every access on conn->active alone — if active=1 were set before the
-// 4-tuple was rewritten, another CPU could match the OLD 4-tuple of a
-// recycled slot and dispatch a packet to the wrong (about-to-be-rewritten)
-// connection.
-//
-// Allocate the de-inlined per-connection inflight + ooo arrays.  Both are
-// slab-allocated by the caller OUTSIDE tcp_lock (same TLB-shootdown-safety
-// discipline as the rx/tx ring buffers).  Returns 0 with both pointers set on
-// success, or -1 with neither leaked on failure.
-static int tcp_alloc_seg_arrays(tcp_inflight_segment_t **inflight_out,
-				tcp_ooo_segment_t **ooo_out)
-{
-	tcp_inflight_segment_t *inflight = (tcp_inflight_segment_t *)slab_alloc(
-		sizeof(tcp_inflight_segment_t) * TCP_MAX_INFLIGHT);
-	tcp_ooo_segment_t *ooo = (tcp_ooo_segment_t *)slab_alloc(
-		sizeof(tcp_ooo_segment_t) * TCP_MAX_OOO);
-	if (!inflight || !ooo) {
-		if (inflight)
-			slab_free(inflight);
-		if (ooo)
-			slab_free(ooo);
-		return -1;
-	}
-	*inflight_out = inflight;
-	*ooo_out = ooo;
-	return 0;
-}
-
-static inline void tcp_free_seg_arrays(tcp_inflight_segment_t *inflight,
-				       tcp_ooo_segment_t *ooo)
-{
-	if (inflight)
-		slab_free(inflight);
-	if (ooo)
-		slab_free(ooo);
-}
-
-// On allocation failure (table full) returns NULL; caller must slab_free
-// the buffers it pre-allocated.
-//
-// rx_buf/tx_buf and the inflight/ooo arrays are all allocated by the caller
-// OUTSIDE tcp_lock (slab_alloc may fire a TLB-shootdown IPI, illegal while
-// holding tcp_lock IRQs-off) and adopted here.  The inflight/ooo arrays used
-// to be inlined in the connection block (~280 KB/conn); pointing at
-// caller-allocated arrays shrinks the block enough to allocate dynamically.
-static tcp_conn_t *tcp_conn_alloc(uint8_t *rx_buf, uint8_t *tx_buf,
-				  tcp_inflight_segment_t *inflight,
-				  tcp_ooo_segment_t *ooo)
-{
-	BUG_ON(rx_buf == NULL);
-	BUG_ON(tx_buf == NULL);
-	BUG_ON(inflight == NULL);
-	BUG_ON(ooo == NULL);
-
-	// There is no fixed connection cap: the number of live connections is
-	// bounded only by available memory (slab_alloc returns NULL on
-	// exhaustion) and, above this layer, by the number of open sockets.
-	tcp_conn_t *conn = (tcp_conn_t *)slab_alloc(sizeof(*conn));
-	if (!conn)
-		return NULL;
-	for (size_t b = 0; b < sizeof(*conn); b++)
-		((uint8_t *)conn)[b] = 0;
-	__atomic_fetch_add(&g_tcp_conn_count, 1, __ATOMIC_ACQ_REL);
-
-	conn->lock = (spinlock_t)SPINLOCK_INIT("tcp_conn");
-	conn->state = TCP_STATE_CLOSED;
-	conn->tx_ready = 1;
-	conn->peer_mss = TCP_MSS;
-	conn->max_seg_size = TCP_MSS;
-	conn->owner_socket = NULL;
-
-	// Reference counting: one protocol self-reference, held until the
-	// connection becomes terminally dead.
-	conn->refcount = 1;
-	conn->proto_ref = 1;
-	conn->on_reap_queue = 0;
-	conn->list_next = NULL;
-
-	// RFC 6298 initial RTO (no measurement yet)
-	conn->rto_us = TCP_RTO_INITIAL_US;
-
-	// RFC 5681 NewReno: cwnd starts at 10 segments (RFC 6928 IW10)
-	conn->cwnd = 10;
-	conn->ssthresh = 0xFFFFFFFFu;
-
-	/* Disable Nagle by default (see the Nagle-deadlock note in the design). */
-	conn->nodelay = 1;
-	conn->keepidle_ticks = (uint32_t)timer_s_to_ticks(7200); // 2 hours
-	conn->keepintvl_ticks = (uint32_t)timer_s_to_ticks(75); // 75 s
-	conn->keepcnt = 9;
-	conn->last_rx_tick = timer_ticks();
-
-	// RFC 7323 — we always offer window scale 7 (128x); cleared if the peer
-	// does not negotiate it.
-	conn->rcv_wscale = 7;
-
-	// Adopt pre-allocated RX/TX buffers + de-inlined segment arrays.
-	conn->rx_buf = rx_buf;
-	conn->tx_buf = tx_buf;
-	conn->inflight = inflight;
-	conn->ooo = ooo;
-	conn->rx_buf_size = TCP_RX_BUF_SIZE;
-	conn->tx_buf_size = TCP_TX_BUF_SIZE;
-
-	// Not yet linked/published — caller writes the 4-tuple then calls
-	// tcp_publish_conn() under tcp_lock.
-	return conn;
-}
-
-// Free a connection that was allocated but never published (a lost duplicate-
-// conn race, or a post-alloc failure).  It is not on the global list and has
-// no references beyond the birth reference, so free directly.
-static void tcp_conn_free_unpublished(tcp_conn_t *conn)
-{
-	if (!conn)
-		return;
-	if (conn->rx_buf)
-		slab_free(conn->rx_buf);
-	if (conn->tx_buf)
-		slab_free(conn->tx_buf);
-	if (conn->inflight)
-		slab_free(conn->inflight);
-	if (conn->ooo)
-		slab_free(conn->ooo);
-	slab_free(conn);
-	__atomic_fetch_sub(&g_tcp_conn_count, 1, __ATOMIC_ACQ_REL);
-}
-
-// Publish a freshly-allocated conn after the caller has written the 4-tuple:
-// link it into the global connection list and mark it active.  MUST be called
-// with tcp_lock held so the link + the 4-tuple are visible atomically to
-// lock-holding walkers.  The compiler barrier keeps the active=1 store from
-// being reordered before the 4-tuple/link stores.
-static inline void tcp_publish_conn(tcp_conn_t *conn)
-{
-	uint32_t b = tcp_ehash_key(conn->local_port, conn->remote_ip,
-				   conn->remote_port);
-
-	conn->list_next = g_tcp_conn_list;
-	g_tcp_conn_list = conn;
-	/* Into the demux hash as well, on the same lock and in the same
-	 * breath: a connection visible on one and not the other is a packet
-	 * delivered to nowhere (or a port handed out twice).  Listeners go
-	 * in too -- their key is degenerate (remote 0:0) but keeping the
-	 * insert unconditional means the unlink can be unconditional as
-	 * well, and the two can never disagree about membership. */
-	conn->hash_next = g_tcp_ehash[b];
-	g_tcp_ehash[b] = conn;
-	__asm__ volatile("" ::: "memory");
-	conn->active = 1;
-}
-
-// Physically free a connection whose refcount has reached 0: unlink it from
-// the global list and release all its memory.  Process/softirq context only
-// (slab_free may fire a TLB-shootdown IPI).  A 0-refcount connection is
-// stable — nothing can re-reference it — so no further validation is needed.
-static void tcp_conn_final_free(tcp_conn_t *conn)
-{
-	uint64_t flags;
-	spin_lock_irqsave(&tcp_lock, &flags);
-	tcp_conn_t **pp = &g_tcp_conn_list;
-	while (*pp) {
-		if (*pp == conn) {
-			*pp = conn->list_next;
-			break;
-		}
-		pp = &(*pp)->list_next;
-	}
-	/* ...and out of the demux hash.  The key is the 4-tuple, which has
-	 * not changed since the insert, so this finds the same bucket. */
-	uint32_t b = tcp_ehash_key(conn->local_port, conn->remote_ip,
-				   conn->remote_port);
-	tcp_conn_t **hp = &g_tcp_ehash[b];
-	while (*hp) {
-		if (*hp == conn) {
-			*hp = conn->hash_next;
-			break;
-		}
-		hp = &(*hp)->hash_next;
-	}
-	conn->hash_next = NULL;
-	conn->active = 0;
-	spin_unlock_irqrestore(&tcp_lock, flags);
-
-	if (conn->rx_buf)
-		slab_free(conn->rx_buf);
-	if (conn->tx_buf)
-		slab_free(conn->tx_buf);
-	if (conn->inflight)
-		slab_free(conn->inflight);
-	if (conn->ooo)
-		slab_free(conn->ooo);
-	slab_free(conn);
-	__atomic_fetch_sub(&g_tcp_conn_count, 1, __ATOMIC_ACQ_REL);
-}
-
-// Drive a connection to a terminally-dead state and drop its protocol self-
-// reference exactly once.  Safe to call under conn->lock: tcp_conn_put only
-// decrements the refcount and, on reaching 0, queues the physical free for
-// softirq context — it never blocks or slab_frees inline.  Idempotent.
-static void tcp_conn_kill(tcp_conn_t *conn)
-{
-	conn->state = TCP_STATE_CLOSED;
-	if (conn->proto_ref) {
-		conn->proto_ref = 0;
-		tcp_conn_put(conn);
-	}
-}
-
-// Recover capacity when the live-connection count is at its cap by killing
-// TIME_WAIT connections (they hold only their protocol reference, so killing
-// them drops them to 0 and frees them).  Returns the number killed.
-static int tcp_reap_time_wait_slots(void)
-{
-	int reaped = 0;
-	uint64_t flags;
-	spin_lock_irqsave(&tcp_lock, &flags);
-	for (tcp_conn_t *c = g_tcp_conn_list; c; c = c->list_next) {
-		if (c->active && c->state == TCP_STATE_TIME_WAIT &&
-		    c->proto_ref) {
-			c->proto_ref = 0;
-			c->state = TCP_STATE_CLOSED;
-			tcp_conn_put(c); // drop protocol ref → reaped when it hits 0
-			reaped++;
-		}
-	}
-	spin_unlock_irqrestore(&tcp_lock, flags);
-	return reaped;
-}
-
-// Clear the parent back-pointer of every child of a closing listener.  parent
-// is a weak reference (no refcount), so this is just a pointer clear.
-static void tcp_detach_listener_children(tcp_conn_t *listener)
-{
-	if (!listener)
-		return;
-	uint64_t flags;
-	spin_lock_irqsave(&tcp_lock, &flags);
-	for (tcp_conn_t *c = g_tcp_conn_list; c; c = c->list_next) {
-		if (c->active && c->parent == listener)
-			c->parent = NULL;
-	}
-	spin_unlock_irqrestore(&tcp_lock, flags);
-}
-
-// Find a connection by 4-tuple.  Caller MUST hold tcp_lock; the returned
-// pointer is only valid while tcp_lock is held (no reference is taken).  Used
-// for existence checks under the lock (e.g. the duplicate-connection guard).
-static tcp_conn_t *tcp_find_conn_locked(uint32_t local_ip, uint16_t local_port,
-					uint32_t remote_ip, uint16_t remote_port)
-{
-	/* One bucket of the demux hash, not the whole table -- see the note
-	 * above g_tcp_ehash.  The comparison below is unchanged: the hash
-	 * only narrows the candidates. */
-	uint32_t b = tcp_ehash_key(local_port, remote_ip, remote_port);
-
-	for (tcp_conn_t *c = g_tcp_ehash[b]; c; c = c->hash_next) {
-		// Skip LISTEN (separate lookup) and CLOSED (dead — a killed
-		// TIME_WAIT awaiting reap, or a peer-reset connection kept only
-		// for the owning socket's SO_ERROR; neither should demux a
-		// packet).
-		if (c->active && c->state != TCP_STATE_LISTEN &&
-		    c->state != TCP_STATE_CLOSED &&
-		    c->local_port == local_port &&
-		    c->remote_port == remote_port &&
-		    (c->local_ip == local_ip || c->local_ip == 0) &&
-		    c->remote_ip == remote_ip) {
-			return c;
-		}
-	}
-	return NULL;
-}
-
-// Find a connection by 4-tuple and take a reference on it, so the caller can
-// use it after dropping tcp_lock.  Caller MUST tcp_conn_put() the result.
-static tcp_conn_t *tcp_find_conn_hold(uint32_t local_ip, uint16_t local_port,
-				      uint32_t remote_ip, uint16_t remote_port)
-{
-	uint64_t flags;
-	spin_lock_irqsave(&tcp_lock, &flags);
-	tcp_conn_t *c = tcp_find_conn_locked(local_ip, local_port, remote_ip,
-					     remote_port);
-	if (c && !tcp_conn_tryhold(c))
-		c = NULL;
-	spin_unlock_irqrestore(&tcp_lock, flags);
-	return c;
-}
-
-// Find a listening connection on a port.  Caller MUST hold tcp_lock; the
-// returned pointer is valid only while tcp_lock is held (no reference taken).
-//
-// When only one listener exists for the port (common case) returns it
-// immediately.  When multiple listeners share the same port distributes
-// incoming SYNs across them by picking the one with the fewest pending
-// connections (accept-queue depth + SYN_RECEIVED children not yet enqueued),
-// so connections do not all pile up on one listener and starve the others.
-static tcp_conn_t *tcp_find_listener_locked(uint32_t local_ip,
-					    uint16_t local_port)
-{
-	// First pass: collect candidate counts.
-	tcp_conn_t *first_exact = NULL;
-	tcp_conn_t *first_wildcard = NULL;
-	int exact_count = 0;
-	int wildcard_count = 0;
-
-	for (tcp_conn_t *c = g_tcp_conn_list; c; c = c->list_next) {
-		if (!c->active || c->state != TCP_STATE_LISTEN ||
-		    c->local_port != local_port)
-			continue;
-		if (c->local_ip == local_ip) {
-			if (!first_exact)
-				first_exact = c;
-			exact_count++;
-		} else if (c->local_ip == 0) {
-			if (!first_wildcard)
-				first_wildcard = c;
-			wildcard_count++;
-		}
-	}
-
-	// Fast path: single listener.
-	if (exact_count == 1)
-		return first_exact;
-	if (exact_count == 0 && wildcard_count <= 1)
-		return first_wildcard;
-	if (exact_count == 0 && wildcard_count == 0)
-		return NULL;
-
-	// Multiple listeners on the same port.  Second pass: select the one
-	// with the smallest load (accept-queue depth + SYN_RECEIVED children
-	// in flight).
-	tcp_conn_t *best_exact = NULL;
-	tcp_conn_t *best_wildcard = NULL;
-	int best_exact_load = 0x7fffffff;
-	int best_wildcard_load = 0x7fffffff;
-
-	for (tcp_conn_t *c = g_tcp_conn_list; c; c = c->list_next) {
-		if (!c->active || c->state != TCP_STATE_LISTEN ||
-		    c->local_port != local_port)
-			continue;
-
-		int load = (int)((c->accept_tail - c->accept_head + 16u) % 16u);
-		for (tcp_conn_t *ch = g_tcp_conn_list; ch; ch = ch->list_next) {
-			if (ch->active &&
-			    ch->state == TCP_STATE_SYN_RECEIVED &&
-			    ch->parent == c)
-				load++;
-		}
-
-		if (c->local_ip == local_ip && load < best_exact_load) {
-			best_exact = c;
-			best_exact_load = load;
-		} else if (c->local_ip == 0 && load < best_wildcard_load) {
-			best_wildcard = c;
-			best_wildcard_load = load;
-		}
-	}
-
-	return best_exact ? best_exact : best_wildcard;
-}
-
-// Find a listener and take a reference on it, so the caller can use it after
-// dropping tcp_lock.  Caller MUST tcp_conn_put() the result.
-static tcp_conn_t *tcp_find_listener_hold(uint32_t local_ip,
-					  uint16_t local_port)
-{
-	uint64_t flags;
-	spin_lock_irqsave(&tcp_lock, &flags);
-	tcp_conn_t *c = tcp_find_listener_locked(local_ip, local_port);
-	if (c && !tcp_conn_tryhold(c))
-		c = NULL;
-	spin_unlock_irqrestore(&tcp_lock, flags);
-	return c;
-}
-
-// Does any listener exist for this local endpoint?  Does its own locking, so
-// it is safe to call while holding a conn->lock (lock order conn->lock →
-// tcp_lock is respected — nothing acquires them the other way round).
-static int tcp_listener_exists(uint32_t local_ip, uint16_t local_port)
-{
-	uint64_t flags;
-	spin_lock_irqsave(&tcp_lock, &flags);
-	int found = tcp_find_listener_locked(local_ip, local_port) != NULL;
-	spin_unlock_irqrestore(&tcp_lock, flags);
-	return found;
-}
-
-// Ring buffer helpers
-static uint32_t ring_used(uint32_t head, uint32_t tail, uint32_t size)
-{
-	WARN_ON(size == 0);
-	return (tail - head + size) % size;
-}
-
-static uint32_t ring_free(uint32_t head, uint32_t tail, uint32_t size)
-{
-	uint32_t used = ring_used(head, tail, size);
-	WARN_ON(used + 1 > size); /* ring used > size-1: head/tail corrupt */
-	return size - 1 - used;
-}
-
-/* Append `len` bytes to the receive ring at rx_tail, splitting the copy at
- * the wrap.  Stores at most the free space and returns the count stored;
- * the caller advances rcv_nxt by that much.  Caller holds conn->lock. */
-static uint32_t tcp_rx_ring_store(tcp_conn_t *conn, const uint8_t *src,
-				  uint32_t len)
-{
-	uint32_t avail =
-		ring_free(conn->rx_head, conn->rx_tail, conn->rx_buf_size);
-	if (len > avail)
-		len = avail;
-	if (len == 0)
+	if ((uint64_t)q * 3 > (uint64_t)c->sndbuf * 2)
 		return 0;
-	uint32_t first = conn->rx_buf_size - conn->rx_tail;
-	if (first > len)
-		first = len;
-	mm_memcpy(conn->rx_buf + conn->rx_tail, src, first);
-	if (len > first)
-		mm_memcpy(conn->rx_buf, src + first, len - first);
-	conn->rx_tail = (conn->rx_tail + len) % conn->rx_buf_size;
-	return len;
+	if (c->notsent_lowat && tcp_notsent_bytes(c) >= c->notsent_lowat)
+		return 0;
+	return 1;
 }
 
-// ============================================================================
-// Send TCP Segment
-// ============================================================================
-int tcp_send_segment(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
-		     uint16_t src_port, uint16_t dst_port, uint32_t seq,
-		     uint32_t ack, uint8_t flags, uint16_t window,
-		     const uint8_t *data, uint16_t data_len)
+/* The send queue shrank (an ACK, a reset) or the buffer grew: tell a
+ * writer parked on POLLOUT.  Caller holds conn->lock. */
+void tcp_update_tx_ready(tcp_conn_t *c)
 {
-	return tcp_send_segment_ex(dev, src_ip, dst_ip, src_port, dst_port, seq,
-				   ack, flags, window, data, data_len, NULL, 0);
-}
+	int st = c->state;
 
-static void tcp_send_ack(tcp_conn_t *conn)
-{
-	BUG_ON(conn == NULL);
-	BUG_ON(conn->dev == NULL);
-	uint8_t opts[TCP_MAX_OPTIONS];
-	uint8_t olen = tcp_build_options(conn, TCP_ACK, 0, opts);
-	uint16_t win = tcp_advertised_window(conn);
-	tcp_send_segment_ex(conn->dev, conn->local_ip, conn->remote_ip,
-			    conn->local_port, conn->remote_port, conn->snd_nxt,
-			    conn->rcv_nxt, TCP_ACK, win, NULL, 0, opts, olen);
-	conn->delayed_ack_pending = 0;
-	conn->segs_since_ack = 0;
-	/* Remember what we advertised so sock_recv's RFC 813 silly-window
-     * threshold is based on the most recent advertisement, not stale. */
-	conn->rcv_adv_last_bytes = (uint32_t)((
-		conn->rx_buf_size -
-		((conn->rx_tail - conn->rx_head + conn->rx_buf_size) %
-		 conn->rx_buf_size)));
-}
-
-/* tcp_queue_ack_locked() — used by tcp_rx to *defer* an ACK transmit.
- *
- * tcp_rx runs the entire RX state machine under conn->lock.  Calling
- * tcp_send_ack() inline transmits the ACK synchronously: build packet,
- * checksum, ipv4_send, eth_send, NIC tx_lock + MMIO doorbell — all with
- * conn->lock held.  Meanwhile sock_recv waits on conn->lock to drain
- * the rx ring.  At ~250 ACKs/sec and ~10-20 µs per ACK TX, this adds a
- * few ms/sec of lock-held time on the RX softirq, which feeds back
- * directly into how quickly the application can read data and how
- * quickly we can ACK the next segment.
- *
- * This function just updates the conn state.  The caller (tcp_rx) sets
- * a local ack_pending flag and, AFTER releasing conn->lock, snapshots
- * the ACK params and calls tcp_send_segment_ex directly.  Multiple
- * tcp_queue_ack_locked() calls during one tcp_rx collapse into a
- * single trailing ACK (cumulative — peer cares only about the latest
- * rcv_nxt). */
-static void tcp_queue_ack_locked(tcp_conn_t *conn)
-{
-	BUG_ON(conn == NULL);
-	BUG_ON(conn->dev == NULL);
-	conn->delayed_ack_pending = 0;
-	conn->segs_since_ack = 0;
-	// rx_buf_size is 0 for a TIME_WAIT connection whose buffers were shed
-	// (it re-ACKs a retransmitted FIN with a zero window).
-	conn->rcv_adv_last_bytes =
-		conn->rx_buf_size ?
-			(uint32_t)((conn->rx_buf_size -
-				    ((conn->rx_tail - conn->rx_head +
-				      conn->rx_buf_size) %
-				     conn->rx_buf_size))) :
-			0;
-}
-
-// ============================================================================
-// tcp_send_window_update - Proactively advertise a newly opened receive window.
-//
-// Called from sock_recv after the application drains data from the RX ring.
-// Without this, a zero-window pause never self-recovers: when the receiver's
-// buffer fills, it advertises window=0 and the sender stops.  The sender
-// then has no in-flight segments, so the RTO retransmit path in
-// tcp_timer_tick never fires a window probe.  Both sides block on
-// sched_yield_in_kernel() indefinitely.
-//
-// Sending one ACK carrying the current (now larger) window breaks the stall
-// immediately and lets the sender resume.
-// ============================================================================
-void tcp_send_window_update(tcp_conn_t *conn)
-{
-	if (!conn)
+	if (st != TCP_STATE_ESTABLISHED && st != TCP_STATE_CLOSE_WAIT) {
+		if (!c->tx_ready) {
+			c->tx_ready = 1;
+			tcp_poll_notify_key(c, POLLOUT | POLLWRNORM);
+		}
 		return;
-	uint64_t flags;
-	tcp_lock_acquire(&conn->lock, &flags);
-	if (conn->state == TCP_STATE_ESTABLISHED ||
-	    conn->state == TCP_STATE_CLOSE_WAIT) {
-		tcp_send_ack(conn);
 	}
-	tcp_lock_release(&conn->lock, flags);
-}
-
-static void tcp_send_rst(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
-			 uint16_t src_port, uint16_t dst_port, uint32_t seq,
-			 uint32_t ack)
-{
-	tcp_send_segment(dev, src_ip, dst_ip, src_port, dst_port, seq, ack,
-			 TCP_RST | TCP_ACK, 0, NULL, 0);
-}
-
-/* Consume an in-order data payload arriving in FIN_WAIT_1 / FIN_WAIT_2.
- * Half-close (RFC 793 §3.5): our FIN closed only OUR direction — the peer
- * may legitimately still deliver data, typically a TLS close_notify sent
- * in response to ours.  Ignoring it would leave rcv_nxt behind the peer's
- * FIN, which the in-order FIN rule then (correctly) keeps refusing — the
- * shutdown never completes cleanly.  Store what fits so a shutdown(SHUT_WR)
- * reader can still recv() it; bytes beyond the ring stay unACKed for
- * retransmission.  Caller holds conn->lock and guarantees seq == rcv_nxt. */
-static void tcp_consume_data_half_closed(tcp_conn_t *conn,
-					 const uint8_t *payload,
-					 uint16_t payload_len)
-{
-	if (!conn->rx_buf)
-		return;
-	uint32_t avail =
-		ring_free(conn->rx_head, conn->rx_tail, conn->rx_buf_size);
-	uint32_t copy = payload_len > avail ? avail : payload_len;
-	if (copy > 0) {
-		uint32_t first = conn->rx_buf_size - conn->rx_tail;
-		if (first > copy)
-			first = copy;
-		mm_memcpy(conn->rx_buf + conn->rx_tail, payload, first);
-		if (copy > first)
-			mm_memcpy(conn->rx_buf, payload + first, copy - first);
-		conn->rx_tail = (conn->rx_tail + copy) % conn->rx_buf_size;
-		conn->rcv_nxt += copy;
-		conn->rx_ready = 1;
-		tcp_poll_notify(conn);
-		sched_wake_channel((void *)&conn->rx_ready);
+	if (!c->tx_ready && tcp_stream_is_writeable(c)) {
+		c->tx_ready = 1;
+		tcp_poll_notify_key(c, POLLOUT | POLLWRNORM);
 	}
 }
 
-// ============================================================================
-// TCP Connect (active open)
-// ============================================================================
+static uint32_t tcp_truesize_for(uint32_t payload)
+{
+	/* What skb_alloc charges for a buffer of this payload: one slot of
+	 * the class it falls in (skb.h). */
+	uint32_t slot = payload + TCP_MAX_HEADER <= SKB_SMALL_DATA ?
+				SKB_SMALL_DATA :
+				SKB_JUMBO_DATA;
+
+	return slot + (uint32_t)sizeof(skb_slot_t);
+}
+
+/* The send buffer follows the congestion window: room for two windows of
+ * full-sized segments (one in flight, one being filled), unless the
+ * application set SO_SNDBUF. */
+void tcp_sndbuf_expand(tcp_conn_t *c)
+{
+	uint32_t per_mss, nr_segs;
+	uint64_t sndmem;
+
+	if (c->userlocks & TCP_SNDBUF_LOCK)
+		return;
+	per_mss = tcp_truesize_for(tcp_max32(c->mss_clamp, c->mss_cache));
+	nr_segs = tcp_max32(TCP_INIT_CWND, c->cwnd);
+	nr_segs = tcp_max32(nr_segs, TCP_REORDERING + 1);
+	sndmem = 2ULL * nr_segs * per_mss;
+	if (sndmem > TCP_WMEM_MAX)
+		sndmem = TCP_WMEM_MAX;
+	if ((uint64_t)c->sndbuf < sndmem) {
+		c->sndbuf = (int)sndmem;
+		TCPX_INC(TCPX_SNDBUFGROW);
+	}
+}
+
+uint32_t tcp_win_from_space(const tcp_conn_t *c, int space)
+{
+	if (space <= 0)
+		return 0;
+	return (uint32_t)(((uint64_t)space * c->scaling_ratio) >> 8);
+}
+
+int tcp_space_from_win(const tcp_conn_t *c, uint32_t win)
+{
+	uint64_t v = ((uint64_t)win << 8) / (c->scaling_ratio ? c->scaling_ratio :
+								 1);
+
+	return v > 0x7FFFFFFF ? 0x7FFFFFFF : (int)v;
+}
+
+int tcp_space(const tcp_conn_t *c)
+{
+	int free = c->rcvbuf - (int)c->rmem_alloc;
+
+	return (int)tcp_win_from_space(c, free);
+}
+
+int tcp_full_space(const tcp_conn_t *c)
+{
+	return (int)tcp_win_from_space(c, c->rcvbuf);
+}
+
+/* The handshake completed: size the buffers for the connection (window
+ * clamp, the first auto-tuning measurement, the send buffer).  Caller
+ * holds conn->lock. */
+void tcp_init_buffer_space(tcp_conn_t *c)
+{
+	uint32_t maxwin;
+
+	tcp_sndbuf_expand(c);
+	c->rcvq_space.space = tcp_min32(tcp_min32(c->rcv_ssthresh, c->rcv_wnd),
+					TCP_INIT_CWND * (uint32_t)c->advmss);
+	c->rcvq_space.time_us = tcp_now_us();
+	c->rcvq_space.seq = c->copied_seq;
+	maxwin = (uint32_t)tcp_full_space(c);
+	if (c->window_clamp >= maxwin)
+		c->window_clamp = maxwin;
+	/* Keep one segment of the buffer in reserve. */
+	if (c->window_clamp > 2u * c->advmss &&
+	    c->window_clamp + c->advmss > maxwin)
+		c->window_clamp = tcp_max32(2u * c->advmss, maxwin - c->advmss);
+	c->rcv_ssthresh = tcp_min32(c->rcv_ssthresh, c->window_clamp);
+}
+
+// ---------------------------------------------------------------------------
+// Active open.
+// ---------------------------------------------------------------------------
+/* The initial receive window and window scale (the SYN offers them).
+ * The window is the free space rounded down to whole segments and to the
+ * 16-bit field; the scale is chosen from the largest buffer the
+ * connection may ever grow to -- tcp_rmem's maximum, or the size the
+ * application fixed with SO_RCVBUF. */
+void tcp_select_initial_window(uint32_t space, uint32_t mss, uint32_t clamp,
+			       int rcvbuf_locked, uint32_t *rcv_wnd,
+			       uint32_t *window_clamp, uint8_t *rcv_wscale)
+{
+	uint32_t wspace;
+	int wscale = 0;
+
+	if (!clamp)
+		clamp = 65535u << TCP_MAX_WSCALE;
+	space = tcp_min32(clamp, space);
+	if (mss && space > mss)
+		space = (space / mss) * mss;
+	*rcv_wnd = tcp_min32(space, 65535u);
+	wspace = rcvbuf_locked ? space : tcp_max32(space, TCP_RMEM_MAX);
+	wspace = tcp_min32(wspace, clamp);
+	/* The scale that is just enough: the smallest with
+	 * 65535 << scale >= space, which for the default tcp_rmem maximum is
+	 * 7 -- what the common stack offers. */
+	while (wscale < TCP_MAX_WSCALE && (65535u << wscale) < wspace)
+		wscale++;
+	*rcv_wscale = (uint8_t)wscale;
+	*window_clamp = tcp_min32(65535u << wscale, clamp);
+}
+
+static void tcp_select_initial_window_conn(tcp_conn_t *c, uint32_t space,
+					   uint32_t mss)
+{
+	tcp_select_initial_window(space, mss, c->window_clamp,
+				  c->userlocks & TCP_RCVBUF_LOCK, &c->rcv_wnd,
+				  &c->window_clamp, &c->rcv_wscale);
+	c->rcv_ssthresh = c->rcv_wnd;
+}
+
+/* Route, MSS and window of a connection about to send its SYN (active)
+ * or SYN-ACK (passive child).  `pmtu' is the path MTU. */
+static void tcp_connect_init(tcp_conn_t *c, uint32_t pmtu)
+{
+	uint32_t mss;
+
+	if (c->userlocks & TCP_RCVBUF_LOCK) {
+		uint32_t full = (uint32_t)tcp_full_space(c);
+
+		if (!c->window_clamp || c->window_clamp > full)
+			c->window_clamp = full;
+	}
+	c->tcp_header_len = sizeof(tcp_header_t) + 12; // with timestamps
+	mss = pmtu > 40 + TCP_MIN_MSS ? pmtu - 40 : TCP_MIN_MSS;
+	if (mss > 65535u - 40u)
+		mss = 65535u - 40u;
+	if (c->user_mss && c->user_mss < mss)
+		mss = c->user_mss;
+	c->advmss = (uint16_t)mss;
+	c->mss_clamp = c->user_mss ? c->user_mss : (uint16_t)mss;
+	c->pmtu_cookie = pmtu;
+	tcp_sync_mss(c, pmtu);
+	tcp_select_initial_window_conn(c, (uint32_t)tcp_full_space(c), c->advmss);
+	c->rcv_nxt = 0;
+	c->rcv_wup = 0;
+	c->copied_seq = 0;
+}
+
+/* Path MTU toward `daddr' (and the route into the connection's cache). */
+static uint32_t tcp_route_mtu(tcp_conn_t *c, uint32_t daddr, uint32_t saddr,
+			      net_device_t *dev)
+{
+	struct ip_route rt;
+	uint32_t mtu;
+
+	if (ip_route_out(daddr, saddr, NULL, &rt) == 0) {
+		mtu = rt.loopback ? rt.mtu : ip_route_mtu(&rt, IP_PMTUDISC_WANT);
+		if (rt.dst)
+			dst_cache_set(&c->dst_cache, rt.dst, daddr);
+		if (!c->dev)
+			c->dev = rt.dev;
+		ip_route_put(&rt);
+	} else {
+		mtu = dev && dev->mtu ? dev->mtu : NET_MTU_DEFAULT;
+	}
+	if (mtu < 68)
+		mtu = 68;
+	return mtu;
+}
+
 tcp_conn_t *tcp_connect(net_device_t *dev, uint32_t local_ip, uint32_t dst_ip,
 			uint16_t src_port, uint16_t dst_port)
 {
-	uint64_t flags;
-
-	// Drain any TIME_WAIT slots deferred by tcp_timer_tick — process
-	// context, slab_free is safe here.
-	tcp_reap_pending();
-
-	// Pre-allocate the new conn's RX/TX buffers BEFORE taking tcp_lock —
-	// slab_alloc may trigger a TLB shootdown IPI, which would deadlock if
-	// any other CPU were spinning on tcp_lock with IRQs off.
-	uint8_t *new_rx = (uint8_t *)slab_alloc(TCP_RX_BUF_SIZE);
-	uint8_t *new_tx = (uint8_t *)slab_alloc(TCP_TX_BUF_SIZE);
-	tcp_inflight_segment_t *new_if = NULL;
-	tcp_ooo_segment_t *new_ooo = NULL;
-	if (!new_rx || !new_tx ||
-	    tcp_alloc_seg_arrays(&new_if, &new_ooo) != 0) {
-		WARN_RATELIMIT(
-			1, "tcp_connect: conn buffer alloc failed (rx=%d tx=%d)",
-			new_rx != NULL, new_tx != NULL);
-		if (new_rx)
-			slab_free(new_rx);
-		if (new_tx)
-			slab_free(new_tx);
-		return NULL;
-	}
-
-	// Allocate the connection object OUTSIDE tcp_lock (slab_alloc may fire a
-	// TLB-shootdown IPI).  On success it adopts the buffers above.
-	tcp_conn_t *conn = tcp_conn_alloc(new_rx, new_tx, new_if, new_ooo);
-	if (!conn) {
-		// At the live-connection cap.  Reap TIME_WAIT connections to
-		// recover capacity (RFC 6191), drain the reap queue, and retry.
-		tcp_reap_time_wait_slots();
-		tcp_reap_pending();
-		conn = tcp_conn_alloc(new_rx, new_tx, new_if, new_ooo);
-	}
-	if (!conn) {
-		NET_STATS_INC(NET_MIB_TCP_CONNTABLEFULL);
-		slab_free(new_rx);
-		slab_free(new_tx);
-		tcp_free_seg_arrays(new_if, new_ooo);
-		return NULL;
-	}
-
-	conn->dev = dev;
-	conn->local_ip = local_ip;
-	conn->remote_ip = dst_ip;
-	conn->local_port = src_port;
-	conn->remote_port = dst_port;
-	conn->ts_offset =
-		tcp_compute_ts_offset(local_ip, dst_ip, src_port, dst_port);
-	conn->iss = tcp_generate_isn(local_ip, dst_ip, src_port, dst_port);
-	conn->snd_una = conn->iss;
-	conn->snd_nxt = conn->iss + 1;
-	conn->snd_wnd = TCP_WINDOW_SIZE;
-	conn->rcv_wnd = TCP_WINDOW_SIZE;
-	conn->peer_mss = TCP_MSS;
-	conn->max_seg_size = tcp_local_mss(dev);
-	conn->state = TCP_STATE_SYN_SENT;
-	conn->retransmit_tick = timer_ticks() + TCP_SYN_RETRANSMIT_TICKS;
-	conn->retransmit_count = 0;
-	conn->handshake_deadline = timer_ticks() + TCP_HANDSHAKE_TIMEOUT_TICKS;
-	NET_STATS_INC(NET_MIB_TCP_ACTIVEOPENS);
-
-	// Take the reference the caller (sock_connect) will own as s->tcp.  The
-	// connection is returned with refcount 2: the protocol self-reference
-	// plus this socket reference.
-	tcp_conn_hold(conn);
-
-	spin_lock_irqsave(&tcp_lock, &flags);
-	// RFC 6191: a fresh connection may reuse a TIME_WAIT 4-tuple.  Kill any
-	// TIME_WAIT connection with the same 4-tuple (mark it CLOSED so it is no
-	// longer found) before publishing this one, so demux resolves this
-	// 4-tuple to the new connection.
-	for (tcp_conn_t *c = g_tcp_ehash[tcp_ehash_key(src_port, dst_ip,
-						       dst_port)];
-	     c; c = c->hash_next) {
-		if (c->active && c->state == TCP_STATE_TIME_WAIT &&
-		    c->proto_ref && c->local_port == src_port &&
-		    c->remote_port == dst_port && c->local_ip == local_ip &&
-		    c->remote_ip == dst_ip) {
-			c->proto_ref = 0;
-			c->state = TCP_STATE_CLOSED;
-			tcp_conn_put(c);
-		}
-	}
-	tcp_publish_conn(conn);
-	spin_unlock_irqrestore(&tcp_lock, flags);
-
-	// Send SYN.  A local drop (skb pool empty under a burst) is not
-	// network loss: retry on the short local-drop interval rather than
-	// waiting out a full SYN retransmit period, as the timer already
-	// does for its own resends.
-	if (tcp_send_syn_packet(dev, local_ip, dst_ip, src_port, dst_port,
-				conn->iss, 0, TCP_SYN, TCP_SYN_WINDOW,
-				conn) < 0) {
-		uint64_t cflags;
-		tcp_lock_acquire(&conn->lock, &cflags);
-		if (conn->state == TCP_STATE_SYN_SENT)
-			conn->retransmit_tick =
-				timer_ticks() + TCP_LOCAL_DROP_RETRY_TICKS;
-		tcp_lock_release(&conn->lock, cflags);
-	}
-
-	return conn;
+	return tcp_connect_opts(dev, local_ip, dst_ip, src_port, dst_port,
+				NULL);
 }
 
-// ============================================================================
-// TCP Listen (passive open)
-// ============================================================================
+tcp_conn_t *tcp_connect_opts(net_device_t *dev, uint32_t local_ip,
+			     uint32_t dst_ip, uint16_t src_port,
+			     uint16_t dst_port, const struct tcp_conn_params *p)
+{
+	uint64_t f;
+	tcp_conn_t *c;
+	uint32_t pmtu;
+	int rc;
+
+	might_sleep();
+	tcp_reap_pending();
+	c = tcp_conn_alloc();
+	if (!c) {
+		NET_STATS_INC(NET_MIB_TCP_CONNTABLEFULL);
+		return NULL;
+	}
+	if (p) {
+		/* What the socket set before connect(): the SYN's window
+		 * scale and MSS depend on it. */
+		c->userlocks = p->userlocks;
+		if ((p->userlocks & TCP_SNDBUF_LOCK) && p->sndbuf > 0)
+			c->sndbuf = p->sndbuf > TCP_WMEM_MIN ? p->sndbuf :
+							       TCP_WMEM_MIN;
+		if ((p->userlocks & TCP_RCVBUF_LOCK) && p->rcvbuf > 0)
+			c->rcvbuf = p->rcvbuf > TCP_RMEM_MIN ? p->rcvbuf :
+							       TCP_RMEM_MIN;
+		c->user_mss = p->user_mss;
+		c->syn_retries = p->syn_retries;
+		c->window_clamp = p->window_clamp;
+	}
+	c->dev = dev;
+	c->local_ip = local_ip;
+	c->remote_ip = dst_ip;
+	c->local_port = src_port;
+	c->remote_port = dst_port;
+	c->active_open = 1;
+	c->owner_socket = c; // the tcp layer's until the socket attaches
+	c->ts_offset = tcp_ts_offset_for(local_ip, dst_ip, src_port, dst_port);
+	pmtu = tcp_route_mtu(c, dst_ip, local_ip, dev);
+	tcp_connect_init(c, pmtu);
+
+	c->iss = tcp_isn(local_ip, dst_ip, src_port, dst_port);
+	c->snd_una = c->iss;
+	c->snd_nxt = c->iss;
+	c->write_seq = c->iss;
+	c->pushed_seq = c->iss;
+	c->snd_wnd = 0;
+	c->state = TCP_STATE_SYN_SENT;
+
+	// The caller (sock_connect) owns this reference as s->tcp.
+	tcp_conn_hold(c);
+
+	/* Into the tables: the 4-tuple must be free, or held by a TIME_WAIT
+	 * sock that may be reused (tcp_hash_connect decides). */
+	rc = tcp_hash_connect(c, p && p->user_port);
+	if (rc < 0) {
+		/* The 4-tuple is taken (by a connection, or a TIME_WAIT sock
+		 * that may not be reused): the address is not available. */
+		if (p && p->err)
+			*p->err = -EADDRNOTAVAIL;
+		c->state = TCP_STATE_CLOSED;
+		c->proto_ref = 0;
+		tcp_conn_put(c); // protocol reference
+		tcp_conn_put(c); // the caller's
+		return NULL;
+	}
+	NET_STATS_INC(NET_MIB_TCP_ACTIVEOPENS);
+
+	tcp_lock_acquire(&c->lock, &f);
+	tcp_send_syn(c);
+	tcp_lock_release(&c->lock, f);
+	return c;
+}
+
+// ---------------------------------------------------------------------------
+// Passive open.
+// ---------------------------------------------------------------------------
 tcp_conn_t *tcp_listen(net_device_t *dev, uint32_t local_ip,
 		       uint16_t local_port, int backlog)
 {
-	uint64_t flags;
+	tcp_conn_t *c;
 
-	// Drain deferred-free queue (process context — safe to slab_free).
+	might_sleep();
 	tcp_reap_pending();
-
-	// Pre-allocate buffers BEFORE taking tcp_lock — slab_alloc may trigger
-	// a TLB shootdown IPI that would deadlock against tcp_lock holders.
-	uint8_t *new_rx = (uint8_t *)slab_alloc(TCP_RX_BUF_SIZE);
-	uint8_t *new_tx = (uint8_t *)slab_alloc(TCP_TX_BUF_SIZE);
-	tcp_inflight_segment_t *new_if = NULL;
-	tcp_ooo_segment_t *new_ooo = NULL;
-	if (!new_rx || !new_tx ||
-	    tcp_alloc_seg_arrays(&new_if, &new_ooo) != 0) {
-		WARN_RATELIMIT(
-			1, "tcp_listen: conn buffer alloc failed (rx=%d tx=%d)",
-			new_rx != NULL, new_tx != NULL);
-		if (new_rx)
-			slab_free(new_rx);
-		if (new_tx)
-			slab_free(new_tx);
-		return NULL;
-	}
-
-	// Allocate the connection object OUTSIDE tcp_lock (slab_alloc safety).
-	tcp_conn_t *conn = tcp_conn_alloc(new_rx, new_tx, new_if, new_ooo);
-	if (!conn) {
-		tcp_reap_time_wait_slots();
-		tcp_reap_pending();
-		conn = tcp_conn_alloc(new_rx, new_tx, new_if, new_ooo);
-	}
-	if (!conn) {
+	c = tcp_conn_alloc();
+	if (!c) {
 		NET_STATS_INC(NET_MIB_TCP_CONNTABLEFULL);
-		slab_free(new_rx);
-		slab_free(new_tx);
-		tcp_free_seg_arrays(new_if, new_ooo);
 		return NULL;
 	}
-
-	conn->dev = dev;
-	conn->local_ip = local_ip;
-	conn->local_port = local_port;
-	conn->remote_ip = 0;
-	conn->remote_port = 0;
-	conn->state = TCP_STATE_LISTEN;
-	conn->backlog = backlog > 16 ? 16 : backlog;
-	conn->max_seg_size = tcp_local_mss(dev);
-
-	// Reference the caller (sock_listen) will own as s->tcp (refcount 2:
-	// protocol self-reference + socket reference).
-	tcp_conn_hold(conn);
-
-	spin_lock_irqsave(&tcp_lock, &flags);
-	tcp_publish_conn(conn);
-	spin_unlock_irqrestore(&tcp_lock, flags);
-	return conn;
+	c->dev = dev;
+	c->local_ip = local_ip;
+	c->local_port = local_port;
+	c->owner_socket = c;
+	if (backlog < 0)
+		backlog = 0;
+	if (backlog > TCP_SOMAXCONN)
+		backlog = TCP_SOMAXCONN;
+	c->backlog = backlog;
+	c->max_ack_backlog = (uint32_t)backlog;
+	c->advmss = (uint16_t)(dev && dev->mtu > 40 ? dev->mtu - 40 : TCP_MSS);
+	c->state = TCP_STATE_LISTEN;
+	tcp_conn_hold(c); // the caller's (sock_listen) reference
+	tcp_hash_listener(c);
+	return c;
 }
 
-// ============================================================================
-// TCP Accept (from listener)
-// ============================================================================
-tcp_conn_t *tcp_accept(tcp_conn_t *listener)
+/* listen() on a socket that is already listening changes its backlog and
+ * nothing else: the same listener, the same queues.  Connections already
+ * queued beyond a smaller new limit stay queued; only new ones are held
+ * to it. */
+void tcp_listen_set_backlog(tcp_conn_t *l, int backlog)
 {
-	if (!listener || listener->state != TCP_STATE_LISTEN)
+	uint64_t f;
+
+	if (backlog < 0)
+		backlog = 0;
+	if (backlog > TCP_SOMAXCONN)
+		backlog = TCP_SOMAXCONN;
+	tcp_lock_acquire(&l->lock, &f);
+	l->backlog = backlog;
+	__atomic_store_n(&l->max_ack_backlog, (uint32_t)backlog,
+			 __ATOMIC_RELEASE);
+	tcp_lock_release(&l->lock, f);
+}
+
+/* Take a connection off the accept queue.  The queue's reference moves to
+ * the caller.  A child that died on the queue (reset by its peer) is
+ * dropped and the next one taken. */
+tcp_conn_t *tcp_accept(tcp_conn_t *l)
+{
+	uint64_t f;
+
+	if (!l)
 		return NULL;
+	for (;;) {
+		tcp_conn_t *child;
+		int st;
 
-	uint64_t flags;
-	tcp_lock_acquire(&listener->lock, &flags);
-
-	// Each accept-queue entry holds a reference on its child, so the child's
-	// memory is guaranteed valid here (no recycle possible).  The entry's
-	// reference transfers to the caller (becomes the accepted socket's
-	// reference) when we return the child; if the child died before accept()
-	// (peer reset → CLOSED), we drop the entry's reference and discard it.
-	while (listener->accept_head != listener->accept_tail) {
-		struct tcp_accept_entry e =
-			listener->accept_queue[listener->accept_head];
-		listener->accept_queue[listener->accept_head].conn = NULL;
-		listener->accept_head = (listener->accept_head + 1) % 16;
-		if (listener->accept_head == listener->accept_tail)
-			listener->accept_ready = 0;
-
-		tcp_conn_t *conn = e.conn;
-		if (!conn)
-			continue;
-		if (conn->state != TCP_STATE_ESTABLISHED &&
-		    conn->state != TCP_STATE_CLOSE_WAIT) {
-			// Child died between queueing and accept — drop the
-			// entry's reference and move on.
-			tcp_lock_release(&listener->lock, flags);
-			tcp_conn_put(conn);
-			tcp_lock_acquire(&listener->lock, &flags);
-			continue;
+		tcp_lock_acquire(&l->lock, &f);
+		if (l->state != TCP_STATE_LISTEN) {
+			tcp_lock_release(&l->lock, f);
+			return NULL;
 		}
-
-		conn->parent = NULL;
-		tcp_lock_release(&listener->lock, flags);
-		return conn; // entry reference transfers to the caller
-	}
-
-	tcp_lock_release(&listener->lock, flags);
-
-	// Fallback: a child that reached an accept-ready state but is not on the
-	// explicit accept queue (its parent link was cleared when the original
-	// listener slot could not be validated at enqueue time).  Recover it by
-	// 4-tuple.  Take a reference before returning so the caller owns one.
-	uint64_t tcp_flags;
-	spin_lock_irqsave(&tcp_lock, &tcp_flags);
-	for (tcp_conn_t *conn = g_tcp_conn_list; conn; conn = conn->list_next) {
-		if (!conn->active)
-			continue;
-		if (conn->state != TCP_STATE_ESTABLISHED &&
-		    conn->state != TCP_STATE_CLOSE_WAIT)
-			continue;
-
-		int matches = 0;
-		if (conn->parent == listener) {
-			matches = 1;
-		} else if (conn->parent == NULL && conn->owner_socket == NULL &&
-			   conn->local_port == listener->local_port &&
-			   conn->remote_port != 0 &&
-			   (listener->local_ip == 0 ||
-			    conn->local_ip == listener->local_ip)) {
-			// Unowned (owner_socket==NULL) child on this listener's
-			// port: not yet claimed by any accept().
-			matches = 1;
+		child = l->accept_head;
+		if (child) {
+			l->accept_head = child->accept_next;
+			if (!l->accept_head)
+				l->accept_tail = NULL;
+			child->accept_next = NULL;
+			l->ack_backlog--;
 		}
-		if (!matches)
-			continue;
-
-		if (!tcp_conn_tryhold(conn))
-			continue;
-		conn->parent = NULL;
-		spin_unlock_irqrestore(&tcp_lock, tcp_flags);
-		return conn;
+		if (!l->accept_head)
+			l->accept_ready = 0;
+		tcp_lock_release(&l->lock, f);
+		if (!child)
+			return NULL;
+		st = __atomic_load_n(&child->state, __ATOMIC_ACQUIRE);
+		if (st == TCP_STATE_ESTABLISHED || st == TCP_STATE_CLOSE_WAIT)
+			return child;
+		tcp_conn_put(child); // died before accept()
 	}
-
-	spin_unlock_irqrestore(&tcp_lock, tcp_flags);
-	return NULL;
 }
 
-// ============================================================================
-// TCP Close
-// ============================================================================
-// Drive a connection toward teardown.  The caller must hold a reference on
-// `conn` (the socket reference), so the connection is guaranteed alive here —
-// no identity/generation check is needed.  This never frees the connection;
-// it only drives the state machine (and, for states with no closing handshake,
-// drops the protocol self-reference via tcp_conn_kill).  The caller drops the
-// socket reference separately; physical free happens when the refcount reaches
-// zero.
-int tcp_close(tcp_conn_t *conn)
+// ---------------------------------------------------------------------------
+// Close and shutdown.
+// ---------------------------------------------------------------------------
+/* The state a close (or shutdown(SHUT_WR)) moves to; 1 when a FIN must be
+ * sent (RFC 9293 3.10.4). */
+static int tcp_close_state(tcp_conn_t *c)
 {
-	if (!conn)
-		return -1;
-
-	uint64_t flags;
-	tcp_lock_acquire(&conn->lock, &flags);
-
-	switch (conn->state) {
+	switch (c->state) {
 	case TCP_STATE_ESTABLISHED:
-	case TCP_STATE_SYN_RECEIVED: {
-		int fin_sent = tcp_send_segment(
-			conn->dev, conn->local_ip, conn->remote_ip,
-			conn->local_port, conn->remote_port, conn->snd_nxt,
-			conn->rcv_nxt, TCP_FIN | TCP_ACK,
-			tcp_advertised_window(conn), NULL, 0);
-		// Queue the FIN for retransmit whether or not the immediate
-		// send succeeded.  A local drop (skb pool exhausted under load)
-		// must not swallow the FIN: if it is not queued, snd_nxt never
-		// advances, the retransmit timer has nothing to resend, and the
-		// peer blocks in recv()/SSL_read forever waiting for a close
-		// that never arrives.
-		if (tcp_queue_inflight(conn, conn->snd_nxt, TCP_FIN | TCP_ACK,
-				       NULL, 0) == 0) {
-			conn->snd_nxt++;
-			if (fin_sent != 0)
-				conn->retransmit_tick =
-					timer_ticks() +
-					TCP_LOCAL_DROP_RETRY_TICKS;
-		}
-		conn->state = TCP_STATE_FIN_WAIT_1;
-		tcp_lock_release(&conn->lock, flags);
-		break;
-	}
-
-	case TCP_STATE_CLOSE_WAIT: {
-		int fin_sent = tcp_send_segment(
-			conn->dev, conn->local_ip, conn->remote_ip,
-			conn->local_port, conn->remote_port, conn->snd_nxt,
-			conn->rcv_nxt, TCP_FIN | TCP_ACK,
-			tcp_advertised_window(conn), NULL, 0);
-		// Same local-drop safety as the ESTABLISHED case above.
-		if (tcp_queue_inflight(conn, conn->snd_nxt, TCP_FIN | TCP_ACK,
-				       NULL, 0) == 0) {
-			conn->snd_nxt++;
-			if (fin_sent != 0)
-				conn->retransmit_tick =
-					timer_ticks() +
-					TCP_LOCAL_DROP_RETRY_TICKS;
-		}
-		conn->state = TCP_STATE_LAST_ACK;
-		tcp_lock_release(&conn->lock, flags);
-		break;
-	}
-
-	case TCP_STATE_LISTEN: {
-		// Drain the accept queue, dropping the reference each entry holds
-		// on its unaccepted child.  Collect them under the listener's
-		// lock, then put them after releasing it (put may queue a free).
-		tcp_conn_t *pending[16];
-		int npending = 0;
-		while (conn->accept_head != conn->accept_tail) {
-			tcp_conn_t *child =
-				conn->accept_queue[conn->accept_head].conn;
-			conn->accept_queue[conn->accept_head].conn = NULL;
-			conn->accept_head = (conn->accept_head + 1) % 16;
-			if (child && npending < 16)
-				pending[npending++] = child;
-		}
-		conn->accept_ready = 0;
-		tcp_lock_release(&conn->lock, flags);
-		for (int pi = 0; pi < npending; pi++)
-			tcp_conn_put(pending[pi]);
-
-		tcp_detach_listener_children(conn);
-		tcp_lock_acquire(&conn->lock, &flags);
-		// No closing handshake for a listener: drop the protocol
-		// self-reference now.  When the caller also drops the socket
-		// reference, the connection is freed.
-		tcp_conn_kill(conn);
-		tcp_lock_release(&conn->lock, flags);
-		break;
-	}
-
+	case TCP_STATE_SYN_RECEIVED:
+		tcp_set_state(c, TCP_STATE_FIN_WAIT_1);
+		return 1;
+	case TCP_STATE_CLOSE_WAIT:
+		tcp_set_state(c, TCP_STATE_LAST_ACK);
+		return 1;
 	case TCP_STATE_SYN_SENT:
-		tcp_conn_kill(conn);
-		tcp_lock_release(&conn->lock, flags);
-		break;
-
-	case TCP_STATE_CLOSED:
-		// Already terminally dead (peer RST / timeout).  The protocol
-		// self-reference was already dropped; nothing to do here — the
-		// caller's socket-reference drop frees it.
-		tcp_lock_release(&conn->lock, flags);
-		break;
-
+		tcp_set_state(c, TCP_STATE_CLOSED);
+		return 0;
 	default:
-		// A closing state (FIN_WAIT_*, CLOSING, LAST_ACK, TIME_WAIT):
-		// the handshake is already in progress and the protocol
-		// self-reference keeps the connection alive until it completes.
-		tcp_lock_release(&conn->lock, flags);
-		break;
+		return 0;
 	}
+}
 
-	// Opportunistic drain of the reap queue (process context — slab_free ok).
+/* An orphan in FIN_WAIT2 waits for the peer's FIN at most TCP_LINGER2 (the
+ * fin timeout); it does so as a TIME_WAIT sock, which frees the full
+ * socket.  Caller holds conn->lock. */
+static void tcp_orphan_fin_wait2(tcp_conn_t *c)
+{
+	uint64_t tmo;
+
+	if (c->linger2_ms < 0) {
+		tcp_set_state(c, TCP_STATE_CLOSED);
+		tcp_send_active_reset(c);
+		TCPX_INC(TCPX_ABORTONLINGER);
+		tcp_done(c);
+		return;
+	}
+	tmo = tcp_ms(c->linger2_ms ? (uint64_t)c->linger2_ms :
+				     TCP_FIN_TIMEOUT_MS);
+	if (tmo > tcp_ms(TCP_TIMEWAIT_LEN_MS))
+		tcp_reset_keepalive_timer(c, tmo - tcp_ms(TCP_TIMEWAIT_LEN_MS));
+	else
+		tcp_time_wait(c, TCP_STATE_FIN_WAIT_2, tmo);
+}
+
+/* Shut down a listener: the request socks go, the children nobody
+ * accepted are reset.  Caller holds a reference on l. */
+static void tcp_close_listener(tcp_conn_t *l)
+{
+	tcp_conn_t *list;
+	uint64_t f;
+
+	tcp_lock_acquire(&l->lock, &f);
+	list = l->accept_head;
+	l->accept_head = NULL;
+	l->accept_tail = NULL;
+	l->ack_backlog = 0;
+	l->accept_ready = 0;
+	tcp_listen_stop(l); // request socks
+	tcp_done(l);
+	tcp_lock_release(&l->lock, f);
+
+	while (list) {
+		tcp_conn_t *child = list;
+
+		list = child->accept_next;
+		child->accept_next = NULL;
+		tcp_lock_acquire(&child->lock, &f);
+		child->owner_socket = NULL;
+		if (child->state != TCP_STATE_CLOSED) {
+			tcp_send_active_reset(child);
+			tcp_done(child);
+		}
+		tcp_lock_release(&child->lock, f);
+		tcp_conn_put(child); // the accept queue's reference
+	}
+}
+
+/* close(): the application is done with the connection.  The caller holds
+ * a reference (the socket's, dropped after this returns).  Unread data
+ * turns the close into a reset (RFC 2525 2.17: the peer must learn that
+ * what it sent was not read); otherwise the FIN goes after the queued
+ * data and the connection finishes as an orphan. */
+int tcp_close(tcp_conn_t *c)
+{
+	uint64_t f;
+	uint32_t unread;
+
+	if (!c)
+		return -1;
+	if (__atomic_load_n(&c->state, __ATOMIC_ACQUIRE) == TCP_STATE_LISTEN) {
+		tcp_close_listener(c);
+		tcp_reap_pending();
+		return 0;
+	}
+	tcp_lock_acquire(&c->lock, &f);
+	c->owner_socket = NULL;
+	unread = c->rcvq_bytes;
+	{
+		sk_buff_t *skb;
+
+		while ((skb = __skb_dequeue(&c->rcv_queue)) != NULL) {
+			tcp_rmem_uncharge(c, skb);
+			skb_put(skb);
+		}
+		c->rcvq_bytes = 0;
+		c->rx_ready = 0;
+	}
+	if (c->state == TCP_STATE_CLOSED) {
+		// already over (reset, timed out, TIME_WAIT handed over)
+	} else if (unread) {
+		tcp_set_state(c, TCP_STATE_CLOSED);
+		tcp_send_active_reset(c);
+		TCPX_INC(TCPX_ABORTONCLOSE);
+		tcp_done(c);
+	} else {
+		if (tcp_close_state(c))
+			tcp_send_fin(c);
+		if (c->state == TCP_STATE_CLOSED) {
+			tcp_done(c); // SYN_SENT: nothing to finish
+		} else {
+			tcp_orphan_inc(c);
+			if (c->state == TCP_STATE_FIN_WAIT_2) {
+				tcp_orphan_fin_wait2(c);
+			} else if (tcp_orphan_too_many()) {
+				tcp_set_state(c, TCP_STATE_CLOSED);
+				tcp_send_active_reset(c);
+				TCPX_INC(TCPX_ORPHANS_KILLED);
+				tcp_done(c);
+			}
+		}
+	}
+	tcp_lock_release(&c->lock, f);
 	tcp_reap_pending();
 	return 0;
 }
 
-// ============================================================================
-// TCP Send Data
-// ============================================================================
-int tcp_send_data(tcp_conn_t *conn, const uint8_t *data, uint16_t len)
+/* shutdown(SHUT_WR): our direction ends with a FIN after the queued data;
+ * the connection and its receive side stay. */
+int tcp_shutdown(tcp_conn_t *c)
 {
-	/* A raw -1 here reached userspace as errno 1 (EPERM) via sock_send —
-	 * observed as "send failed: Operation not permitted" when the conn was
-	 * reset mid-transfer.  Report the real condition: the conn's recorded
-	 * error (ECONNRESET/ETIMEDOUT from tcp_fail_connection) or EPIPE. */
-	if (!conn || (conn->state != TCP_STATE_ESTABLISHED &&
-		      conn->state != TCP_STATE_CLOSE_WAIT))
-		return (conn && conn->error) ? -conn->error : -EPIPE;
+	uint64_t f;
+
+	if (!c)
+		return -1;
+	tcp_lock_acquire(&c->lock, &f);
+	if (c->state == TCP_STATE_ESTABLISHED ||
+	    c->state == TCP_STATE_SYN_SENT ||
+	    c->state == TCP_STATE_SYN_RECEIVED ||
+	    c->state == TCP_STATE_CLOSE_WAIT) {
+		if (tcp_close_state(c))
+			tcp_send_fin(c);
+		else if (c->state == TCP_STATE_CLOSED)
+			tcp_done(c);
+	}
+	tcp_lock_release(&c->lock, f);
+	return 0;
+}
+
+/* Abortive close (SO_LINGER with a zero timeout): a reset, nothing kept.
+ * The caller holds a reference. */
+void tcp_abort(tcp_conn_t *c)
+{
+	uint64_t f;
+
+	if (!c)
+		return;
+	if (__atomic_load_n(&c->state, __ATOMIC_ACQUIRE) == TCP_STATE_LISTEN) {
+		tcp_close_listener(c);
+		return;
+	}
+	tcp_lock_acquire(&c->lock, &f);
+	c->owner_socket = NULL;
+	if (c->state != TCP_STATE_CLOSED) {
+		if (c->state != TCP_STATE_SYN_SENT)
+			tcp_send_active_reset(c);
+		TCPX_INC(TCPX_ABORTONLINGER);
+		tcp_purge_queues(c);
+		tcp_done(c);
+	}
+	tcp_lock_release(&c->lock, f);
+}
+
+// ---------------------------------------------------------------------------
+// Sending.
+// ---------------------------------------------------------------------------
+/* One caller at a time copies between user memory and a connection's
+ * queues with the lock dropped -- per direction (rx_busy, tx_busy): one
+ * send()'s data stays together in the stream, two readers never take the
+ * same bytes.  Called and returns with conn->lock held (interrupts off);
+ * waits with the lock dropped and interrupts on. */
+static void tcp_user_begin(tcp_conn_t *c, uint8_t *busy, uint64_t *f)
+{
+	while (*busy) {
+		tcp_lock_release(&c->lock, *f);
+		sched_yield_in_kernel();
+		tcp_lock_acquire(&c->lock, f);
+	}
+	*busy = 1;
+}
+
+/* Bytes the tail segment of the write queue can still take (it is not
+ * full, not sent, not a SYN or FIN).  Under conn->lock. */
+static uint32_t tcp_tail_room(tcp_conn_t *c, uint32_t mss_now)
+{
+	sk_buff_t *tail = skb_peek_tail(&c->write_queue);
+
+	if (!tail || tail->len >= mss_now || skb_cloned(tail) ||
+	    (TCP_SKB_CB(tail)->tcp_flags & (TCP_FIN | TCP_SYN)))
+		return 0;
+	return tcp_min32(mss_now - tail->len, skb_tailroom(tail));
+}
+
+/* Put `skb' (payload at data, not charged) at the end of the write queue:
+ * as much as fits into the tail segment's room goes there (a small write
+ * after a small write makes one segment), the rest as a segment of its
+ * own.  Under conn->lock; consumes the skb. */
+static void tcp_queue_user_skb(tcp_conn_t *c, sk_buff_t *skb, uint32_t mss_now)
+{
+	sk_buff_t *tail = skb_peek_tail(&c->write_queue);
+	uint32_t room = tcp_tail_room(c, mss_now);
+
+	if (room) {
+		uint32_t k = tcp_min32(room, skb->len);
+
+		if (k) {
+			mm_memcpy(skb_append(tail, k), skb->data, k);
+			TCP_SKB_CB(tail)->end_seq += k;
+			c->write_seq += k;
+			skb_pull(skb, k);
+		}
+	}
+	if (!skb->len) {
+		skb_put(skb);
+		return;
+	}
+	/* New data after an idle period restarts the window (RFC 5681
+	 * 4.1). */
+	tcp_slow_start_after_idle_check(c);
+	TCP_SKB_CB(skb)->seq = c->write_seq;
+	TCP_SKB_CB(skb)->end_seq = c->write_seq + skb->len;
+	TCP_SKB_CB(skb)->tcp_flags = TCP_ACK;
+	c->write_seq += skb->len;
+	tcp_wmem_charge(c, skb);
+	__skb_queue_tail(&c->write_queue, skb);
+}
+
+/* Queue `len' bytes for sending.  Returns what was queued (all of it,
+ * unless the send buffer filled), 0 when the buffer is full (tx_ready is
+ * then 0 and becomes 1 when ACKs free room), or -errno.  The caller has
+ * made the source resident and opened user access.
+ *
+ * The user memory is copied with interrupts on and no lock held -- into
+ * a buffer of its own, one segment's worth at a time, which then goes
+ * onto the write queue under the lock.  A fault on the source (a sibling
+ * thread unmapped it since the caller made it resident) is then an
+ * ordinary fault, not one inside an interrupts-off section. */
+int tcp_send_data_urg(tcp_conn_t *c, const uint8_t *data, uint16_t len,
+		      int urg)
+{
+	uint64_t f;
+	uint32_t copied = 0, mss_now = 0;
+	int err = 0, first = 1;
+
+	if (!c)
+		return -EPIPE;
 	if (len == 0)
 		return 0;
-	WARN_ON(conn->local_port == 0 ||
-		conn->remote_port ==
-			0); /* sending on a connection without a bound 4-tuple */
-	WARN_ON(conn->tx_buf ==
-		NULL); /* TX ring buffer is NULL — tcp_conn_alloc invariant violated */
+	tcp_lock_acquire(&c->lock, &f);
+	tcp_user_begin(c, &c->tx_busy, &f);
+	for (;;) {
+		sk_buff_t *skb;
+		uint32_t want, room;
 
-	uint64_t flags;
-	tcp_lock_acquire(&conn->lock, &flags);
-
-	/* TOCTOU re-check: state may have changed to CLOSED by tcp_fail_connection
-     * on another CPU between the unlocked entry check above and here. */
-	if (conn->state != TCP_STATE_ESTABLISHED &&
-	    conn->state != TCP_STATE_CLOSE_WAIT) {
-		int err = conn->error ? -conn->error : -EPIPE;
-		tcp_lock_release(&conn->lock, flags);
-		return err;
+		if (c->state != TCP_STATE_ESTABLISHED &&
+		    c->state != TCP_STATE_CLOSE_WAIT) {
+			/* The socket layer reports a pending error in its
+			 * place (once, tcp_sock_error). */
+			err = -EPIPE;
+			break;
+		}
+		if (copied >= len)
+			break;
+		if (first) {
+			// is the sender application-limited? (rate samples)
+			tcp_rate_check_app_limited(c);
+			first = 0;
+		}
+		mss_now = tcp_current_mss(c);
+		/* Room left in the tail segment is filled whatever the
+		 * buffer says; a new segment needs send-buffer space. */
+		room = tcp_tail_room(c, mss_now);
+		if (!room && !tcp_stream_memory_free(c))
+			break;
+		want = tcp_min32(room ? room : mss_now, len - copied);
+		tcp_lock_release(&c->lock, f);
+		/* Interrupts on, no lock: the allocation may use the slab,
+		 * the copy may fault. */
+		skb = skb_alloc_headroom(TCP_MAX_HEADER, want);
+		if (skb) {
+			mm_memset(skb->cb, 0, sizeof(struct tcp_skb_cb));
+			mm_memcpy(skb_append(skb, want), data + copied, want);
+		}
+		tcp_lock_acquire(&c->lock, &f);
+		if (!skb)
+			break;
+		if (c->state != TCP_STATE_ESTABLISHED &&
+		    c->state != TCP_STATE_CLOSE_WAIT) {
+			skb_put(skb);
+			continue; // the state check above reports it
+		}
+		mss_now = tcp_current_mss(c);
+		tcp_queue_user_skb(c, skb, mss_now);
+		copied += want;
+		/* A full segment ready: send what the windows allow now,
+		 * rather than after the whole write was copied. */
+		if (copied < len && tcp_send_head(c) &&
+		    skb_peek_tail(&c->write_queue)->len >= mss_now)
+			tcp_write_xmit(c, mss_now, c->nonagle, 0);
 	}
+	if (copied && (c->state == TCP_STATE_ESTABLISHED ||
+		       c->state == TCP_STATE_CLOSE_WAIT)) {
+		net_socket_t *s = (net_socket_t *)c->owner_socket;
+		int more = s && (void *)s != (void *)c &&
+			   __atomic_load_n(&s->tx_more, __ATOMIC_ACQUIRE);
 
-	uint16_t sent = 0;
-	uint16_t seg_mss = tcp_effective_mss(conn);
-	// Reserve room for TS option (12 bytes after NOP padding) when negotiated
-	if (conn->ts_enabled && seg_mss > 12)
-		seg_mss -= 12;
-
-	// RFC 5681: don't put more than min(cwnd, snd_wnd) bytes in flight.
-	uint32_t flightsize = 0;
-	for (uint8_t i = 0; i < conn->inflight_count; i++)
-		flightsize += conn->inflight[i].len;
-	uint32_t cwnd_bytes = conn->cwnd * seg_mss;
-	// A closed peer window (snd_wnd == 0) blocks new data: the zero-window
-	// persist timer (armed below, fired in tcp_timer_tick) probes instead
-	// of sending data the peer would drop.  RFC 9293 §3.8.6.
-	uint32_t window_bytes = conn->snd_wnd;
-	uint32_t allowed =
-		cwnd_bytes < window_bytes ? cwnd_bytes : window_bytes;
-	uint32_t budget = (allowed > flightsize) ? (allowed - flightsize) : 0;
-
-	while (sent < len) {
-		if (conn->inflight_count >= TCP_MAX_INFLIGHT) {
-			conn->tx_ready = 0;
-			break;
+		if (urg) {
+			c->snd_up = c->write_seq;
+			c->snd_urg_pending = 1;
 		}
-		if (budget == 0) {
-			if (sent == 0)
-				conn->tx_ready = 0;
-			break;
-		}
-
-		uint16_t seg_len = (uint16_t)(len - sent);
-		if (seg_len > seg_mss)
-			seg_len = seg_mss;
-		if (seg_len > budget)
-			seg_len = (uint16_t)budget;
-
-		// Nagle: when nodelay is off and any unacked data outstanding, only
-		// send MSS-sized segments to coalesce small writes.
-		if (!conn->nodelay && flightsize > 0 && seg_len < seg_mss &&
-		    sent > 0)
-			break;
-
-		// TCP_CORK: hold partial segments up to ~200ms unless filled
-		if (conn->cork && seg_len < seg_mss) {
-			if (conn->cork_deadline == 0)
-				conn->cork_deadline =
-					timer_ticks() + timer_ms_to_ticks(200);
-			if (timer_ticks() < conn->cork_deadline)
-				break;
-			conn->cork_deadline = 0;
-		}
-
-		uint8_t opts[TCP_MAX_OPTIONS];
-		uint8_t olen =
-			tcp_build_options(conn, TCP_ACK | TCP_PSH, 0, opts);
-		if (tcp_send_segment_ex(conn->dev, conn->local_ip,
-					conn->remote_ip, conn->local_port,
-					conn->remote_port, conn->snd_nxt,
-					conn->rcv_nxt, TCP_ACK | TCP_PSH,
-					tcp_advertised_window(conn),
-					data + sent, seg_len, opts, olen) < 0) {
-			/* A local drop (ARP pending pool full, transmit ring
-			 * full, no buffer).  With nothing of this write in
-			 * flight there is no ACK to set tx_ready again, so a
-			 * non-blocking writer that gets EAGAIN here would wait
-			 * for POLLOUT for ever -- the browser's network
-			 * process froze in exactly that wait.  Arm the retry
-			 * tick instead; tcp_timer_tick re-opens the socket. */
-			if (sent == 0)
-				conn->tx_retry_tick = timer_ticks() +
-						      TCP_LOCAL_DROP_RETRY_TICKS;
-			break;
-		}
-
-		tcp_queue_inflight(conn, conn->snd_nxt, TCP_ACK | TCP_PSH,
-				   data + sent, seg_len);
-		conn->snd_nxt += seg_len;
-		sent += seg_len;
-		flightsize += seg_len;
-		budget -= seg_len;
+		tcp_push(c, c->nonagle, more && !urg);
 	}
+	if (!tcp_stream_memory_free(c) || !tcp_stream_is_writeable(c))
+		c->tx_ready = 0;
+	else if (!c->tx_ready)
+		c->tx_ready = 1;
+	if (copied && !c->tx_ready && tcp_stream_is_writeable(c))
+		c->tx_ready = 1;
+	c->tx_busy = 0;
+	tcp_lock_release(&c->lock, f);
+	if (copied)
+		return (int)copied;
+	return err;
+}
 
-	if (sent == 0) {
-		conn->tx_ready = 0;
-		// Arm the zero-window persist timer if the block is a closed peer
-		// window with nothing in flight: the retransmit timer only probes
-		// when there is inflight data, so without this a receiver that
-		// advertised window 0 and then lost its re-open ACK would stall
-		// this sender forever.  RFC 1122 §4.2.2.17.
-		if (conn->snd_wnd == 0 && conn->inflight_count == 0 &&
-		    conn->persist_tick == 0) {
-			conn->persist_backoff = 0;
-			conn->persist_tick =
-				timer_ticks() + TCP_PERSIST_MIN_TICKS;
+int tcp_send_data(tcp_conn_t *c, const uint8_t *data, uint16_t len)
+{
+	return tcp_send_data_urg(c, data, len, 0);
+}
+
+int tcp_send_oob(tcp_conn_t *c, uint8_t byte)
+{
+	return tcp_send_data_urg(c, &byte, 1, 1);
+}
+
+/* SO_MAX_PACING_RATE.  The rate is capped at once; any value but "no
+ * cap" also turns TCP's own pacing on for the connection (tcp.h). */
+void tcp_set_max_pacing_rate(tcp_conn_t *c, uint64_t rate)
+{
+	uint64_t f;
+
+	if (!c)
+		return;
+	tcp_lock_acquire(&c->lock, &f);
+	c->max_pacing_rate = rate;
+	if (rate != ~0ULL)
+		c->pacing_on = 1;
+	if (c->pacing_rate > rate)
+		c->pacing_rate = rate ? rate : 1;
+	tcp_lock_release(&c->lock, f);
+}
+
+/* TCP_CORK on or off.  Off releases what the cork held back. */
+void tcp_set_cork(tcp_conn_t *c, int on)
+{
+	uint64_t f;
+
+	if (!c)
+		return;
+	tcp_lock_acquire(&c->lock, &f);
+	c->cork = on ? 1 : 0;
+	if (on) {
+		c->nonagle |= TCP_NAGLE_CORK;
+	} else {
+		c->nonagle &= (uint8_t)~TCP_NAGLE_CORK;
+		c->cork_deadline = 0;
+		if (c->state == TCP_STATE_ESTABLISHED ||
+		    c->state == TCP_STATE_CLOSE_WAIT) {
+			/* What the cork held goes now; with Nagle on, only
+			 * what Nagle lets through. */
+			if (c->nonagle & TCP_NAGLE_OFF)
+				c->nonagle |= TCP_NAGLE_PUSH;
+			tcp_push_pending_frames(c);
+			c->nonagle &= (uint8_t)~TCP_NAGLE_PUSH;
 		}
-		tcp_lock_release(&conn->lock, flags);
+		tcp_update_tx_ready(c);
+	}
+	tcp_lock_release(&c->lock, f);
+}
+
+// ---------------------------------------------------------------------------
+// Receiving.
+// ---------------------------------------------------------------------------
+/* Received data to user memory.  Under the lock the segments to copy
+ * are chosen and pinned (a reference each) -- up to the urgent mark, past
+ * an out-of-band urgent byte; the copy runs with the lock dropped and
+ * interrupts on (the receive path may append meanwhile, a collapse may
+ * replace the pinned segments on the queue: their data stays valid and
+ * unchanged); under the lock again the read is committed by sequence
+ * number.  rx_busy keeps a second reader out for the while. */
+#define TCP_RECV_BATCH 16
+int tcp_recv_copy(tcp_conn_t *c, void *buf, size_t len, int peek)
+{
+	uint64_t f;
+	size_t copied = 0;
+	uint32_t seq;
+
+	if (!c || !len)
+		return 0;
+	tcp_lock_acquire(&c->lock, &f);
+	if (!c->active) {
+		tcp_lock_release(&c->lock, f);
 		return 0;
 	}
+	tcp_user_begin(c, &c->rx_busy, &f);
+	seq = c->copied_seq;
+	while (copied < len) {
+		struct {
+			sk_buff_t *skb;
+			uint32_t off, n;
+		} pin[TCP_RECV_BATCH];
+		uint32_t npin = 0, start = seq, want = 0, skipped = 0;
+		size_t room = len - copied;
+		sk_buff_t *skb;
 
-	// Data went out — no window stall, so disarm any persist probe.
-	conn->persist_tick = 0;
-	conn->tx_retry_tick = 0;
-	conn->retransmit_tick = timer_ticks() + tcp_rto_ticks(conn);
-	conn->retransmit_count = 0;
-
-	tcp_lock_release(&conn->lock, flags);
-	return sent;
-}
-
-// ============================================================================
-// TCP Receive Processing
-// ============================================================================
-
-// Idle connection timeout: close ESTABLISHED connections with no data for 5 minutes
-/* Deadline for a connection stuck in a CLOSING state, in SECONDS.  Converted at
- * the use site against the measured tick rate rather than baked in here as a
- * tick count: the rate is calibrated at boot and is not necessarily 100Hz, and
- * a constant like `300 * 100' silently becomes two and a half minutes when it
- * is 200.  Not applied to ESTABLISHED -- see the note at the use site. */
-#define TCP_IDLE_TIMEOUT_SECS 300
-
-// Disposition of an inbound segment as decided by tcp_validate_incoming().
-typedef enum {
-	TCP_SEG_OK, // passed validation; continue to the state machine
-	TCP_SEG_DROP, // discard silently
-	TCP_SEG_DROP_ACK, // discard, but emit a current-state ACK
-	TCP_SEG_RESET, // a valid reset at rcv_nxt; fail the connection
-} tcp_seg_verdict_t;
-
-// Central inbound-segment validation, run exactly once before the per-state
-// switch for every fully-synchronized data-transfer state (ESTABLISHED,
-// FIN_WAIT_1/2, CLOSE_WAIT, CLOSING, LAST_ACK).  It unifies three checks that
-// were previously scattered across individual states, duplicated, or missing
-// entirely (CLOSE_WAIT had none): reset processing (RFC 5961 §3), blind-SYN
-// mitigation (RFC 5961 §4), and timestamp/PAWS validation (RFC 7323 §5.3).
-//
-// It performs NO transmit and mutates only ts_recent on an accepted in-window
-// segment, preserving the deferred-ACK discipline: the caller emits any owed
-// ACK after releasing conn->lock.  TIME_WAIT and the handshake states
-// (SYN_SENT/SYN_RECEIVED) keep their own bespoke validation and are not
-// routed here.
-static tcp_seg_verdict_t tcp_validate_incoming(tcp_conn_t *conn, uint8_t flags,
-					       uint32_t seq, uint32_t ack,
-					       uint16_t payload_len,
-					       const tcp_parsed_opts_t *pop)
-{
-	(void)ack;
-	int in_window =
-		(int32_t)(seq - conn->rcv_nxt) >= 0 &&
-		(int32_t)(seq - (conn->rcv_nxt + conn->rcv_wnd)) <= 0;
-
-	// RFC 5961 §3 — reset processing.  Only a reset landing exactly at
-	// rcv_nxt is honored; an in-window-but-not-exact reset gets a
-	// challenge ACK (a blind-reset probe cannot then tear us down), and an
-	// out-of-window reset is ignored.
-	if (flags & TCP_RST) {
-		if (!in_window)
-			return TCP_SEG_DROP;
-		if (seq == conn->rcv_nxt) {
-			if (conn->inflight_count > 0 || conn->rx_ready)
-				NET_STATS_INC(NET_MIB_TCP_RSTDATALOSS);
-			NET_STATS_INC(NET_MIB_TCP_ESTABRESETS);
-			return TCP_SEG_RESET;
-		}
-		NET_STATS_INC(NET_MIB_TCP_CHALLENGEACK);
-		return TCP_SEG_DROP_ACK;
-	}
-
-	// RFC 5961 §4 — a SYN inside the window on an already-synchronized
-	// connection is answered with a challenge ACK, never an abort.  (True
-	// simultaneous open is handled only in SYN_SENT.)
-	if (flags & TCP_SYN) {
-		if (in_window) {
-			NET_STATS_INC(NET_MIB_TCP_CHALLENGEACK);
-			return TCP_SEG_DROP_ACK;
-		}
-		return TCP_SEG_DROP;
-	}
-
-	// RFC 7323 §5.3 — protection against wrapped sequence numbers.  Applied
-	// to every synchronized state now, not just ESTABLISHED.
-	if (conn->ts_enabled && pop->ts_present) {
-		if ((int32_t)(pop->tsval - conn->ts_recent) < 0 &&
-		    payload_len > 0) {
-			NET_STATS_INC(NET_MIB_TCP_PAWSDROP);
-			return TCP_SEG_DROP_ACK;
-		}
-		if ((int32_t)(seq - conn->rcv_nxt) <= 0 &&
-		    (int32_t)(pop->tsval - conn->ts_recent) >= 0) {
-			conn->ts_recent = pop->tsval;
-			conn->ts_recent_age = (uint32_t)timer_ticks();
-		}
-	}
-
-	return TCP_SEG_OK;
-}
-
-static inline int tcp_state_is_synchronized(int state)
-{
-	return state == TCP_STATE_ESTABLISHED ||
-	       state == TCP_STATE_FIN_WAIT_1 || state == TCP_STATE_FIN_WAIT_2 ||
-	       state == TCP_STATE_CLOSE_WAIT || state == TCP_STATE_CLOSING ||
-	       state == TCP_STATE_LAST_ACK;
-}
-
-void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
-	    const uint8_t *data, uint16_t len)
-{
-	if (len < sizeof(tcp_header_t)) {
-		NET_STATS_INC(NET_MIB_TCP_INERRS);
-		return;
-	}
-	NET_STATS_INC(NET_MIB_TCP_INSEGS);
-
-	const tcp_header_t *tcp = (const tcp_header_t *)data;
-	uint16_t src_port = net_ntohs(tcp->src_port);
-	uint16_t dst_port = net_ntohs(tcp->dst_port);
-	uint32_t seq = net_ntohl(tcp->seq_num);
-	uint32_t ack = net_ntohl(tcp->ack_num);
-	uint8_t tcp_flags = tcp->flags;
-	uint16_t window = net_ntohs(tcp->window);
-	uint8_t data_offset = (tcp->data_offset >> 4) * 4;
-	tcp_parsed_opts_t pop;
-	tcp_parse_options(tcp, data_offset, &pop);
-	uint16_t peer_mss = pop.mss;
-	uint16_t urg_ptr = net_ntohs(tcp->urgent_ptr);
-
-	if (data_offset > len)
-		return;
-	const uint8_t *payload = data + data_offset;
-	uint16_t payload_len = len - data_offset;
-
-	uint32_t local_ip = dst_ip;
-
-	// --- Illegal flag combinations ---
-	// Null scan: no flags at all
-	if (tcp_flags == 0)
-		return;
-	// SYN+FIN simultaneously
-	if ((tcp_flags & (TCP_SYN | TCP_FIN)) == (TCP_SYN | TCP_FIN))
-		return;
-	// XMAS scan: SYN+FIN+RST+PSH+URG+ACK all set
-	if ((tcp_flags & 0x3F) == 0x3F)
-		return;
-
-	// --- Land attack: SYN with src == dst 4-tuple ---
-	if ((tcp_flags & TCP_SYN) && !(tcp_flags & TCP_ACK) &&
-	    src_ip == dst_ip && src_port == dst_port)
-		return;
-
-	// --- Per-source SYN rate limit (complements SYN cookies) ---
-	if ((tcp_flags & TCP_SYN) && !(tcp_flags & TCP_ACK)) {
-		uint64_t rl_flags;
-		spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
-		int syn_ok = net_rl_src_allow(&g_tcp_syn_rl, src_ip);
-		spin_unlock_irqrestore(&g_ratelimit_lock, rl_flags);
-		if (!syn_ok)
-			return;
-	}
-
-	// Find the existing connection and take a reference on it, so it cannot
-	// be freed under us while we process the segment.  Released at every
-	// exit of the segment-processing path below (search: tcp_conn_put(conn)).
-	tcp_conn_t *conn =
-		tcp_find_conn_hold(local_ip, dst_port, src_ip, src_port);
-
-	// RFC 1122 §4.2.2.13: a fresh SYN whose 4-tuple matches an existing
-	// TIME_WAIT connection re-opens the connection.  Kill the TIME_WAIT
-	// connection and fall through to the listener path so the SYN is
-	// processed as a brand-new connection.
-	if (conn && conn->state == TCP_STATE_TIME_WAIT &&
-	    (tcp_flags & TCP_SYN) && !(tcp_flags & TCP_ACK)) {
-		uint64_t twflags;
-		tcp_lock_acquire(&conn->lock, &twflags);
-		tcp_conn_kill(conn);
-		tcp_lock_release(&conn->lock, twflags);
-		tcp_conn_put(conn); // drop our transient reference
-		conn = NULL;
-	}
-
-	if (!conn) {
-		// Check for a listener.  Hold a reference so it cannot be freed
-		// (by a concurrent sock_close on the listening socket) while we
-		// use it to create a child below.  Every exit of this block
-		// jumps to rx_no_conn_done, which drops this reference.
-		tcp_conn_t *listener =
-			tcp_find_listener_hold(local_ip, dst_port);
-		if (listener && (tcp_flags & TCP_SYN) &&
-		    !(tcp_flags & TCP_ACK)) {
-			// Check if accept queue is full — use SYN cookies if so
-			int queue_used = (listener->accept_tail -
-					  listener->accept_head + 16) %
-					 16;
-			if (queue_used >= listener->backlog) {
-				// Accept queue full: respond with SYN cookie instead of allocating state
-				uint32_t cookie = tcp_syncookie_generate(
-					src_ip, local_ip, src_port, dst_port,
-					seq, TCP_MSS);
-				tcp_send_segment(dev, local_ip, src_ip,
-						 dst_port, src_port, cookie,
-						 seq + 1, TCP_SYN | TCP_ACK,
-						 TCP_WINDOW_SIZE, NULL, 0);
-				goto rx_no_conn_done;
-			}
-
-			// New connection on listening socket.
-			// Pre-allocate buffers BEFORE taking tcp_lock — slab_alloc may
-			// trigger a TLB shootdown IPI that would deadlock against
-			// tcp_lock holders.
-			uint8_t *nc_rx = (uint8_t *)slab_alloc(TCP_RX_BUF_SIZE);
-			uint8_t *nc_tx = (uint8_t *)slab_alloc(TCP_TX_BUF_SIZE);
-			tcp_inflight_segment_t *nc_if = NULL;
-			tcp_ooo_segment_t *nc_ooo = NULL;
-			if (!nc_rx || !nc_tx ||
-			    tcp_alloc_seg_arrays(&nc_if, &nc_ooo) != 0) {
-				if (nc_rx)
-					slab_free(nc_rx);
-				if (nc_tx)
-					slab_free(nc_tx);
-				// Fallback to SYN cookie
-				uint32_t cookie = tcp_syncookie_generate(
-					src_ip, local_ip, src_port, dst_port,
-					seq, TCP_MSS);
-				tcp_send_segment(dev, local_ip, src_ip,
-						 dst_port, src_port, cookie,
-						 seq + 1, TCP_SYN | TCP_ACK,
-						 TCP_WINDOW_SIZE, NULL, 0);
-				goto rx_no_conn_done;
-			}
-
-			// Allocate the connection OUTSIDE tcp_lock (slab_alloc may
-			// fire a TLB-shootdown IPI); it adopts the buffers above.
-			tcp_conn_t *new_conn =
-				tcp_conn_alloc(nc_rx, nc_tx, nc_if, nc_ooo);
-			if (!new_conn) {
-				tcp_reap_time_wait_slots();
-				tcp_reap_pending();
-				new_conn = tcp_conn_alloc(nc_rx, nc_tx, nc_if,
-							  nc_ooo);
-			}
-			if (!new_conn) {
-				slab_free(nc_rx);
-				slab_free(nc_tx);
-				tcp_free_seg_arrays(nc_if, nc_ooo);
-				NET_STATS_INC(NET_MIB_TCP_CONNTABLEFULL);
-				// Fallback to SYN cookie
-				uint32_t cookie = tcp_syncookie_generate(
-					src_ip, local_ip, src_port, dst_port,
-					seq, TCP_MSS);
-				tcp_send_segment(dev, local_ip, src_ip,
-						 dst_port, src_port, cookie,
-						 seq + 1, TCP_SYN | TCP_ACK,
-						 TCP_WINDOW_SIZE, NULL, 0);
-				goto rx_no_conn_done;
-			}
-
-			new_conn->dev = dev;
-			new_conn->local_ip = local_ip;
-			new_conn->remote_ip = src_ip;
-			new_conn->local_port = dst_port;
-			new_conn->remote_port = src_port;
-			new_conn->ts_offset = tcp_compute_ts_offset(
-				local_ip, src_ip, dst_port, src_port);
-			new_conn->iss = tcp_generate_isn(local_ip, src_ip,
-							 dst_port, src_port);
-			new_conn->irs = seq;
-			new_conn->snd_una = new_conn->iss;
-			new_conn->snd_nxt = new_conn->iss + 1;
-			new_conn->rcv_nxt = seq + 1;
-			new_conn->snd_wnd =
-				window; // not yet scaled (SYN window per RFC 7323)
-			new_conn->rcv_wnd = TCP_WINDOW_SIZE;
-			new_conn->peer_mss = peer_mss ? peer_mss : TCP_MSS;
-			new_conn->max_seg_size = new_conn->peer_mss;
-			new_conn->state = TCP_STATE_SYN_RECEIVED;
-			new_conn->parent = listener;
-			NET_STATS_INC(NET_MIB_TCP_PASSIVEOPENS);
-			// Arm SYN+ACK retransmit deadline.  tcp_timer_tick now handles
-			// SYN_RECEIVED retransmit/timeout; without this, a lost client
-			// ACK leaves the slot wedged forever and hangs accept().
-			new_conn->retransmit_count = 0;
-			new_conn->retransmit_tick =
-				timer_ticks() + TCP_SYN_RETRANSMIT_TICKS;
-			new_conn->handshake_deadline =
-				timer_ticks() + TCP_HANDSHAKE_TIMEOUT_TICKS;
-
-			// RFC 7323/2018 — adopt peer-offered options
-			if (pop.ts_present) {
-				new_conn->ts_enabled = 1;
-				new_conn->ts_recent = pop.tsval;
-				new_conn->ts_recent_age =
-					(uint32_t)timer_ticks();
-			}
-			if (pop.wscale >= 0) {
-				new_conn->ws_enabled = 1;
-				new_conn->snd_wscale = (uint8_t)pop.wscale;
-				// rcv_wscale already set in alloc; will be advertised in SYN+ACK
-			} else {
-				new_conn->rcv_wscale = 0;
-			}
-			if (pop.sack_perm)
-				new_conn->sack_ok = 1;
-
-			// Publish under tcp_lock, guarding against a racing SYN
-			// for the SAME 4-tuple having already created a
-			// connection on another CPU (a client SYN retransmit or
-			// the loopback self-connect delivering on another CPU).
-			// Without the re-check we would mint a SECOND connection
-			// for one 4-tuple; the client's data would then split
-			// across the two while accept() hands out the wrong
-			// (empty) one.  Drop ours; the existing connection's
-			// SYN-ACK drives the handshake.
-			{
-				uint64_t flags;
-				spin_lock_irqsave(&tcp_lock, &flags);
-				if (tcp_find_conn_locked(local_ip, dst_port,
-							 src_ip, src_port)) {
-					spin_unlock_irqrestore(&tcp_lock, flags);
-					tcp_conn_free_unpublished(new_conn);
-					goto rx_no_conn_done;
-				}
-				tcp_publish_conn(new_conn);
-				spin_unlock_irqrestore(&tcp_lock, flags);
-			}
-
-			// Send SYN+ACK with mirrored options
-			tcp_send_synack_conn(new_conn,
-					     tcp_syn_window(new_conn));
-			goto rx_no_conn_done;
-		}
-
-		// SYN cookie validation: ACK for unknown connection with a listener
-		if (listener && (tcp_flags & TCP_ACK) &&
-		    !(tcp_flags & TCP_SYN)) {
-			uint32_t cookie =
-				ack -
-				1; // The ISN we sent was cookie, client ACKs cookie+1
-			uint16_t cookie_mss = 0;
-			int cookie_ok = tcp_syncookie_validate(
-				src_ip, local_ip, src_port, dst_port, cookie,
-				&cookie_mss);
-			NET_STATS_INC(cookie_ok ? NET_MIB_TCP_SYNCOOKIERECV :
-						  NET_MIB_TCP_SYNCOOKIEFAIL);
-			if (cookie_ok) {
-				// Valid SYN cookie - create connection directly in ESTABLISHED state.
-				// Pre-allocate buffers BEFORE taking tcp_lock (TLB-shootdown safety).
-				uint8_t *cc_rx =
-					(uint8_t *)slab_alloc(TCP_RX_BUF_SIZE);
-				uint8_t *cc_tx =
-					(uint8_t *)slab_alloc(TCP_TX_BUF_SIZE);
-				tcp_inflight_segment_t *cc_if = NULL;
-				tcp_ooo_segment_t *cc_ooo = NULL;
-				if (!cc_rx || !cc_tx ||
-				    tcp_alloc_seg_arrays(&cc_if, &cc_ooo) != 0) {
-					if (cc_rx)
-						slab_free(cc_rx);
-					if (cc_tx)
-						slab_free(cc_tx);
-					goto rx_no_conn_done;
-				}
-
-				// Allocate the connection OUTSIDE tcp_lock
-				// (slab_alloc TLB-shootdown safety); it adopts the
-				// buffers above.
-				tcp_conn_t *new_conn = tcp_conn_alloc(
-					cc_rx, cc_tx, cc_if, cc_ooo);
-				if (!new_conn) {
-					tcp_reap_time_wait_slots();
-					tcp_reap_pending();
-					new_conn = tcp_conn_alloc(cc_rx, cc_tx,
-								  cc_if, cc_ooo);
-				}
-				if (!new_conn) {
-					slab_free(cc_rx);
-					slab_free(cc_tx);
-					tcp_free_seg_arrays(cc_if, cc_ooo);
-					NET_STATS_INC(NET_MIB_TCP_CONNTABLEFULL);
-					goto rx_no_conn_done;
-				}
-
-				new_conn->dev = dev;
-				new_conn->local_ip = local_ip;
-				new_conn->remote_ip = src_ip;
-				new_conn->local_port = dst_port;
-				new_conn->remote_port = src_port;
-				// ts_offset deliberately left 0 here: the SYN+ACK that this
-				// ACK echoes was emitted from the stateless cookie path with
-				// the global TS offset, so RTT/PAWS for the rest of this
-				// conn must continue using the global offset for consistency.
-				new_conn->iss = cookie;
-				new_conn->irs = seq - 1;
-				new_conn->snd_una = cookie + 1;
-				new_conn->snd_nxt = cookie + 1;
-				new_conn->rcv_nxt = seq;
-				new_conn->snd_wnd = window;
-				new_conn->rcv_wnd = TCP_WINDOW_SIZE;
-				new_conn->peer_mss =
-					cookie_mss ? cookie_mss : TCP_MSS;
-				new_conn->max_seg_size = new_conn->peer_mss;
-				new_conn->state = TCP_STATE_ESTABLISHED;
-				NET_STATS_INC(NET_MIB_TCP_PASSIVEOPENS);
-				new_conn->parent = listener;
-
-				// Publish under tcp_lock with the same duplicate-
-				// connection guard as the SYN path (a racing
-				// cookie-ACK may have already created the conn for
-				// this 4-tuple).  Release tcp_lock BEFORE taking
-				// listener->lock for the accept enqueue — never
-				// hold both at once.
-				{
-					uint64_t flags;
-					spin_lock_irqsave(&tcp_lock, &flags);
-					if (tcp_find_conn_locked(local_ip,
-								 dst_port, src_ip,
-								 src_port)) {
-						spin_unlock_irqrestore(&tcp_lock,
-								       flags);
-						tcp_conn_free_unpublished(
-							new_conn);
-						goto rx_no_conn_done;
-					}
-					tcp_publish_conn(new_conn);
-					spin_unlock_irqrestore(&tcp_lock, flags);
-				}
-
-				// Enqueue to listener accept queue under listener->lock so
-				// it serialises with tcp_accept (the reader).  Re-validate
-				// that the slot still hosts a LISTEN-state conn matching
-				// our 4-tuple expectations: between tcp_find_listener()
-				// (lock-free) above and acquiring listener->lock here, the
-				// listener may have been closed and the slot recycled as
-				// an unrelated conn (visible under stress when the table
-				// churns through TIME_WAIT reaping).  Writing into a
-				// non-listener's accept_queue silently corrupts that
-				// conn's state.  If validation fails, leave new_conn with
-				// parent=NULL so the orphan-recovery fallback in
-				// tcp_accept can still hand it to whichever LISTEN socket
-				// actually owns the local port.
-				uint64_t lflags;
-				void *lowner = NULL;
-				int queued = 0;
-				tcp_lock_acquire(&listener->lock, &lflags);
-				if (listener->active &&
-				    listener->state == TCP_STATE_LISTEN &&
-				    listener->local_port ==
-					    new_conn->local_port) {
-					int next_tail =
-						(listener->accept_tail + 1) %
-						16;
-					if (next_tail !=
-					    listener->accept_head) {
-						// The accept-queue entry holds a
-						// reference on the child so it
-						// cannot be freed before accept()
-						// claims it.
-						tcp_conn_hold(new_conn);
-						listener->accept_queue
-							[listener->accept_tail]
-								.conn = new_conn;
-						listener->accept_tail =
-							next_tail;
-						listener->accept_ready = 1;
-						lowner = listener->owner_socket;
-						queued = 1;
-					}
-					tcp_lock_release(&listener->lock,
-							 lflags);
-					if (queued)
-						tcp_listener_notify(listener,
-								    lowner);
-				} else {
-					tcp_lock_release(&listener->lock,
-							 lflags);
-					new_conn->parent = NULL;
-				}
-				goto rx_no_conn_done;
+		/* At the urgent mark: a read that got data stops before it;
+		 * otherwise an out-of-band byte is stepped over. */
+		if (c->urg_state != TCP_URG_NONE && c->rcv_up == seq) {
+			if (copied)
+				break;
+			if (!c->urg_inline &&
+			    before(seq, c->copied_seq + c->rcvq_bytes)) {
+				seq++;
+				skipped = 1;
 			}
 		}
+		if (c->urg_state != TCP_URG_NONE && after(c->rcv_up, seq) &&
+		    c->rcv_up - seq < room)
+			room = c->rcv_up - seq; // up to the mark
+		for (skb = skb_peek(&c->rcv_queue);
+		     skb && want < room && npin < TCP_RECV_BATCH;
+		     skb = skb->next) {
+			struct tcp_skb_cb *cb = TCP_SKB_CB(skb);
+			uint32_t off = seq + want - cb->seq, n;
 
-		// No connection - send RST (RFC 793: a segment to a nonexistent
-		// connection elicits an RST so the peer stops).
-		if (!(tcp_flags & TCP_RST)) {
-			if (tcp_flags & TCP_ACK) {
-				tcp_send_rst(dev, local_ip, src_ip, dst_port,
-					     src_port, ack, 0);
-			} else {
-				tcp_send_rst(dev, local_ip, src_ip, dst_port,
-					     src_port, 0,
-					     seq + payload_len +
-						     ((tcp_flags & TCP_SYN) ?
-							      1 :
-							      0));
-			}
+			if (off >= skb->len)
+				continue; // read already (a peek walks past)
+			n = skb->len - off;
+			if (n > room - want)
+				n = (uint32_t)(room - want);
+			pin[npin].skb = skb_get(skb);
+			pin[npin].off = off;
+			pin[npin].n = n;
+			npin++;
+			want += n;
 		}
-		goto rx_no_conn_done;
+		if (!npin && !skipped)
+			break;
+		tcp_lock_release(&c->lock, f);
+		for (uint32_t i = 0; i < npin; i++) {
+			mm_memcpy((uint8_t *)buf + copied,
+				  pin[i].skb->data + pin[i].off, pin[i].n);
+			copied += pin[i].n;
+		}
+		tcp_lock_acquire(&c->lock, &f);
+		seq += want;
+		if (!peek && c->copied_seq == start) {
+			uint32_t done = seq - start;
+			sk_buff_t *head;
 
-	rx_no_conn_done:
-		// Single exit for the no-existing-connection path: drop the
-		// listener reference (NULL-safe) and return.
-		tcp_conn_put(listener);
-		return;
-	}
-
-	uint64_t flags;
-	/* Deferred-ACK pattern: instead of calling tcp_send_ack() inline
-     * (which transmits under conn->lock), tcp_rx queues with
-     * tcp_queue_ack_locked() and snapshots the params just before
-     * tcp_lock_release().  The actual NIC TX happens AFTER release.
-     * Multiple queue calls collapse into a single trailing ACK. */
-	int ack_pending = 0;
-	tcp_lock_acquire(&conn->lock, &flags);
-
-	// Re-validate under conn->lock.  We hold a reference (tcp_find_conn_hold),
-	// so the connection cannot be freed, but its 4-tuple could in principle
-	// change; if anything no longer matches, drop the packet.
-	if (!conn->active || conn->local_port != dst_port ||
-	    conn->remote_port != src_port || conn->remote_ip != src_ip ||
-	    (conn->local_ip != local_ip && conn->local_ip != 0)) {
-		tcp_lock_release(&conn->lock, flags);
-		tcp_conn_put(conn);
-		return;
-	}
-
-	/* Send-side readiness on entry.  ACK processing below frees inflight
-	 * slots and a window advertisement can reopen a closed peer window;
-	 * both flip tx_ready 0->1, and a writer parked in poll(POLLOUT) --
-	 * every GLib socket, so every browser request -- learns of it only
-	 * from a wake.  None of those paths woke anybody: the poller sat
-	 * until some unrelated descriptor fired.  Compared at
-	 * deferred_ack_out, once for the whole segment. */
-	int tx_was_ready = conn->tx_ready;
-
-	// Central inbound validation for the fully-synchronized states
-	// (RST / blind-SYN / PAWS in one place — see tcp_validate_incoming).
-	// The handshake states and TIME_WAIT keep their own handling below.
-	if (tcp_state_is_synchronized(conn->state)) {
-		switch (tcp_validate_incoming(conn, tcp_flags, seq, ack,
-					      payload_len, &pop)) {
-		case TCP_SEG_DROP:
-			tcp_lock_release(&conn->lock, flags);
-			tcp_conn_put(conn);
-			return;
-		case TCP_SEG_DROP_ACK:
-			tcp_queue_ack_locked(conn);
-			ack_pending = 1;
-			goto deferred_ack_out;
-		case TCP_SEG_RESET:
-			tcp_fail_connection(conn, ECONNRESET);
-			tcp_lock_release(&conn->lock, flags);
-			tcp_conn_put(conn);
-			return;
-		case TCP_SEG_OK:
+			c->copied_seq = seq;
+			c->rcvq_bytes -= tcp_min32(c->rcvq_bytes, done);
+			while ((head = skb_peek(&c->rcv_queue)) != NULL &&
+			       !before(seq, TCP_SKB_CB(head)->seq + head->len)) {
+				__skb_unlink(head, &c->rcv_queue);
+				tcp_rmem_uncharge(c, head);
+				skb_put(head);
+			}
+			/* Read past the urgent byte: the mark is over
+			 * (header prediction resumes with the next
+			 * segment's slow-path check). */
+			if (c->urg_state != TCP_URG_NONE &&
+			    c->urg_state != TCP_URG_NOTYET &&
+			    after(seq, c->rcv_up))
+				c->urg_state = TCP_URG_NONE;
+		} else if (!peek) {
+			/* The queue was taken away under us (close) --
+			 * what was copied is reported, nothing else. */
+			for (uint32_t i = 0; i < npin; i++)
+				skb_put(pin[i].skb);
 			break;
 		}
+		for (uint32_t i = 0; i < npin; i++)
+			skb_put(pin[i].skb);
 	}
+	if (!peek && copied) {
+		if (!c->rcvq_bytes)
+			c->rx_ready = 0;
+		tcp_rcv_space_adjust(c);
+		tcp_cleanup_rbuf(c, (int)copied);
+	} else if (!peek && !c->rcvq_bytes) {
+		c->rx_ready = 0;
+	}
+	c->rx_busy = 0;
+	tcp_lock_release(&c->lock, f);
+	return (int)copied;
+}
 
-	// Process by state
-	switch (conn->state) {
-	case TCP_STATE_SYN_SENT:
-		if ((tcp_flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)) {
-			if (ack == conn->snd_nxt) {
-				conn->irs = seq;
-				conn->rcv_nxt = seq + 1;
-				conn->snd_una = ack;
-				conn->snd_wnd = window; // SYN window unscaled
-				conn->peer_mss = peer_mss ? peer_mss : TCP_MSS;
-				conn->max_seg_size = conn->peer_mss;
-				conn->state = TCP_STATE_ESTABLISHED;
-				conn->connect_done = 1;
-				/* Wake a non-blocking connect()er parked in
-				 * poll(POLLOUT).  The failure path
-				 * (tcp_fail_connection) notified the poller;
-				 * the success path never did, so a fresh
-				 * connection sat ESTABLISHED until some
-				 * unrelated event or the poll timeout woke the
-				 * caller -- luakit stuck at 10% on every typed
-				 * address (new host = new connect) while clicks
-				 * on keep-alive connections were fine.  The
-				 * blocking path spins on connect_done and never
-				 * noticed. */
-				tcp_poll_notify(conn);
+int tcp_recv_urg(tcp_conn_t *c, int peek, uint8_t *byte)
+{
+	uint64_t f;
+	int rc;
 
-				// Negotiate TS / WS / SACK based on what the peer echoed
-				if (pop.ts_present) {
-					conn->ts_enabled = 1;
-					conn->ts_recent = pop.tsval;
-					conn->ts_recent_age =
-						(uint32_t)timer_ticks();
-				}
-				if (pop.wscale >= 0) {
-					conn->ws_enabled = 1;
-					conn->snd_wscale = (uint8_t)pop.wscale;
-				} else {
-					conn->rcv_wscale =
-						0; // peer didn't agree
-				}
-				if (pop.sack_perm)
-					conn->sack_ok = 1;
+	if (!c)
+		return -ENOTCONN;
+	tcp_lock_acquire(&c->lock, &f);
+	if (c->urg_inline || c->urg_state == TCP_URG_NONE ||
+	    c->urg_state == TCP_URG_READ) {
+		rc = -EINVAL;
+	} else if (c->urg_state == TCP_URG_VALID) {
+		*byte = c->urgent_byte;
+		if (!peek)
+			c->urg_state = TCP_URG_READ;
+		rc = 1;
+	} else if (c->state == TCP_STATE_CLOSED ||
+		   c->state == TCP_STATE_CLOSE_WAIT ||
+		   c->state == TCP_STATE_CLOSING ||
+		   c->state == TCP_STATE_LAST_ACK) {
+		rc = 0; // it will never come
+	} else {
+		rc = -EAGAIN; // never waits for it
+	}
+	tcp_lock_release(&c->lock, f);
+	return rc;
+}
 
-				// Send ACK (now with TS option if negotiated, scaled window)
-				tcp_queue_ack_locked(conn);
-				ack_pending = 1;
+void tcp_set_oobinline(tcp_conn_t *c, int on)
+{
+	uint64_t f;
+
+	if (!c)
+		return;
+	tcp_lock_acquire(&c->lock, &f);
+	c->urg_inline = on ? 1 : 0;
+	tcp_lock_release(&c->lock, f);
+}
+
+uint32_t tcp_inq(tcp_conn_t *c)
+{
+	if (!c)
+		return 0;
+	return __atomic_load_n(&c->rcvq_bytes, __ATOMIC_ACQUIRE);
+}
+
+// SIOCATMARK: the next byte to read is the urgent byte.
+int tcp_at_mark(tcp_conn_t *c)
+{
+	if (!c)
+		return 0;
+	return __atomic_load_n(&c->urg_state, __ATOMIC_ACQUIRE) !=
+		       TCP_URG_NONE &&
+	       __atomic_load_n(&c->rcv_up, __ATOMIC_RELAXED) ==
+		       __atomic_load_n(&c->copied_seq, __ATOMIC_RELAXED);
+}
+
+// ---------------------------------------------------------------------------
+// Socket options.
+// ---------------------------------------------------------------------------
+void tcp_set_buffers(tcp_conn_t *c, int sndbuf, int rcvbuf, uint8_t locks)
+{
+	uint64_t f;
+
+	if (!c)
+		return;
+	tcp_lock_acquire(&c->lock, &f);
+	if (locks & TCP_SNDBUF_LOCK) {
+		c->userlocks |= TCP_SNDBUF_LOCK;
+		c->sndbuf = sndbuf > TCP_WMEM_MIN ? sndbuf : TCP_WMEM_MIN;
+		tcp_update_tx_ready(c);
+	}
+	if (locks & TCP_RCVBUF_LOCK) {
+		c->userlocks |= TCP_RCVBUF_LOCK;
+		c->rcvbuf = rcvbuf > TCP_RMEM_MIN ? rcvbuf : TCP_RMEM_MIN;
+		/* A smaller buffer than the window offered so far: the
+		 * window is not taken back, it shrinks as data arrives. */
+		if (c->state != TCP_STATE_LISTEN &&
+		    c->state != TCP_STATE_CLOSED) {
+			uint32_t full = (uint32_t)tcp_full_space(c);
+
+			if (c->window_clamp > full)
+				c->window_clamp = tcp_max32(full,
+							    c->advmss);
+			c->rcv_ssthresh = tcp_min32(c->rcv_ssthresh,
+						    c->window_clamp);
+		}
+	}
+	tcp_lock_release(&c->lock, f);
+}
+
+int tcp_setsockopt_int(tcp_conn_t *c, int optname, int val)
+{
+	uint64_t f;
+	int rc = 0;
+
+	if (!c)
+		return -ENOTCONN;
+	tcp_lock_acquire(&c->lock, &f);
+	switch (optname) {
+	case TCP_NODELAY:
+		c->nodelay = val ? 1 : 0;
+		if (val) {
+			/* What Nagle held back goes now (a one-time push;
+			 * TCP_CORK still holds what it holds). */
+			c->nonagle |= TCP_NAGLE_OFF;
+			if (c->state == TCP_STATE_ESTABLISHED ||
+			    c->state == TCP_STATE_CLOSE_WAIT) {
+				c->nonagle |= TCP_NAGLE_PUSH;
+				tcp_push_pending_frames(c);
+				c->nonagle &= (uint8_t)~TCP_NAGLE_PUSH;
 			}
-		} else if (tcp_flags & TCP_RST) {
-			NET_STATS_INC(NET_MIB_TCP_ATTEMPTFAILS);
-			tcp_fail_connection(conn, ECONNREFUSED);
-		} else if ((tcp_flags & TCP_SYN) && !(tcp_flags & TCP_ACK)) {
-			// RFC 793 §3.4 simultaneous open — both sides sent SYN
-			conn->irs = seq;
-			conn->rcv_nxt = seq + 1;
-			conn->snd_wnd = window;
-			if (pop.ts_present) {
-				conn->ts_enabled = 1;
-				conn->ts_recent = pop.tsval;
-			}
-			if (pop.wscale >= 0) {
-				conn->ws_enabled = 1;
-				conn->snd_wscale = (uint8_t)pop.wscale;
-			}
-			if (pop.sack_perm)
-				conn->sack_ok = 1;
-			conn->state = TCP_STATE_SYN_RECEIVED;
-			// Arm SYN+ACK retransmit deadline (simultaneous-open path).
-			conn->retransmit_count = 0;
-			conn->retransmit_tick =
-				timer_ticks() + TCP_SYN_RETRANSMIT_TICKS;
-			tcp_send_synack_conn(conn, tcp_syn_window(conn));
+		} else {
+			c->nonagle &= (uint8_t)~(TCP_NAGLE_OFF | TCP_NAGLE_PUSH);
 		}
 		break;
-
-	case TCP_STATE_SYN_RECEIVED:
-		// Duplicate SYN (no ACK) means our SYN+ACK was lost on the wire
-		// (skb_alloc failure under sustained pressure, NIC TX-ring overrun,
-		// or a real packet drop on a non-loopback path).  Without this
-		// resend, the peer keeps retransmitting SYN forever and we sit
-		// here ignoring it because nothing else in this state machine or
-		// in tcp_timer_tick retransmits the SYN+ACK for SYN_RECEIVED.
-		// The result is a wedged listener with an empty accept_queue and
-		// a child slot stuck below ESTABLISHED — observed as a sporadic
-		// accept() hang under teststress network loops.
-		if ((tcp_flags & TCP_SYN) && !(tcp_flags & TCP_ACK) &&
-		    seq == conn->irs) {
-			tcp_send_synack_conn(conn, tcp_syn_window(conn));
-			tcp_lock_release(&conn->lock, flags);
-			tcp_conn_put(conn);
-			return;
-		}
-		if (tcp_flags & TCP_ACK) {
-			if (ack == conn->snd_nxt) {
-				conn->snd_una = ack;
-				// First ACK after SYN+ACK: window is now scaled
-				{
-					uint32_t scaled = (uint32_t)window;
-					if (conn->ws_enabled)
-						scaled <<= conn->snd_wscale;
-					conn->snd_wnd = scaled;
-				}
-				conn->max_seg_size = conn->peer_mss ?
-							     conn->peer_mss :
-							     TCP_MSS;
-				conn->state = TCP_STATE_ESTABLISHED;
-				// Disarm the SYN+ACK retransmit deadline armed at
-				// SYN_RECEIVED entry.  ESTABLISHED reuses retransmit_tick
-				// for inflight data RTO; leaving the SYN_RECEIVED deadline
-				// armed could trip the SYN+ACK retransmit branch on the
-				// very next timer tick before any data is in flight.
-				conn->retransmit_tick = 0;
-				conn->retransmit_count = 0;
-
-				// Enqueue in parent's accept queue.  Re-validate under
-				// p->lock that p is still a LISTEN-state conn on the
-				// matching local port.  If the listener slot was freed
-				// and reused (stress-induced churn through TIME_WAIT
-				// reaping), p now points to an unrelated conn whose
-				// accept_queue/accept_tail/accept_ready fields are
-				// semantically meaningless and would be corrupted by
-				// the writes below.  Drop the stale link so the
-				// orphan-recovery fallback in tcp_accept can still pair
-				// this conn with the real listener by 4-tuple.
-				/* Read conn->parent ONCE into a local: another CPU
-                 * can clear it (tcp_detach_listener_children on listener
-                 * close) between a NULL test and a deref, so a re-read
-                 * could deref NULL.  A stale but non-NULL parent is fine —
-                 * it is re-validated under p->lock below. */
-				tcp_conn_t *p = conn->parent;
-				if (p) {
-					uint64_t pflags;
-					void *powner = NULL;
-					int pqueued = 0;
-					spin_lock_irqsave(&p->lock, &pflags);
-					if (p->active &&
-					    p->state == TCP_STATE_LISTEN &&
-					    p->local_port == conn->local_port) {
-						int next =
-							(p->accept_tail + 1) %
-							16;
-						if (next != p->accept_head) {
-							// The accept-queue entry
-							// holds a reference on the
-							// child (see tcp_accept).
-							tcp_conn_hold(conn);
-							p->accept_queue
-								[p->accept_tail]
-									.conn =
-								conn;
-							p->accept_tail = next;
-							p->accept_ready = 1;
-							powner = p->owner_socket;
-							pqueued = 1;
-						} else {
-							/* accept_queue (16 slots)
-							 * full: the just-established
-							 * child cannot be published
-							 * to accept().  It keeps its
-							 * parent link so orphan
-							 * recovery may still find it,
-							 * but a blocking accept() can
-							 * miss it and time out.
-							 * Counted (ACCEPTQFULL). */
-							NET_STATS_INC(
-								NET_MIB_TCP_ACCEPTQFULL);
-						}
-						spin_unlock_irqrestore(&p->lock,
-								       pflags);
-						if (pqueued)
-							tcp_listener_notify(
-								p, powner);
-					} else {
-						/* Parent is no longer a LISTEN conn
-						 * on our port — it was closed
-						 * between the lookup and here.  The
-						 * child is orphaned and only
-						 * reachable via tcp_accept's 4-tuple
-						 * fallback. */
-						spin_unlock_irqrestore(&p->lock,
-								       pflags);
-						conn->parent = NULL;
-					}
-				} else if (!tcp_listener_exists(
-						   conn->local_ip,
-						   conn->local_port)) {
-					/* The child completed its handshake but its
-					 * listener is GONE (closed before the final
-					 * ACK arrived — e.g. the server's accept()
-					 * timed out and exited) and NO other listener
-					 * on the port can adopt it via orphan
-					 * recovery.  Nothing will ever accept this
-					 * conn: keeping it leaves the peer talking to
-					 * a socket-less ESTABLISHED zombie until its
-					 * own timeout, and the connection leaks.
-					 * RFC-conformant behaviour is a reset — the
-					 * peer gets ECONNRESET immediately.  Counted
-					 * (LISTENERGONE). */
-					NET_STATS_INC(NET_MIB_TCP_LISTENERGONE);
-					tcp_send_rst(conn->dev, conn->local_ip,
-						     conn->remote_ip,
-						     conn->local_port,
-						     conn->remote_port,
-						     conn->snd_nxt,
-						     conn->rcv_nxt);
-					tcp_fail_connection(conn, ECONNRESET);
-					tcp_lock_release(&conn->lock, flags);
-					tcp_conn_put(conn);
-					return;
-				}
-			}
-		}
-		if (tcp_flags & TCP_RST) {
-			// Peer reset the half-open connection: kill it (drop the
-			// protocol reference).  It is freed once our transient
-			// reference is released at the rx exit.
-			tcp_conn_kill(conn);
-			tcp_lock_release(&conn->lock, flags);
-			tcp_conn_put(conn);
-			return;
-		}
-		/* RFC 793 p.72 (SYN-RECEIVED, acceptable ACK): "enter ESTABLISHED
-		 * state and continue processing".  The segment that completes the
-		 * handshake may itself carry data: connect() returns as soon as
-		 * the SYN+ACK is processed, so the client's first data segment
-		 * (which also carries the ACK flag) races the deferred bare ACK
-		 * onto the loopback queue and regularly arrives here first.
-		 * Breaking out silently dropped that payload: rcv_nxt froze at
-		 * iss+1, the follow-up segments piled into the OOO queue, the
-		 * peer's FIN was refused as out-of-order (seq exactly
-		 * transfer-size ahead of rcv_nxt in dmesg), and the transfer
-		 * stalled until RTO retransmission — the intermittent teststress
-		 * recv failures.  Process the payload/FIN in ESTABLISHED. */
-		if (conn->state == TCP_STATE_ESTABLISHED &&
-		    (payload_len > 0 || (tcp_flags & TCP_FIN)))
-			goto established_segment;
+	case TCP_SOCKOPT_KEEPALIVE:
+		c->keepalive = val ? 1 : 0;
+		tcp_set_keepalive(c, c->keepalive);
 		break;
-
-	case TCP_STATE_ESTABLISHED:
-established_segment:
-		// RST, blind-SYN, and PAWS were already handled by
-		// tcp_validate_incoming() before the switch.
-		conn->last_rx_tick = timer_ticks();
-		conn->keep_probes_sent = 0;
-
-		// Apply RFC 7323 window scaling on inbound advertised window
-		{
-			uint32_t scaled = (uint32_t)window;
-			if (conn->ws_enabled)
-				scaled <<= conn->snd_wscale;
-			conn->snd_wnd = scaled;
-			// Peer re-opened its window — cancel any persist probe and
-			// wake the send path.
-			if (scaled > 0 && conn->persist_tick) {
-				conn->persist_tick = 0;
-				conn->tx_ready = 1;
-			}
+	case TCP_KEEPIDLE:
+	case TCP_KEEPINTVL:
+	case TCP_KEEPCNT:
+		if (val < 1 || val > (optname == TCP_KEEPCNT ? 127 : 32767)) {
+			rc = -EINVAL;
+			break;
 		}
-
-		// RFC 6093: track urgent pointer for MSG_OOB / SIOCATMARK
-		if (tcp_flags & TCP_URG) {
-			uint32_t up = seq + urg_ptr;
-			conn->rcv_up = up;
-			// Save the OOB byte (last byte of urgent data per BSD semantics)
-			if (urg_ptr > 0 && urg_ptr <= payload_len) {
-				conn->urgent_byte = payload[urg_ptr - 1];
-				conn->urgent_valid = 1;
-			}
+		if (optname == TCP_KEEPIDLE) {
+			c->keepidle_ticks = (uint32_t)timer_s_to_ticks((uint64_t)val);
+			if (c->keepalive)
+				tcp_set_keepalive(c, 1);
+		} else if (optname == TCP_KEEPINTVL) {
+			c->keepintvl_ticks =
+				(uint32_t)timer_s_to_ticks((uint64_t)val);
+		} else {
+			c->keepcnt = (uint32_t)val;
 		}
+		break;
+	case TCP_MAXSEG:
+		if (val && (val < TCP_MIN_MSS || val > 65535 - 40)) {
+			rc = -EINVAL;
+			break;
+		}
+		c->user_mss = (uint16_t)val;
+		break;
+	case TCP_QUICKACK:
+		if (val) {
+			c->ack_pingpong = 0;
+			if (tcp_state_synchronized(c->state) &&
+			    (c->ack_pending & TCP_ACK_SCHED)) {
+				tcp_enter_quickack_mode(c, TCP_MAX_QUICKACKS);
+				tcp_send_ack(c);
+			} else {
+				tcp_enter_quickack_mode(c, TCP_MAX_QUICKACKS);
+			}
+		} else {
+			c->ack_pingpong = 1;
+		}
+		break;
+	case TCP_USER_TIMEOUT:
+		if (val < 0) {
+			rc = -EINVAL;
+			break;
+		}
+		c->user_timeout_ms = (uint32_t)val;
+		break;
+	case TCP_NOTSENT_LOWAT:
+		c->notsent_lowat = val > 0 ? (uint32_t)val : 0;
+		tcp_update_tx_ready(c);
+		break;
+	case TCP_DEFER_ACCEPT: {
+		/* Seconds -> SYN-ACK retransmissions that cover them (1, 2,
+		 * 4, ... s), as the common stack rounds it. */
+		uint32_t secs = val > 0 ? (uint32_t)val : 0, n = 0, t = 1;
 
-		// Process ACK
-		if (tcp_flags & TCP_ACK) {
-			// Validate ACK is within snd_una..snd_nxt (out-of-window ACK flood)
-			if ((int32_t)(ack - conn->snd_una) < 0 ||
-			    (int32_t)(ack - conn->snd_nxt) > 1) {
-				// Out-of-window ACK: send current ACK state back and drop
-				tcp_queue_ack_locked(conn);
-				ack_pending = 1;
+		while (secs && n < 255) {
+			n++;
+			if (t >= secs)
 				break;
-			}
-			// Store any peer-sent SACK blocks for the retransmit timer to use
-			if (conn->sack_ok && pop.sack_count > 0) {
-				conn->sack_block_count = pop.sack_count;
-				for (uint8_t b = 0; b < pop.sack_count; b++) {
-					conn->sack_blocks[b].left =
-						pop.sack[b].left;
-					conn->sack_blocks[b].right =
-						pop.sack[b].right;
-				}
-			}
-			if (ack > conn->snd_una && ack <= conn->snd_nxt) {
-				// Prefer RFC 7323 TSecr for RTT (ignores Karn ambiguity for retrans)
-				int rtt_sampled = 0;
-				uint64_t now_us = timer_get_precise_us();
-				if (conn->ts_enabled && pop.ts_present &&
-				    pop.tsecr != 0) {
-					uint32_t now_ts = tcp_ts_now_for(conn);
-					uint32_t elapsed_ms = now_ts - pop.tsecr;
-					/* A TS unit is one MILLISECOND
-					 * (tcp_ts_clock_ms), whatever the tick
-					 * rate.  It used to be one tick, and the
-					 * conversion below tracked the measured
-					 * tick length; an earlier hardcoded
-					 * 10000 us over-stated every RTT sample
-					 * at any other rate, inflating the RTO
-					 * it feeds. */
-					tcp_update_rtt(conn, elapsed_ms * 1000U);
-					rtt_sampled = 1;
-				}
-				if (!rtt_sampled) {
-					for (uint8_t i = 0;
-					     i < conn->inflight_count &&
-					     !rtt_sampled;
-					     i++) {
-						tcp_inflight_segment_t *seg =
-							&conn->inflight[i];
-						uint32_t seg_end =
-							seg->seq + seg->len +
-							((seg->flags &
-							  (TCP_SYN | TCP_FIN)) ?
-								 1U :
-								 0U);
-						if (ack >= seg_end &&
-						    seg->retransmit_count ==
-							    0 &&
-						    seg->send_us) {
-							if (now_us >
-							    seg->send_us)
-								tcp_update_rtt(
-									conn,
-									(uint32_t)(now_us -
-										   seg->send_us));
-							rtt_sampled = 1;
-						}
-					}
-				}
-				conn->snd_una = ack;
-				tcp_ack_inflight(conn, ack);
-				conn->retransmit_count = 0;
-				conn->retransmit_tick =
-					timer_ticks() + tcp_rto_ticks(conn);
-				conn->tx_ready =
-					conn->inflight_count < TCP_MAX_INFLIGHT;
-				conn->dup_acks = 0;
-
-				// RFC 5681 NewReno congestion control on new ACK.
-				if (conn->cwnd < conn->ssthresh) {
-					conn->cwnd++;
-					if (conn->cwnd > 65535U)
-						conn->cwnd = 65535U;
-				} else {
-					/* Per-conn counter — previously this was a file-scope
-                     * static, which let parallel flows clobber each
-                     * other's congestion-avoidance accounting (one flow
-                     * could "earn" cwnd growth driven entirely by another
-                     * flow's ACKs). */
-					conn->ca_ack_counter++;
-					if (conn->ca_ack_counter >=
-					    conn->cwnd) {
-						conn->cwnd++;
-						conn->ca_ack_counter = 0;
-					}
-				}
-			} else if (ack == conn->snd_una && payload_len == 0 &&
-				   conn->inflight_count > 0) {
-				conn->dup_acks++;
-				if (conn->dup_acks == 3) {
-					uint32_t flight = conn->inflight_count;
-					conn->ssthresh =
-						flight > 2 ? flight / 2 : 2;
-					conn->cwnd = conn->ssthresh + 3;
-					if (conn->inflight_count > 0) {
-						tcp_inflight_segment_t *seg =
-							&conn->inflight[0];
-						tcp_send_segment(
-							conn->dev,
-							conn->local_ip,
-							conn->remote_ip,
-							conn->local_port,
-							conn->remote_port,
-							seg->seq, conn->rcv_nxt,
-							seg->flags,
-							tcp_advertised_window(
-								conn),
-							seg->data, seg->len);
-						seg->retransmit_count++;
-						conn->total_retrans++;
-						NET_STATS_INC(
-							NET_MIB_TCP_RETRANSSEGS);
-					}
-				} else if (conn->dup_acks > 3) {
-					conn->cwnd++;
-				}
-			}
+			secs -= t;
+			t <<= 1;
 		}
-
-		/* A segment that starts before rcv_nxt and reaches past it
-		 * carries bytes we already have followed by bytes we do not:
-		 * the retransmission of a segment we could only partly store
-		 * (ring full), or one the peer re-segmented when it collapsed
-		 * small skbs for a retransmit.  It used to fall through to the
-		 * "already received" branch and be discarded whole, so the
-		 * peer -- which had already received the ACK for the prefix
-		 * -- re-sent the same tail at every backed-off RTO and got the
-		 * same dup-ACK back.  Trim the stale prefix and take the rest
-		 * in order (RFC 9293 §3.10.7.4 accepts any segment that
-		 * overlaps the window). */
-		if (payload_len > 0 && (int32_t)(seq - conn->rcv_nxt) < 0 &&
-		    (int32_t)(seq + payload_len - conn->rcv_nxt) > 0) {
-			uint32_t trim = conn->rcv_nxt - seq;
-			payload += trim;
-			payload_len = (uint16_t)(payload_len - trim);
-			seq = conn->rcv_nxt;
+		c->defer_accept = n;
+		break;
+	}
+	case TCP_LINGER2:
+		if (val < 0)
+			c->linger2_ms = -1;
+		else if (val == 0)
+			c->linger2_ms = 0;
+		else
+			c->linger2_ms = val > TCP_FIN_TIMEOUT_MS / 1000 ?
+						TCP_FIN_TIMEOUT_MS :
+						val * 1000;
+		break;
+	case TCP_SYNCNT:
+		if (val < 1 || val > 127)
+			rc = -EINVAL;
+		else
+			c->syn_retries = (uint8_t)val;
+		break;
+	case TCP_CONGESTION:
+		rc = tcp_set_congestion_control(c, val);
+		break;
+	case TCP_WINDOW_CLAMP:
+		if (val < 0) {
+			rc = -EINVAL;
+			break;
 		}
-
-		// Process data: in-order vs out-of-order
-		if (payload_len > 0) {
-			if (seq == conn->rcv_nxt) {
-				/* Bulk-copy into the rx ring (split at the wrap);
-				 * stores what fits, the peer resends the rest. */
-				uint32_t copy = tcp_rx_ring_store(conn, payload,
-								  payload_len);
-				conn->rcv_nxt += copy;
-				/* Only wake the reader when at least one byte was stored.
-                 * Setting rx_ready=1 with copy=0 (ring full, probe dropped)
-                 * causes sock_recv to return 0 — a false EOF to OpenSSL. */
-				if (copy > 0) {
-					/* Only fire the (expensive) sched_wake_channel scan
-                     * — which walks the entire task list under
-                     * g_task_list_lock IRQ-off — when rx_ready actually
-                     * transitions 0→1.  If the reader is already
-                     * scheduled / running, repeating the wake per
-                     * segment was burning 5-20 µs per packet under two
-                     * spinlocks for no observable benefit. */
-					int was_ready = conn->rx_ready;
-					conn->rx_ready = 1;
-					tcp_poll_notify(conn);
-					if (!was_ready)
-						sched_wake_channel(
-							(void *)&conn
-								->rx_ready);
-				}
-
-				/* Receive-buffer auto-tuning: if we just stored data into a
-                 * ring that's now > 50% full, peer is filling faster than
-                 * we drain.  Double the ring size (up to TCP_RX_BUF_MAX) so
-                 * the BDP-limited throughput ceiling (rx_buf / RTT) keeps
-                 * pace with the connection's actual demand.  Connections
-                 * that never fill the buffer keep the small initial size. */
-				uint32_t ring_used =
-					(conn->rx_tail - conn->rx_head +
-					 conn->rx_buf_size) %
-					conn->rx_buf_size;
-				if (ring_used * 2 > conn->rx_buf_size &&
-				    conn->rx_buf_size < TCP_RX_BUF_MAX) {
-					tcp_grow_rx_buf(conn);
-				}
-
-				/* Drain the reassembly queue.  A queued entry can
-				 * start BEFORE rcv_nxt: the peer re-segmented on
-				 * retransmit, or the in-order segment just stored
-				 * overlapped it.  The drain used to wait for an
-				 * exact seq match that never came, so the entry
-				 * pinned its slot for the life of the connection
-				 * and its bytes -- which the peer had seen SACKed
-				 * and would not resend until it detected reneging
-				 * -- were never delivered.  Trim the stale prefix
-				 * instead, and discard an entry lying entirely
-				 * behind rcv_nxt. */
-				int had_ooo = conn->ooo_count > 0;
-				int progress = 1;
-				while (progress && conn->ooo_count > 0) {
-					progress = 0;
-					for (uint8_t k = 0; k < conn->ooo_count;
-					     k++) {
-						tcp_ooo_segment_t *e =
-							&conn->ooo[k];
-						int32_t off = (int32_t)(
-							conn->rcv_nxt - e->seq);
-						if (off < 0)
-							continue; /* still ahead */
-						if (off < (int32_t)e->len) {
-							uint16_t l = (uint16_t)(
-								e->len - off);
-							uint32_t st =
-								tcp_rx_ring_store(
-									conn,
-									e->data +
-										off,
-									l);
-							conn->rcv_nxt += st;
-							if (st < l) {
-								/* Ring full (cannot
-								 * happen for data
-								 * inside the window
-								 * we advertised):
-								 * keep the rest
-								 * queued at its new
-								 * start. */
-								uint32_t skip =
-									(uint32_t)off +
-									st;
-								uint16_t rem =
-									(uint16_t)(l -
-										   st);
-								for (uint16_t j =
-									     0;
-								     j < rem;
-								     j++)
-									e->data[j] =
-										e->data[skip +
-											j];
-								e->seq +=
-									skip;
-								e->len = rem;
-								if (st == 0)
-									continue;
-								progress = 1;
-								break;
-							}
-						}
-						/* Consumed (or entirely stale):
-						 * remove this entry. */
-						for (uint8_t m = k + 1;
-						     m < conn->ooo_count; m++)
-							conn->ooo[m - 1] =
-								conn->ooo[m];
-						conn->ooo_count--;
-						progress = 1;
-						break;
-					}
-				}
-
-				/* Stretch-ACK: ACK every 4th segment instead of every 2nd
-                 * during sustained in-order bulk receive.  Each ACK fires
-                 * a full TX pipeline (skb_alloc × 2, NIC tx_lock + MMIO
-                 * doorbell, multiple mm_memcpys) HELD UNDER conn->lock,
-                 * which also blocks sock_recv on the user side from
-                 * draining the rx ring.  At 1000 pkt/s with ACK-every-2
-                 * that's 500 lock-held ACK builds/sec × ~40 µs each =
-                 * a hard ceiling of ~1.7 MB/s on single-CPU receive.
-                 * RFC 5681 §4.2 allows the stretch as long as the
-                 * delay is bounded by the delayed-ACK timer below.
-                 * OOO segments and PSH still force an immediate ACK to
-                 * avoid hurting interactive / handshake latency. */
-				conn->segs_since_ack++;
-				/* had_ooo: this segment filled (part of) a gap.
-				 * RFC 5681 §4.2 wants that ACKed at once -- the
-				 * peer is in loss recovery and its next move
-				 * waits on it.  The test used to look at
-				 * ooo_count AFTER the drain, so a retransmit
-				 * that closed the last hole was delay-ACKed. */
-				if (conn->segs_since_ack >= 4 ||
-				    conn->ooo_count > 0 || had_ooo ||
-				    (tcp_flags & TCP_PSH)) {
-					tcp_queue_ack_locked(conn);
-					ack_pending = 1;
-				} else if (!conn->delayed_ack_pending) {
-					conn->delayed_ack_pending = 1;
-					/* 40 ms — matches typical TCP_DELACK_MAX in modern
-                     * stacks.  200 ms (the previous value) compounds with
-                     * Nagle on the sending side and stalls TLS handshakes
-                     * by half a second per round-trip. */
-					conn->delayed_ack_deadline =
-						timer_ticks() +
-						timer_ms_to_ticks(40);
-				}
-			} else if ((int32_t)(seq - conn->rcv_nxt) > 0 &&
-				   payload_len <= TCP_MSS) {
-				// Out-of-order: insert sorted; a segment already
-				// covered by a queued entry is a duplicate.
-				// Partial overlaps are queued as-is and trimmed
-				// by the drain.
-				int dup = 0;
-				uint8_t pos = 0;
-				for (; pos < conn->ooo_count; pos++) {
-					uint32_t qs = conn->ooo[pos].seq;
-					uint32_t qe = qs + conn->ooo[pos].len;
-					if ((int32_t)(seq - qs) >= 0 &&
-					    (int32_t)((seq + payload_len) -
-						      qe) <= 0) {
-						dup = 1;
-						break;
-					}
-					if ((int32_t)(seq - qs) < 0)
-						break;
-				}
-				if (!dup && conn->ooo_count < TCP_MAX_OOO) {
-					for (uint8_t k = conn->ooo_count;
-					     k > pos; k--)
-						conn->ooo[k] = conn->ooo[k - 1];
-					conn->ooo[pos].seq = seq;
-					conn->ooo[pos].len = payload_len;
-					for (uint16_t j = 0; j < payload_len;
-					     j++)
-						conn->ooo[pos].data[j] =
-							payload[j];
-					conn->ooo_count++;
-				} else if (!dup) {
-					// Reassembly queue full: this future
-					// segment is dropped and must be
-					// retransmitted by the peer.
-					NET_STATS_INC(NET_MIB_TCP_OOOQUEUEFULL);
-				}
-				// Send immediate dup-ACK with SACK info (helps fast retransmit)
-				tcp_queue_ack_locked(conn);
-				ack_pending = 1;
-			} else {
-				// A future segment (seq > rcv_nxt) larger than
-				// one MSS falls here and is dropped — not a
-				// duplicate; only a retransmit recovers it.
-				if ((int32_t)(seq - conn->rcv_nxt) > 0)
-					NET_STATS_INC(NET_MIB_TCP_OOOOVERSIZE);
-				// Already-received data — duplicate ACK
-				tcp_queue_ack_locked(conn);
-				ack_pending = 1;
-			}
-		}
-
-		// Process FIN — only when it lands exactly in order (RFC 793:
-		// the FIN occupies the sequence position one past the last data
-		// byte).  Honoring an out-of-order FIN (earlier data still
-		// missing or only partially stored) would jump rcv_nxt over the
-		// hole — silently discarding the missing bytes, ACKing them as
-		// received, and turning the reader's recv() into a false EOF
-		// with truncated data.  Dup-ACK instead; the peer retransmits
-		// the hole and the FIN gets re-processed in order.
-		if (tcp_flags & TCP_FIN) {
-			if (seq + payload_len == conn->rcv_nxt) {
-				conn->rcv_nxt += 1;
-				conn->state = TCP_STATE_CLOSE_WAIT;
-				conn->rx_ready = 1; // Wake up reader (EOF)
-				tcp_poll_notify(conn);
-				sched_wake_channel((void *)&conn->rx_ready);
-			} else {
-				// Out-of-order FIN (a data hole precedes it):
-				// dup-ACK and wait for the retransmit rather than
-				// jumping rcv_nxt over the hole.  Counted.
-				NET_STATS_INC(NET_MIB_TCP_OOOFINREFUSED);
-			}
-			tcp_queue_ack_locked(conn);
-			ack_pending = 1;
+		if (val == 0) {
+			if (c->state != TCP_STATE_CLOSED)
+				rc = -EINVAL;
+			else
+				c->window_clamp = 0;
+		} else {
+			c->window_clamp = tcp_max32((uint32_t)val,
+						    TCP_MIN_MSS * 2u);
+			c->rcv_ssthresh = tcp_min32(c->rcv_ssthresh,
+						    c->window_clamp);
 		}
 		break;
+	default:
+		rc = -ENOPROTOOPT;
+		break;
+	}
+	tcp_lock_release(&c->lock, f);
+	return rc;
+}
 
+int tcp_getsockopt_int(tcp_conn_t *c, int optname, int *val)
+{
+	if (!c)
+		return -ENOTCONN;
+	switch (optname) {
+	case TCP_MAXSEG:
+		if (c->state == TCP_STATE_LISTEN ||
+		    c->state == TCP_STATE_CLOSED || !c->mss_cache)
+			*val = c->user_mss ? c->user_mss : TCP_MSS_DEFAULT;
+		else
+			*val = c->mss_cache;
+		return 0;
+	case TCP_QUICKACK:
+		*val = c->ack_quick && !c->ack_pingpong;
+		return 0;
+	case TCP_USER_TIMEOUT:
+		*val = (int)c->user_timeout_ms;
+		return 0;
+	case TCP_NOTSENT_LOWAT:
+		*val = (int)c->notsent_lowat;
+		return 0;
+	case TCP_DEFER_ACCEPT: {
+		uint32_t secs = 0, t = 1;
+
+		for (uint32_t i = 0; i < c->defer_accept; i++) {
+			secs += t;
+			t <<= 1;
+		}
+		*val = (int)secs;
+		return 0;
+	}
+	case TCP_LINGER2:
+		*val = c->linger2_ms < 0 ? -1 :
+		       c->linger2_ms	 ? c->linger2_ms / 1000 :
+					   TCP_FIN_TIMEOUT_MS / 1000;
+		return 0;
+	case TCP_SYNCNT:
+		*val = c->syn_retries ? c->syn_retries : TCP_SYN_RETRIES;
+		return 0;
+	case TCP_WINDOW_CLAMP:
+		*val = (int)c->window_clamp;
+		return 0;
+	case TCP_CONGESTION:
+		*val = tcp_ca_id(c);
+		return 0;
+	default:
+		return -ENOPROTOOPT;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TCP_INFO.
+// ---------------------------------------------------------------------------
+/* tcpi_state in the ABI's numbering (netinet/tcp.h: ESTABLISHED 1 ...
+ * CLOSING 11), not TCP_STATE_*. */
+static uint8_t tcp_info_state(int st)
+{
+	switch (st) {
+	case TCP_STATE_ESTABLISHED:
+		return 1;
+	case TCP_STATE_SYN_SENT:
+		return 2;
+	case TCP_STATE_SYN_RECEIVED:
+		return 3;
 	case TCP_STATE_FIN_WAIT_1:
-		// Half-close: consume in-order data (e.g. the peer's TLS
-		// close_notify) so its FIN lands exactly at rcv_nxt below.
-		if (payload_len > 0 && seq == conn->rcv_nxt) {
-			tcp_consume_data_half_closed(conn, payload,
-						     payload_len);
-			tcp_queue_ack_locked(conn);
-			ack_pending = 1;
-		}
-		if (tcp_flags & TCP_ACK) {
-			// Graceful close leaves the data the app wrote before
-			// close() still in flight; the peer keeps ACKing it as
-			// it arrives.  Those are PARTIAL (cumulative) ACKs
-			// (snd_una < ack < snd_nxt) — process them exactly like
-			// ESTABLISHED so the inflight queue drains and the
-			// retransmit timer tracks the peer's real gap.  Without
-			// this, snd_una freezes at close() time, inflight[0]
-			// never advances, the RTO timer resends the already-
-			// delivered head forever, retransmit_count never resets,
-			// and the conn is failed with the tail still unsent —
-			// the peer stalls mid-stream and times out (observed:
-			// TLS 64 KB echo, client got 32 KB then ETIMEDOUT).
-			if (ack > conn->snd_una && ack <= conn->snd_nxt) {
-				conn->snd_una = ack;
-				tcp_ack_inflight(conn, ack);
-				conn->retransmit_count = 0;
-				conn->retransmit_tick =
-					timer_ticks() + tcp_rto_ticks(conn);
-				conn->dup_acks = 0;
-			} else if (ack == conn->snd_una && payload_len == 0 &&
-				   conn->inflight_count > 0) {
-				// Fast retransmit on 3 dup-ACKs (mirror
-				// ESTABLISHED) so a gap recovers within an RTT
-				// instead of a full RTO backoff during close.
-				conn->dup_acks++;
-				if (conn->dup_acks == 3) {
-					tcp_inflight_segment_t *seg =
-						&conn->inflight[0];
-					tcp_send_segment(
-						conn->dev, conn->local_ip,
-						conn->remote_ip,
-						conn->local_port,
-						conn->remote_port, seg->seq,
-						conn->rcv_nxt, seg->flags,
-						tcp_advertised_window(conn),
-						seg->data, seg->len);
-					seg->retransmit_count++;
-					conn->total_retrans++;
-					NET_STATS_INC(NET_MIB_TCP_RETRANSSEGS);
-				}
-			}
-			if (ack == conn->snd_nxt) {
-				// Our FIN is now ACKed.  Same in-order FIN rule
-				// as ESTABLISHED: a peer FIN beyond rcv_nxt
-				// means data is still missing — don't jump the
-				// hole, dup-ACK and wait for the retransmit.
-				if ((tcp_flags & TCP_FIN) &&
-				    seq + payload_len == conn->rcv_nxt) {
-					conn->rcv_nxt += 1;
-					conn->state = TCP_STATE_TIME_WAIT;
-					conn->time_wait_tick =
-						timer_ticks() +
-						TCP_TIME_WAIT_TICKS;
-					tcp_queue_ack_locked(conn);
-					ack_pending = 1;
-					/* Peer FIN = EOF for a reader parked
-					 * through our half-close; data-less
-					 * FINs otherwise woke nobody. */
-					tcp_poll_notify(conn);
-					sched_wake_channel(
-						(void *)&conn->rx_ready);
-				} else {
-					conn->state = TCP_STATE_FIN_WAIT_2;
-					conn->fin_wait_2_deadline =
-						timer_ticks() +
-						timer_s_to_ticks(60);
-					// An out-of-order FIN (data hole still
-					// unfilled) just gets a dup-ACK; the
-					// peer retransmits and the FIN is
-					// re-processed in order in FIN_WAIT_2.
-					if (tcp_flags & TCP_FIN) {
-						tcp_queue_ack_locked(conn);
-						ack_pending = 1;
-					}
-				}
-			}
-		}
-		if ((tcp_flags & TCP_FIN) &&
-		    conn->state == TCP_STATE_FIN_WAIT_1) {
-			// In-order FIN only; an OOO FIN gets the dup-ACK and
-			// is re-processed once the peer fills the hole.
-			if (seq + payload_len == conn->rcv_nxt) {
-				conn->rcv_nxt += 1;
-				conn->state = TCP_STATE_CLOSING;
-				/* Same EOF wake as the TIME_WAIT arm. */
-				tcp_poll_notify(conn);
-				sched_wake_channel((void *)&conn->rx_ready);
-			}
-			tcp_queue_ack_locked(conn);
-			ack_pending = 1;
-		}
-		break;
-
+		return 4;
 	case TCP_STATE_FIN_WAIT_2:
-		// Half-close: consume in-order data (see FIN_WAIT_1).
-		if (payload_len > 0 && seq == conn->rcv_nxt)
-			tcp_consume_data_half_closed(conn, payload,
-						     payload_len);
-		if (tcp_flags & TCP_FIN) {
-			// In-order FIN only (see ESTABLISHED case).  An OOO
-			// FIN just gets the dup-ACK below; the peer
-			// retransmits the hole and the FIN is re-processed
-			// in order.
-			if (seq + payload_len == conn->rcv_nxt) {
-				conn->rcv_nxt += 1;
-				conn->state = TCP_STATE_TIME_WAIT;
-				conn->time_wait_tick =
-					timer_ticks() + TCP_TIME_WAIT_TICKS;
-				/* Same EOF wake as FIN_WAIT_1. */
-				tcp_poll_notify(conn);
-				sched_wake_channel((void *)&conn->rx_ready);
-			}
-		}
-		if (payload_len > 0 || (tcp_flags & TCP_FIN)) {
-			tcp_queue_ack_locked(conn);
-			ack_pending = 1;
-		}
-		break;
-
-	case TCP_STATE_CLOSE_WAIT:
-		// The peer half-closed (sent its FIN); our application may still
-		// be sending, and the peer keeps ACKing that data.  Without
-		// processing those ACKs here the inflight queue never drains, the
-		// RTO timer resends the already-delivered head forever, and the
-		// peer stalls (this case previously fell through to default and
-		// did nothing).  Update the send window and drain inflight on
-		// partial ACKs, mirroring the closing-state handlers.
-		conn->last_rx_tick = timer_ticks();
-		{
-			uint32_t scaled = (uint32_t)window;
-			if (conn->ws_enabled)
-				scaled <<= conn->snd_wscale;
-			conn->snd_wnd = scaled;
-			if (scaled > 0 && conn->persist_tick) {
-				conn->persist_tick = 0;
-				conn->tx_ready = 1;
-			}
-		}
-		if (tcp_flags & TCP_ACK) {
-			if (ack > conn->snd_una && ack <= conn->snd_nxt) {
-				conn->snd_una = ack;
-				tcp_ack_inflight(conn, ack);
-				conn->retransmit_count = 0;
-				conn->retransmit_tick =
-					timer_ticks() + tcp_rto_ticks(conn);
-				conn->dup_acks = 0;
-			} else if (ack == conn->snd_una && payload_len == 0 &&
-				   conn->inflight_count > 0) {
-				// 3-dup-ACK fast retransmit, same as the closing
-				// states, so a gap recovers within an RTT.
-				conn->dup_acks++;
-				if (conn->dup_acks == 3) {
-					tcp_inflight_segment_t *seg =
-						&conn->inflight[0];
-					tcp_send_segment(
-						conn->dev, conn->local_ip,
-						conn->remote_ip,
-						conn->local_port,
-						conn->remote_port, seg->seq,
-						conn->rcv_nxt, seg->flags,
-						tcp_advertised_window(conn),
-						seg->data, seg->len);
-					seg->retransmit_count++;
-					conn->total_retrans++;
-					NET_STATS_INC(NET_MIB_TCP_RETRANSSEGS);
-				}
-			}
-		}
-		// A retransmitted FIN (peer didn't see our ACK) just gets re-ACKed.
-		if (tcp_flags & TCP_FIN) {
-			tcp_queue_ack_locked(conn);
-			ack_pending = 1;
-		}
-		break;
-
-	case TCP_STATE_CLOSING:
-		if (tcp_flags & TCP_ACK) {
-			// Drain inflight on partial ACKs (see FIN_WAIT_1) so any
-			// data still unacked at simultaneous close is delivered
-			// and retransmit tracks the real gap.
-			if (ack > conn->snd_una && ack <= conn->snd_nxt) {
-				conn->snd_una = ack;
-				tcp_ack_inflight(conn, ack);
-				conn->retransmit_count = 0;
-				conn->retransmit_tick =
-					timer_ticks() + tcp_rto_ticks(conn);
-				conn->dup_acks = 0;
-			}
-			if (ack == conn->snd_nxt) {
-				conn->state = TCP_STATE_TIME_WAIT;
-				conn->time_wait_tick =
-					timer_ticks() + TCP_TIME_WAIT_TICKS;
-			}
-		}
-		break;
-
-	case TCP_STATE_LAST_ACK:
-		if (tcp_flags & TCP_ACK) {
-			// Drain inflight on partial ACKs (see FIN_WAIT_1): a
-			// server that read EOF, wrote a response, then close()d
-			// enters LAST_ACK with that response still in flight —
-			// it must be delivered before the conn is freed.
-			if (ack > conn->snd_una && ack <= conn->snd_nxt) {
-				conn->snd_una = ack;
-				tcp_ack_inflight(conn, ack);
-				conn->retransmit_count = 0;
-				conn->retransmit_tick =
-					timer_ticks() + tcp_rto_ticks(conn);
-				conn->dup_acks = 0;
-			}
-			if (ack == conn->snd_nxt) {
-				// Final ACK of our FIN — connection is done.
-				// Kill it (drop the protocol reference); freed
-				// once our transient reference is released.
-				tcp_conn_kill(conn);
-				tcp_lock_release(&conn->lock, flags);
-				tcp_conn_put(conn);
-				return;
-			}
-		}
-		break;
-
+		return 5;
 	case TCP_STATE_TIME_WAIT:
-		// Re-send ACK for any FIN
-		if (tcp_flags & TCP_FIN) {
-			tcp_queue_ack_locked(conn);
-			ack_pending = 1;
-			conn->time_wait_tick =
-				timer_ticks() + TCP_TIME_WAIT_TICKS;
-		}
-		break;
+		return 6;
+	case TCP_STATE_CLOSE_WAIT:
+		return 8;
+	case TCP_STATE_LAST_ACK:
+		return 9;
+	case TCP_STATE_LISTEN:
+		return 10;
+	case TCP_STATE_CLOSING:
+		return 11;
+	default:
+		return 7; // CLOSE
+	}
+}
 
+void tcp_fill_info(tcp_conn_t *c, struct tcp_info *info)
+{
+	uint64_t f, now;
+
+	if (!c || !info)
+		return;
+	mm_memset(info, 0, sizeof(*info));
+	tcp_lock_acquire(&c->lock, &f);
+	now = tcp_now();
+	info->tcpi_state = tcp_info_state(c->state);
+	info->tcpi_ca_state = c->ca_state;
+	info->tcpi_retransmits = c->retransmits;
+	info->tcpi_probes = c->probes_out;
+	info->tcpi_backoff = c->rto_backoff;
+	if (c->ts_enabled)
+		info->tcpi_options |= TCPI_OPT_TIMESTAMPS;
+	if (c->sack_ok)
+		info->tcpi_options |= TCPI_OPT_SACK;
+	if (c->ws_enabled)
+		info->tcpi_options |= TCPI_OPT_WSCALE;
+	if (c->ecn_flags & TCP_ECN_OK)
+		info->tcpi_options |= TCPI_OPT_ECN;
+	if (c->ecn_flags & TCP_ECN_SEEN)
+		info->tcpi_options |= TCPI_OPT_ECN_SEEN;
+	info->tcpi_snd_wscale_rcv_wscale =
+		(uint8_t)((c->snd_wscale & 0x0F) | ((c->rcv_wscale & 0x0F) << 4));
+	info->tcpi_pad0 = c->rate_app_limited ? 1 : 0;
+	{
+		// the RTO with its backoff
+		uint64_t rto = c->rto_us ? c->rto_us : TCP_RTO_INITIAL_US;
+
+		rto <<= c->rto_backoff > 16 ? 16 : c->rto_backoff;
+		info->tcpi_rto = (uint32_t)(rto > TCP_RTO_MAX_US ? TCP_RTO_MAX_US :
+								  rto);
+	}
+	info->tcpi_ato = (uint32_t)(tcp_ticks_to_ms(c->ack_ato) * 1000u);
+	info->tcpi_snd_mss = c->mss_cache;
+	info->tcpi_rcv_mss = c->rcv_mss;
+	info->tcpi_unacked = c->packets_out;
+	info->tcpi_sacked = c->sacked_out;
+	info->tcpi_lost = c->lost_out;
+	info->tcpi_retrans = c->retrans_out;
+	info->tcpi_last_data_sent =
+		c->lsndtime ? (uint32_t)tcp_ticks_to_ms(now - c->lsndtime) : 0;
+	info->tcpi_last_data_recv =
+		c->ack_lrcvtime ?
+			(uint32_t)tcp_ticks_to_ms(now - c->ack_lrcvtime) :
+			0;
+	info->tcpi_last_ack_recv =
+		(uint32_t)tcp_ticks_to_ms(now - c->last_rx_tick);
+	info->tcpi_pmtu = c->pmtu_cookie;
+	info->tcpi_rcv_ssthresh = c->rcv_ssthresh;
+	info->tcpi_rtt = c->srtt_us;
+	info->tcpi_rttvar = c->rttvar_us;
+	info->tcpi_snd_ssthresh = c->ssthresh;
+	info->tcpi_snd_cwnd = c->cwnd;
+	info->tcpi_advmss = c->advmss;
+	info->tcpi_reordering = c->reordering;
+	info->tcpi_rcv_rtt = c->rcv_rtt_est.rtt_us >> 3;
+	info->tcpi_rcv_space = c->rcvq_space.space;
+	info->tcpi_total_retrans = c->total_retrans;
+	info->tcpi_pacing_rate = c->pacing_rate ? c->pacing_rate : ~0ULL;
+	info->tcpi_max_pacing_rate = c->max_pacing_rate;
+	info->tcpi_bytes_acked = c->bytes_acked;
+	info->tcpi_bytes_received = c->bytes_received;
+	info->tcpi_segs_out = c->segs_out;
+	info->tcpi_segs_in = c->segs_in;
+	info->tcpi_notsent_bytes =
+		after(c->write_seq, c->snd_nxt) ? c->write_seq - c->snd_nxt : 0;
+	info->tcpi_min_rtt = tcp_min_rtt(c);
+	info->tcpi_data_segs_in = c->data_segs_in;
+	info->tcpi_data_segs_out = c->data_segs_out;
+	info->tcpi_delivery_rate = tcp_delivery_rate(c);
+	info->tcpi_delivered = c->delivered;
+	info->tcpi_delivered_ce = c->delivered_ce;
+	info->tcpi_bytes_sent = c->bytes_sent;
+	info->tcpi_bytes_retrans = c->bytes_retrans;
+	info->tcpi_dsack_dups = c->dsack_dups;
+	info->tcpi_reord_seen = c->reord_seen;
+	info->tcpi_rcv_ooopack = c->rcv_ooopack;
+	info->tcpi_snd_wnd = c->snd_wnd;
+	info->tcpi_rcv_wnd = c->rcv_wnd;
+	info->tcpi_total_rto = c->total_rto;
+	info->tcpi_total_rto_recoveries = c->total_rto_recoveries;
+	info->tcpi_total_rto_time = c->total_rto_time +
+				    (c->rto_stamp ? (uint32_t)tcp_ticks_to_ms(
+							    now - c->rto_stamp) :
+						    0);
+	tcp_lock_release(&c->lock, f);
+}
+
+// ---------------------------------------------------------------------------
+// ICMP and path MTU.
+// ---------------------------------------------------------------------------
+/* An ICMP error quoting one of our segments (RFC 1122 4.2.3.9, RFC 5927).
+ * An error quoting something we never sent -- outside snd_una..snd_nxt --
+ * is ignored.  During the handshake every error is final; on a
+ * synchronized connection none is: it becomes the soft error, which
+ * SO_ERROR reports and a retransmission timeout fails the connection
+ * with. */
+void tcp_icmp_error(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip,
+		    uint16_t remote_port, uint32_t seq, int err)
+{
+	struct tcp_skc *skc = tcp_lookup_established(local_ip, local_port,
+						     remote_ip, remote_port);
+	uint64_t f;
+
+	if (!skc)
+		return;
+	if (skc->skc_kind == TCP_SKC_REQ) {
+		struct tcp_request_sock *req = (struct tcp_request_sock *)skc;
+		tcp_conn_t *l = req->listener;
+
+		/* A half-open connection nobody holds yet: forget it when
+		 * the error quotes its SYN-ACK. */
+		tcp_lock_acquire(&l->lock, &f);
+		if (seq == req->iss && !req->dead && !req->completing)
+			tcp_reqsk_drop(req);
+		tcp_lock_release(&l->lock, f);
+		tcp_skc_put(skc);
+		return;
+	}
+	if (skc->skc_kind != TCP_SKC_FULL) {
+		tcp_skc_put(skc);
+		return;
+	}
+	tcp_conn_t *c = (tcp_conn_t *)skc;
+
+	tcp_lock_acquire(&c->lock, &f);
+	if (!tcp_seq_between(seq, c->snd_una, c->snd_nxt)) {
+		NET_STATS_INC(NET_MIB_TCP_OUTOFWINDOWICMPS);
+		goto out;
+	}
+	switch (c->state) {
+	case TCP_STATE_SYN_SENT:
+	case TCP_STATE_SYN_RECEIVED:
+		NET_STATS_INC(NET_MIB_TCP_ATTEMPTFAILS);
+		tcp_reset(c, err);
+		break;
+	case TCP_STATE_ESTABLISHED:
+	case TCP_STATE_FIN_WAIT_1:
+	case TCP_STATE_FIN_WAIT_2:
+	case TCP_STATE_CLOSE_WAIT:
+	case TCP_STATE_CLOSING:
+	case TCP_STATE_LAST_ACK:
+		c->soft_error = err;
+		break;
 	default:
 		break;
 	}
-
-deferred_ack_out:;
-	if (!tx_was_ready && conn->tx_ready)
-		tcp_poll_notify(conn);
-
-	/* Snapshot the deferred ACK params UNDER conn->lock, then release
-     * the lock, then transmit.  This removes the NIC TX (skb build +
-     * checksum + tx_lock + MMIO doorbell) from the conn->lock-held
-     * critical section, so sock_recv can drain the rx ring in parallel
-     * with the ACK going out. */
-	uint8_t snap_opts[TCP_MAX_OPTIONS];
-	uint8_t snap_olen = 0;
-	uint16_t snap_win = 0;
-	uint32_t snap_seq = 0;
-	uint32_t snap_ack = 0;
-	net_device_t *snap_dev = NULL;
-	uint32_t snap_lip = 0, snap_rip = 0;
-	uint16_t snap_lp = 0, snap_rp = 0;
-	if (ack_pending) {
-		snap_olen = tcp_build_options(conn, TCP_ACK, 0, snap_opts);
-		snap_win = tcp_advertised_window(conn);
-		snap_seq = conn->snd_nxt;
-		snap_ack = conn->rcv_nxt;
-		snap_dev = conn->dev;
-		snap_lip = conn->local_ip;
-		snap_rip = conn->remote_ip;
-		snap_lp = conn->local_port;
-		snap_rp = conn->remote_port;
-	}
-
-	tcp_lock_release(&conn->lock, flags);
-
-	if (ack_pending) {
-		tcp_send_segment_ex(snap_dev, snap_lip, snap_rip, snap_lp,
-				    snap_rp, snap_seq, snap_ack, TCP_ACK,
-				    snap_win, NULL, 0, snap_opts, snap_olen);
-	}
-
-	// Release the transient reference taken by tcp_find_conn_hold at entry.
-	tcp_conn_put(conn);
+out:
+	tcp_lock_release(&c->lock, f);
+	tcp_conn_put(c);
 }
 
-// ============================================================================
-// TCP Timer (called from net_timer_tick, ~100Hz)
-// ============================================================================
-//
-// IMPORTANT: tcp_timer_tick runs from the per-CPU timer IRQ (vector 32).  At
-// 100Hz on every CPU, multiple instances can race with each other AND with
-// sock_send/sock_recv/tcp_rx running on other CPUs.  Every per-conn body
-// below mutates fields (inflight[], snd_nxt, rcv_nxt, cwnd, state, ...) that
-// are also touched by the data path under conn->lock; we MUST take the same
-// lock here or we corrupt the inflight array (torn struct copies during
-// tcp_drop_first_inflight while tcp_queue_inflight writes the next slot),
-// build retransmit packets from half-shifted segments (wrong bytes for a
-// given seq → mysterious payload mismatches on the receiver), and free
-// conn->rx_buf out from under a concurrent sock_recv.
-void tcp_timer_tick(void)
+/* RFC 1191 / RFC 5927: "fragmentation needed" quoting segment `seq' of
+ * a connection, the next hop's MTU `info'.  Believed only when the quoted
+ * sequence is one we have outstanding (snd_una..snd_nxt) -- a forged
+ * report for some other sequence must not shrink the path; then the
+ * route's path MTU is lowered (the IP layer), and the connection sizes its
+ * segments for it and resends what was dropped.  Softirq context, no lock
+ * held. */
+void tcp_v4_mtu_report(uint32_t local_ip, uint16_t local_port,
+		       uint32_t remote_ip, uint16_t remote_port, uint32_t seq,
+		       uint32_t info)
 {
-	uint64_t now = timer_ticks();
+	struct tcp_skc *skc = tcp_lookup_established(local_ip, local_port,
+						     remote_ip, remote_port);
+	tcp_conn_t *c;
+	uint32_t pmtu;
+	uint64_t f;
+	int locked, ok;
 
-	// Walk the connection list holding a reference on each connection while
-	// it is processed — no fixed-size snapshot, so no cap on live
-	// connections.  Reference-counted safe traversal: keep the current
-	// connection held while finding and holding the next one, so the current
-	// node's list_next stays valid across the unlocked processing window.
-	// Runs in softirq context (net_timer_tick / SOFTIRQ_TCP_TIMER), so
-	// blocking on conn->lock and freeing via tcp_conn_put are both legal.
-	uint64_t lflags;
-	spin_lock_irqsave(&tcp_lock, &lflags);
-	tcp_conn_t *conn = g_tcp_conn_list;
-	while (conn && !tcp_conn_tryhold(conn))
-		conn = conn->list_next;
-	spin_unlock_irqrestore(&tcp_lock, lflags);
-
-	while (conn) {
-		uint64_t flags;
-		// Buffers to shed after releasing conn->lock (slab_free must not
-		// run under the lock — TLB-shootdown safety).
-		void *shed_rx = NULL, *shed_tx = NULL, *shed_if = NULL,
-		     *shed_ooo = NULL;
-		tcp_lock_acquire(&conn->lock, &flags);
-		/* The cork deadline and the SACK-covered-head drop below can
-		 * flip tx_ready 0->1; pollers waiting for POLLOUT need the
-		 * wake (see tcp_rx). */
-		int tx_was_ready = conn->tx_ready;
-
-		// Terminally-dead connections are reclaimed by reference counting
-		// (tcp_conn_kill drops the protocol reference; the connection is
-		// freed once no reference remains), so the timer no longer has any
-		// orphan-reaper clauses — it only drives deadlines.
-
-		// TIME_WAIT demotion: a connection in TIME_WAIT only re-ACKs a
-		// retransmitted FIN and blocks 4-tuple reuse for 2·MSL — it moves
-		// no data, so its ~512 KB of rx/tx/reassembly buffers are dead
-		// weight for up to 60 s.  Shed them here (captured under the lock,
-		// freed after release), keeping only the small connection record.
-		if (conn->state == TCP_STATE_TIME_WAIT && conn->rx_buf) {
-			shed_rx = conn->rx_buf;
-			shed_tx = conn->tx_buf;
-			shed_if = conn->inflight;
-			shed_ooo = conn->ooo;
-			conn->rx_buf = NULL;
-			conn->tx_buf = NULL;
-			conn->inflight = NULL;
-			conn->ooo = NULL;
-			conn->rx_buf_size = 0;
-			conn->tx_buf_size = 0;
-			conn->rx_head = conn->rx_tail = 0;
-			conn->inflight_count = 0;
-			conn->ooo_count = 0;
-		}
-
-		// TIME_WAIT expiry
-		if (conn->state == TCP_STATE_TIME_WAIT &&
-		    now >= conn->time_wait_tick) {
-			tcp_conn_kill(conn);
-			goto unlock_conn;
-		}
-
-		// FIN_WAIT_2 timeout (RFC 1122 SHOULD discard after a while)
-		if (conn->state == TCP_STATE_FIN_WAIT_2 &&
-		    conn->fin_wait_2_deadline &&
-		    now >= conn->fin_wait_2_deadline) {
-			tcp_conn_kill(conn);
-			goto unlock_conn;
-		}
-
-		// Delayed ACK fire
-		if (conn->state == TCP_STATE_ESTABLISHED &&
-		    conn->delayed_ack_pending &&
-		    now >= conn->delayed_ack_deadline) {
-			tcp_send_ack(conn);
-		}
-
-		/* Idle timeout for the CLOSING states only.
-		 *
-		 * Since retransmit_count only advances on transmits that
-		 * actually left the machine, a FIN_WAIT_1/CLOSING/LAST_ACK conn
-		 * whose sends keep failing locally (skb exhaustion) would
-		 * otherwise hold its slot forever.  Those states are supposed to
-		 * be transient, so a deadline on them is right.
-		 *
-		 * ESTABLISHED is deliberately NOT here.  An established
-		 * connection that carries no data is not a broken one -- TCP has
-		 * no requirement that anything ever be sent, and an interactive
-		 * session spends almost all of its life exactly like that.  This
-		 * used to cover ESTABLISHED as a slow-loris defence and killed
-		 * every idle login after five minutes: an ssh session left
-		 * untouched died with ETIMEDOUT, which is indistinguishable from
-		 * the network having failed.
-		 *
-		 * Detecting a peer that really has gone away is what SO_KEEPALIVE
-		 * is for, and it is implemented below: probes after an idle
-		 * period, and the connection fails only when they go unanswered.
-		 * That distinguishes "quiet" from "gone", which a timer on
-		 * silence alone cannot do. */
-		if ((conn->state == TCP_STATE_FIN_WAIT_1 ||
-		     conn->state == TCP_STATE_CLOSING ||
-		     conn->state == TCP_STATE_LAST_ACK) &&
-		    conn->last_rx_tick != 0 &&
-		    (now - conn->last_rx_tick) >
-			    timer_s_to_ticks(TCP_IDLE_TIMEOUT_SECS)) {
-			tcp_fail_connection(conn, ETIMEDOUT);
-			goto unlock_conn;
-		}
-
-		// TCP_CORK deadline — wake send path by clearing tx_ready oscillation
-		if (conn->cork && conn->cork_deadline &&
-		    now >= conn->cork_deadline) {
-			conn->cork_deadline = 0;
-			conn->tx_ready = 1;
-		}
-
-		/* A send that failed locally armed this (tcp_send_data): give
-		 * the writer its POLLOUT back now that the drop's cause has
-		 * had a tick to clear.  The 0->1 flip is notified at
-		 * unlock_conn like the cork case above. */
-		if (conn->tx_retry_tick && now >= conn->tx_retry_tick) {
-			conn->tx_retry_tick = 0;
-			conn->tx_ready = 1;
-		}
-
-		/* Invariant: ESTABLISHED, nothing in flight, peer window open,
-		 * no persist, cork or retry timer armed -- writable.  Every
-		 * path that clears tx_ready is one of those four conditions,
-		 * so a connection found like this slipped through a hole and
-		 * its writer is parked on POLLOUT with nobody left to wake it
-		 * (seen: a browser network process stuck for good in a
-		 * synchronous TLS close on such a socket).  Reopen it. */
-		if (conn->state == TCP_STATE_ESTABLISHED && !conn->tx_ready &&
-		    conn->inflight_count == 0 && conn->snd_wnd > 0 &&
-		    conn->persist_tick == 0 && conn->tx_retry_tick == 0 &&
-		    conn->cork_deadline == 0)
-			conn->tx_ready = 1;
-
-		// Retransmission timeout
-		if (conn->state == TCP_STATE_SYN_SENT &&
-		    now >= conn->retransmit_tick) {
-			if (conn->retransmit_count >= TCP_MAX_RETRANSMITS ||
-			    (conn->handshake_deadline &&
-			     now >= conn->handshake_deadline)) {
-				tcp_fail_connection(conn, ETIMEDOUT);
-				goto unlock_conn;
-			}
-			// Retransmit SYN.  A local send failure (skb pool empty
-			// under load) is not network loss: retry quickly without
-			// consuming the attempt budget.  handshake_deadline
-			// bounds the total time either way.
-			if (tcp_send_syn_packet(conn->dev, conn->local_ip,
-						conn->remote_ip,
-						conn->local_port,
-						conn->remote_port, conn->iss, 0,
-						TCP_SYN, TCP_SYN_WINDOW,
-						conn) >= 0) {
-				conn->retransmit_count++;
-				conn->retransmit_tick =
-					now + TCP_SYN_RETRANSMIT_TICKS;
-			} else {
-				conn->retransmit_tick =
-					now + TCP_LOCAL_DROP_RETRY_TICKS;
-			}
-		}
-
-		// SYN+ACK retransmit for half-open server-side connections.  The
-		// SYN_RECEIVED state has no other timer in this stack, so a lost
-		// client ACK (NIC drop, slab pressure, scheduler-induced softirq
-		// starvation under teststress) would otherwise leave the slot
-		// wedged forever — the listener never sees it in its accept_queue
-		// (enqueue happens on transition to ESTABLISHED) and accept()
-		// hangs forever.  Resend the SYN+ACK up to TCP_MAX_RETRANSMITS,
-		// then drop the slot so a fresh handshake from the same peer can
-		// allocate a clean conn instead of finding the old SYN_RECEIVED
-		// and being silently dropped by tcp_find_conn (which excludes
-		// LISTEN but happily returns SYN_RECEIVED).
-		if (conn->state == TCP_STATE_SYN_RECEIVED &&
-		    conn->retransmit_tick && now >= conn->retransmit_tick) {
-			if (conn->retransmit_count >= TCP_MAX_RETRANSMITS ||
-			    (conn->handshake_deadline &&
-			     now >= conn->handshake_deadline)) {
-				/* A half-open server conn whose 3-way handshake
-				 * never completed (the client's ACK never
-				 * arrived).  Drop it — a blocking accept() on this
-				 * listener sees nothing and times out.  Counted as
-				 * a failed connection attempt. */
-				NET_STATS_INC(NET_MIB_TCP_ATTEMPTFAILS);
-				tcp_conn_kill(conn);
-				goto unlock_conn;
-			}
-			// Same local-drop rule as SYN_SENT: only transmits that
-			// actually left the machine consume the attempt budget.
-			if (tcp_send_synack_conn(conn, tcp_syn_window(conn)) >=
-			    0) {
-				conn->retransmit_count++;
-				conn->retransmit_tick =
-					now + TCP_SYN_RETRANSMIT_TICKS;
-			} else {
-				conn->retransmit_tick =
-					now + TCP_LOCAL_DROP_RETRY_TICKS;
-			}
-		}
-
-		if ((conn->state == TCP_STATE_ESTABLISHED ||
-		     conn->state == TCP_STATE_FIN_WAIT_1 ||
-		     conn->state == TCP_STATE_LAST_ACK ||
-		     conn->state == TCP_STATE_CLOSING) &&
-		    conn->inflight_count > 0 && now >= conn->retransmit_tick) {
-			// Give-up budget.  The short limit is meant for closing
-			// conns that only have control (a FIN) left to get
-			// ACKed — nobody is waiting on payload, and the slot
-			// shouldn't be pinned long under stress.  BUT a graceful
-			// close (application wrote data then close()d) leaves
-			// real DATA queued in FIN_WAIT_1/LAST_ACK/CLOSING that
-			// the PEER IS STILL READING: close() must deliver it.
-			// Using the short limit there drops that data after ~6 s
-			// of backoff and frees the conn out from under the peer
-			// (observed: TLS 64 KB echo delivered only 48 KB, then
-			// the receiver timed out with the server conn already
-			// gone).  So: if the oldest unacked segment carries
-			// payload, use the full DATA budget regardless of
-			// state; only a pure-control (FIN, len==0) head gets the
-			// short limit.
-			int head_has_data = conn->inflight[0].len > 0;
-			uint32_t retrans_limit =
-				(conn->state == TCP_STATE_ESTABLISHED ||
-				 head_has_data) ?
-					TCP_MAX_DATA_RETRANSMITS :
-					TCP_MAX_RETRANSMITS;
-			if (conn->retransmit_count >= retrans_limit) {
-				tcp_fail_connection(conn, ETIMEDOUT);
-				goto unlock_conn;
-			}
-
-			tcp_inflight_segment_t *seg = &conn->inflight[0];
-			// Skip retransmission for segments fully covered by a SACK block
-			if (conn->sack_ok && conn->sack_block_count > 0) {
-				uint32_t s_start = seg->seq;
-				uint32_t s_end = seg->seq + seg->len;
-				for (uint8_t b = 0; b < conn->sack_block_count;
-				     b++) {
-					if ((int32_t)(conn->sack_blocks[b]
-							      .left -
-						      s_start) <= 0 &&
-					    (int32_t)(conn->sack_blocks[b]
-							      .right -
-						      s_end) >= 0) {
-						// Already SACKed — drop from inflight head and skip retx
-						tcp_drop_first_inflight(conn);
-						seg = NULL;
-						break;
-					}
-				}
-			}
-			// A failed transmit here is a local drop (skb pool
-			// exhausted under load), not evidence the network lost
-			// the segment: it must consume neither the give-up
-			// budget nor trigger the congestion penalty, or memory
-			// pressure alone can kill a healthy connection without
-			// a single packet reaching the peer.  Retry quickly —
-			// the pool drains within milliseconds.
-			if (seg &&
-			    tcp_send_segment(conn->dev, conn->local_ip,
-					     conn->remote_ip, conn->local_port,
-					     conn->remote_port, seg->seq,
-					     conn->rcv_nxt, seg->flags,
-					     tcp_advertised_window(conn),
-					     seg->data, seg->len) < 0) {
-				conn->retransmit_tick =
-					now + TCP_LOCAL_DROP_RETRY_TICKS;
-			} else {
-				if (seg) {
-					// RFC 6298: on RTO, ssthresh =
-					// max(flightsize/2, 2*MSS), cwnd = 1.
-					// Karn: don't sample RTT on
-					// retransmits.  Exponential backoff.
-					uint32_t flight = conn->inflight_count;
-					conn->ssthresh =
-						flight > 2 ? flight / 2 : 2;
-					conn->cwnd = 1;
-					conn->dup_acks = 0;
-					conn->rto_backoff++;
-					seg->retransmit_count++;
-					seg->send_us =
-						0; // invalidate RTT sample for retransmitted seg
-					conn->retransmit_count++;
-					conn->total_retrans++;
-					NET_STATS_INC(NET_MIB_TCP_RETRANSSEGS);
-				}
-				conn->retransmit_tick =
-					now + tcp_rto_ticks(conn);
-			}
-		}
-
-		// SO_KEEPALIVE: send 0-byte probe at seq=snd_una-1 after idle.
-		if (conn->keepalive && conn->state == TCP_STATE_ESTABLISHED &&
-		    conn->inflight_count == 0) {
-			uint64_t idle = now - conn->last_rx_tick;
-			if (conn->keep_probes_sent == 0 &&
-			    idle >= conn->keepidle_ticks) {
-				tcp_send_segment(
-					conn->dev, conn->local_ip,
-					conn->remote_ip, conn->local_port,
-					conn->remote_port, conn->snd_una - 1,
-					conn->rcv_nxt, TCP_ACK,
-					tcp_advertised_window(conn), NULL, 0);
-				conn->keep_probes_sent = 1;
-				conn->keep_next_tick =
-					now + conn->keepintvl_ticks;
-			} else if (conn->keep_probes_sent > 0 &&
-				   now >= conn->keep_next_tick) {
-				if (conn->keep_probes_sent >= conn->keepcnt) {
-					tcp_fail_connection(conn, ETIMEDOUT);
-					goto unlock_conn;
-				}
-				tcp_send_segment(
-					conn->dev, conn->local_ip,
-					conn->remote_ip, conn->local_port,
-					conn->remote_port, conn->snd_una - 1,
-					conn->rcv_nxt, TCP_ACK,
-					tcp_advertised_window(conn), NULL, 0);
-				conn->keep_probes_sent++;
-				conn->keep_next_tick =
-					now + conn->keepintvl_ticks;
-			}
-		}
-
-		// Zero-window persist probe (RFC 1122 §4.2.2.17).  Armed by
-		// tcp_send_data when a send stalls on a closed peer window with
-		// nothing in flight.  Send a 1-octet-back probe (seq snd_una-1)
-		// to force the peer to re-advertise its window; back off
-		// exponentially to the ceiling.  Disarmed the moment the window
-		// reopens (see the ACK-processing paths that clear persist_tick).
-		if (conn->persist_tick && now >= conn->persist_tick &&
-		    conn->snd_wnd == 0 && conn->inflight_count == 0 &&
-		    (conn->state == TCP_STATE_ESTABLISHED ||
-		     conn->state == TCP_STATE_CLOSE_WAIT)) {
-			tcp_send_segment(conn->dev, conn->local_ip,
-					 conn->remote_ip, conn->local_port,
-					 conn->remote_port, conn->snd_una - 1,
-					 conn->rcv_nxt, TCP_ACK,
-					 tcp_advertised_window(conn), NULL, 0);
-			NET_STATS_INC(NET_MIB_TCP_PERSISTPROBES);
-			if (conn->persist_backoff < 7)
-				conn->persist_backoff++;
-			uint64_t interval = (uint64_t)TCP_PERSIST_MIN_TICKS
-					    << conn->persist_backoff;
-			if (interval > TCP_PERSIST_MAX_TICKS)
-				interval = TCP_PERSIST_MAX_TICKS;
-			conn->persist_tick = now + interval;
-		}
-
-unlock_conn:
-		if (!tx_was_ready && conn->tx_ready)
-			tcp_poll_notify(conn);
-		tcp_lock_release(&conn->lock, flags);
-
-		// Free any shed TIME_WAIT buffers now that conn->lock is dropped.
-		if (shed_rx)
-			slab_free(shed_rx);
-		if (shed_tx)
-			slab_free(shed_tx);
-		if (shed_if)
-			slab_free(shed_if);
-		if (shed_ooo)
-			slab_free(shed_ooo);
-
-		// Advance: find and hold the next connection while still holding
-		// `conn` (so conn->list_next is valid), then drop `conn`.  If the
-		// drop was the last reference, the connection is queued for free.
-		spin_lock_irqsave(&tcp_lock, &lflags);
-		tcp_conn_t *next = conn->list_next;
-		while (next && !tcp_conn_tryhold(next))
-			next = next->list_next;
-		spin_unlock_irqrestore(&tcp_lock, lflags);
-		tcp_conn_put(conn);
-		conn = next;
-	}
-}
-
-// Snapshot the connection table for netstat (SYS_NET_GETINFO).  Best-effort
-// lock-free walk (a torn read at worst garbles one row).
-int net_get_tcp_connections(net_tcp_info_t *entries, int max_entries)
-{
-	int count = 0;
-	for (tcp_conn_t *c = g_tcp_conn_list; c && count < max_entries;
-	     c = c->list_next) {
-		if (!c->active)
-			continue;
-		entries[count].local_ip = c->local_ip;
-		entries[count].local_port = c->local_port;
-		entries[count].remote_ip = c->remote_ip;
-		entries[count].remote_port = c->remote_port;
-		entries[count].state = c->state;
-		uint32_t rx_used = 0;
-		if (c->rx_buf) {
-			if (c->rx_tail >= c->rx_head)
-				rx_used = c->rx_tail - c->rx_head;
-			else
-				rx_used = c->rx_buf_size - c->rx_head +
-					  c->rx_tail;
-		}
-		entries[count].rx_queue = rx_used;
-		uint32_t tx_used = 0;
-		if (c->inflight) {
-			for (uint8_t seg = 0; seg < c->inflight_count; seg++) {
-				tx_used += c->inflight[seg].len;
-				if (c->inflight[seg].flags &
-				    (TCP_SYN | TCP_FIN))
-					tx_used++;
-			}
-		}
-		entries[count].tx_queue = tx_used;
-		count++;
-	}
-	return count;
-}
-
-// ============================================================================
-// TCP_INFO sockopt — fill struct tcp_info from a connection's runtime state.
-// ============================================================================
-void tcp_fill_info(tcp_conn_t *conn, struct tcp_info *info)
-{
-	if (!conn || !info)
+	if (!skc)
 		return;
-	for (size_t i = 0; i < sizeof(*info); i++)
-		((uint8_t *)info)[i] = 0;
-
-	info->tcpi_state = (uint8_t)conn->state;
-	info->tcpi_ca_state = (conn->dup_acks >= 3) ? 3 /* recovery */ : 0;
-	info->tcpi_retransmits = (uint8_t)conn->retransmit_count;
-	info->tcpi_backoff = conn->rto_backoff;
-	info->tcpi_options = 0;
-	if (conn->ts_enabled)
-		info->tcpi_options |= 1; // TIMESTAMPS
-	if (conn->sack_ok)
-		info->tcpi_options |= 2; // SACK
-	if (conn->ws_enabled)
-		info->tcpi_options |= 4; // WSCALE
-	info->tcpi_snd_wscale_rcv_wscale =
-		(uint8_t)((conn->snd_wscale & 0x0F) |
-			  ((conn->rcv_wscale & 0x0F) << 4));
-	info->tcpi_rto = conn->rto_us ? conn->rto_us : TCP_RTO_INITIAL_US;
-	info->tcpi_ato = 40000;
-	info->tcpi_snd_mss = conn->max_seg_size ? conn->max_seg_size : TCP_MSS;
-	info->tcpi_rcv_mss = conn->peer_mss ? conn->peer_mss : TCP_MSS;
-	info->tcpi_unacked = conn->inflight_count;
-	info->tcpi_sacked = 0;
-	info->tcpi_lost = 0;
-	info->tcpi_retrans = conn->retransmit_count;
-	info->tcpi_pmtu = conn->dev ? conn->dev->mtu : NET_MTU_DEFAULT;
-	info->tcpi_rtt = conn->srtt_us;
-	info->tcpi_rttvar = conn->rttvar_us;
-	info->tcpi_snd_ssthresh = conn->ssthresh;
-	info->tcpi_snd_cwnd = conn->cwnd;
-	info->tcpi_advmss = conn->max_seg_size ? conn->max_seg_size : TCP_MSS;
-	info->tcpi_reordering = 3;
-	info->tcpi_rcv_space = conn->rx_buf_size;
-	info->tcpi_total_retrans = conn->total_retrans;
-}
-
-// ============================================================================
-// RFC 6093 / 793 — Urgent (OOB) send: emit a single byte with URG=1.
-// ============================================================================
-int tcp_send_oob(tcp_conn_t *conn, uint8_t byte)
-{
-	if (!conn || conn->state != TCP_STATE_ESTABLISHED)
-		return -1;
-	uint64_t flags;
-	tcp_lock_acquire(&conn->lock, &flags);
-
-	// Build TCP packet manually since urgent_ptr is in header
-	uint8_t opts[TCP_MAX_OPTIONS];
-	uint8_t olen =
-		tcp_build_options(conn, TCP_ACK | TCP_URG | TCP_PSH, 0, opts);
-
-	// Use tcp_send_segment_ex with manual urgent_ptr override — but our helper
-	// does not expose it. Send a one-byte payload with URG flag and rely on
-	// the receiver tracking urgent pointer = seq+1 via raw header field.
-	// For simplicity: send via segment_ex then patch checksum is too much; use
-	// a small inline path.
-
-	// Build packet
-	uint16_t tcp_len = (uint16_t)(sizeof(tcp_header_t) + olen + 1);
-	uint8_t pkt[sizeof(tcp_header_t) + TCP_MAX_OPTIONS + 1];
-	tcp_header_t *tcp = (tcp_header_t *)pkt;
-	tcp->src_port = net_htons(conn->local_port);
-	tcp->dst_port = net_htons(conn->remote_port);
-	tcp->seq_num = net_htonl(conn->snd_nxt);
-	tcp->ack_num = net_htonl(conn->rcv_nxt);
-	tcp->data_offset = (uint8_t)(((sizeof(tcp_header_t) + olen) / 4) << 4);
-	tcp->flags = TCP_ACK | TCP_URG | TCP_PSH;
-	tcp->window = net_htons(tcp_advertised_window(conn));
-	tcp->checksum = 0;
-	tcp->urgent_ptr = net_htons(1); // points one past last urgent byte
-	for (uint8_t i = 0; i < olen; i++)
-		pkt[sizeof(tcp_header_t) + i] = opts[i];
-	pkt[sizeof(tcp_header_t) + olen] = byte;
-
-	// Pseudo-header checksum
-	uint8_t pseudo[12 + sizeof(tcp_header_t) + TCP_MAX_OPTIONS + 1];
-	uint32_t s = net_htonl(conn->local_ip);
-	uint32_t d = net_htonl(conn->remote_ip);
-	pseudo[0] = (s >> 24) & 0xFF;
-	pseudo[1] = (s >> 16) & 0xFF;
-	pseudo[2] = (s >> 8) & 0xFF;
-	pseudo[3] = s & 0xFF;
-	pseudo[4] = (d >> 24) & 0xFF;
-	pseudo[5] = (d >> 16) & 0xFF;
-	pseudo[6] = (d >> 8) & 0xFF;
-	pseudo[7] = d & 0xFF;
-	pseudo[8] = 0;
-	pseudo[9] = IP_PROTO_TCP;
-	pseudo[10] = (tcp_len >> 8) & 0xFF;
-	pseudo[11] = tcp_len & 0xFF;
-	for (uint16_t i = 0; i < tcp_len; i++)
-		pseudo[12 + i] = pkt[i];
-	tcp->checksum = ipv4_checksum(pseudo, (uint16_t)(12 + tcp_len));
-
-	int rv = ipv4_send(conn->dev, conn->remote_ip, IP_PROTO_TCP, pkt,
-			   tcp_len);
-	if (rv == 0) {
-		conn->snd_up = conn->snd_nxt + 1;
-		conn->snd_nxt += 1;
-		tcp_queue_inflight(conn, conn->snd_nxt - 1,
-				   TCP_ACK | TCP_URG | TCP_PSH, &byte, 1);
+	if (skc->skc_kind != TCP_SKC_FULL) {
+		tcp_skc_put(skc);
+		return;
 	}
-	tcp_lock_release(&conn->lock, flags);
-	return rv;
-}
-
-// SIOCATMARK equivalent: returns 1 when next byte to read is the urgent mark.
-int tcp_at_mark(tcp_conn_t *conn)
-{
-	if (!conn)
-		return 0;
-	return (conn->rcv_nxt == conn->rcv_up) ? 1 : 0;
-}
-
-// On-demand connection-table snapshot for the Ctrl+N debug dump.
-// Lock-free best-effort read — values may tear, but this is purely
-// diagnostic and never used for correctness.
-/* Is `port` (host order) the local port of ANY connection still in the
- * table -- TIME_WAIT and the other closing states included?
- *
- * The ephemeral-port allocator scans SOCKETS, but a connection outlives its
- * socket: close() frees the socket slot while the conn walks FIN_WAIT/
- * TIME_WAIT for up to a minute, its 4-tuple still live in this table.
- * Handing that port to a new socket that then connects to the SAME remote
- * (a browser reconnecting to the same host does this constantly) collides
- * the new handshake with the old conn -- the SYN is answered out of the
- * dying connection's state and the client sees the handshake fail with
- * RST/broken pipe.  The allocator now asks this table too. */
-/* Is this exact 4-tuple live?  What a connecting socket needs to know, and
- * a hash lookup rather than a scan -- see the note above g_tcp_ehash.
- *
- * The connection this asks about may be in TIME_WAIT, which is the point:
- * reusing a 4-tuple whose previous connection is still winding down lets
- * the old connection's late packets land on the new one.  Reusing the
- * local PORT toward a different peer is fine and is what keeps the
- * ephemeral range from running out. */
-int tcp_4tuple_in_use(uint32_t local_ip, uint16_t local_port,
-		      uint32_t remote_ip, uint16_t remote_port)
-{
-	uint64_t flags;
-	int used = 0;
-	uint32_t b = tcp_ehash_key(local_port, remote_ip, remote_port);
-
-	spin_lock_irqsave(&tcp_lock, &flags);
-	for (tcp_conn_t *c = g_tcp_ehash[b]; c; c = c->hash_next) {
-		if (c->active && c->state != TCP_STATE_LISTEN &&
-		    c->state != TCP_STATE_CLOSED &&
-		    c->local_port == local_port &&
-		    c->remote_port == remote_port &&
-		    c->remote_ip == remote_ip &&
-		    (c->local_ip == local_ip || c->local_ip == 0 ||
-		     local_ip == 0)) {
-			used = 1;
-			break;
+	c = (tcp_conn_t *)skc;
+	tcp_lock_acquire(&c->lock, &f);
+	ok = c->state != TCP_STATE_LISTEN && c->state != TCP_STATE_CLOSED &&
+	     tcp_seq_between(seq, c->snd_una, c->snd_nxt);
+	if (!ok && c->state != TCP_STATE_LISTEN && c->state != TCP_STATE_CLOSED)
+		NET_STATS_INC(NET_MIB_TCP_OUTOFWINDOWICMPS);
+	tcp_lock_release(&c->lock, f);
+	/* The route's exception is made without the socket lock (the IP
+	 * layer's locks are not leaves of it). */
+	if (ok) {
+		pmtu = ip_update_pmtu(remote_ip, info, &locked);
+		if (pmtu) {
+			tcp_lock_acquire(&c->lock, &f);
+			tcp_mtu_reduced(c, pmtu);
+			tcp_lock_release(&c->lock, f);
 		}
 	}
-	spin_unlock_irqrestore(&tcp_lock, flags);
-	return used;
+	tcp_conn_put(c);
 }
 
-int tcp_local_port_in_use(uint16_t port)
+// ---------------------------------------------------------------------------
+// Diagnostics.
+// ---------------------------------------------------------------------------
+uint32_t tcp_full_sock_count(void)
 {
-	uint64_t flags;
-	int used = 0;
-
-	spin_lock_irqsave(&tcp_lock, &flags);
-	for (tcp_conn_t *c = g_tcp_conn_list; c; c = c->list_next) {
-		if (c->active && c->local_port == port &&
-		    c->state != TCP_STATE_LISTEN) {
-			used = 1;
-			break;
-		}
-	}
-	spin_unlock_irqrestore(&tcp_lock, flags);
-	return used;
+	return __atomic_load_n(&g_conn_count, __ATOMIC_RELAXED);
 }
 
 void tcp_dump_table(struct tty *tty)
 {
-	static const char *sn[] = { "CLOSED",  "LISTEN",  "SYN_SNT", "SYN_RCV",
-				    "ESTAB",   "FIN_W1",  "FIN_W2",  "CLS_WT",
-				    "CLOSING", "LST_ACK", "TM_WAIT" };
-	tty_printf(tty, "=== TCP table ===\n");
-	/* Field legend:
-     *   rc/tr      = retransmit_count / total_retrans (cumulative)
-     *   cw/ss      = our cwnd / ssthresh (segments)
-     *   if         = our inflight segments (send side)
-     *   snd_wnd    = peer's advertised window to us (bytes)
-     *   rcv_buf    = current rx ring size (auto-tuned)
-     *   rcv_adv    = bytes of OUR rx-buf free space (= peer's effective window after WSCALE)
-     *   ws=R/S     = rcv/snd window-scale shift (0/0 caps window at 65535)
-     *   srtt/rto   = smoothed RTT / current RTO (microseconds) */
-	tty_printf(
-		tty,
-		"slot st       laddr:lport            raddr:rport       p= ar rc tr cw ss if snd_wnd rcv_buf rcv_adv ws ts sack srtt rto rnxt-snxt-suna\n");
-	int i = 0;
-	uint64_t now = timer_ticks();
-	// Best-effort lock-free walk (diagnostic): a torn read at worst
-	// garbles one line.
-	for (tcp_conn_t *c = g_tcp_conn_list; c; c = c->list_next, i++) {
-		if (!c->active)
-			continue;
-		/* idle = time since the last segment from the peer; bo = RTO
-		 * backoff exponent; da = dup-ACKs counted; dack = delayed ACK
-		 * armed; adv = free bytes at our last advertisement; pers =
-		 * zero-window persist probe armed. */
-		uint64_t idle_ms = (c->last_rx_tick && now > c->last_rx_tick) ?
-					   (now - c->last_rx_tick) *
-						   timer_us_per_tick() / 1000 :
-					   0;
-		const char *s = (c->state <= TCP_STATE_TIME_WAIT) ?
-					sn[c->state] :
-					"???";
-		uint32_t li = c->local_ip, ri = c->remote_ip;
-		int parent_slot = c->parent ? 1 : -1;
-		// rx_buf_size is 0 for a TIME_WAIT connection whose buffers were
-		// shed — avoid the modulo-by-zero.
-		uint32_t used = c->rx_buf_size ?
-					((c->rx_tail - c->rx_head +
-					  c->rx_buf_size) %
-					 c->rx_buf_size) :
-					0;
-		uint32_t free_b = c->rx_buf_size - used;
-		tty_printf(
-			tty,
-			"%3d %-7s %u.%u.%u.%u:%u %u.%u.%u.%u:%u p=%d ar=%u rc=%u tr=%u cw=%u ss=%u if=%u snd_wnd=%u rcv_buf=%u rcv_adv=%u ws=%d/%d ts=%d sack=%d srtt=%u rto=%u rnxt=%u snxt=%u suna=%u rxh=%u rxt=%u rxrdy=%d used=%u ooo=%u txrdy=%d idle=%llums bo=%u da=%u dack=%d adv=%u pers=%d\n",
-			i, s, (li >> 24) & 0xff, (li >> 16) & 0xff,
-			(li >> 8) & 0xff, li & 0xff, c->local_port,
-			(ri >> 24) & 0xff, (ri >> 16) & 0xff, (ri >> 8) & 0xff,
-			ri & 0xff, c->remote_port, parent_slot,
-			(unsigned)c->accept_ready,
-			(unsigned)c->retransmit_count,
-			(unsigned)c->total_retrans, (unsigned)c->cwnd,
-			(unsigned)c->ssthresh, (unsigned)c->inflight_count,
-			(unsigned)c->snd_wnd, (unsigned)c->rx_buf_size,
-			(unsigned)free_b, (int)c->rcv_wscale,
-			(int)c->snd_wscale, (int)c->ts_enabled, (int)c->sack_ok,
-			(unsigned)c->srtt_us, (unsigned)c->rto_us, c->rcv_nxt,
-			c->snd_nxt, c->snd_una, (unsigned)c->rx_head,
-			(unsigned)c->rx_tail, (int)c->rx_ready, (unsigned)used,
-			(unsigned)c->ooo_count, (int)c->tx_ready,
-			(unsigned long long)idle_ms, (unsigned)c->rto_backoff,
-			(unsigned)c->dup_acks, (int)c->delayed_ack_pending,
-			(unsigned)c->rcv_adv_last_bytes,
-			(int)(c->persist_tick != 0));
-	}
-
-	/* Network-RX / softirq state — to localise a loopback delivery stall:
-     *   - an ESTAB conn above with used>0 && rxrdy=0  => recv lost wakeup
-     *     (data sits in the ring but sock_recv is asleep).
-     *   - rx_q>0 with the NET_RX softirq bit pending and ksoftirqd not
-     *     RUNNING => softirq lost wakeup (the packet never reaches tcp_rx).
-     * (ksoftirqd_state matches the scheduler dump's State column.) */
-	extern uint32_t net_rx_queue_len(uint32_t cpu);
-	extern int net_rx_cpu(void);
-	extern uint32_t softirq_pending_get(uint32_t cpu);
-	extern int ksoftirqd_state_get(uint32_t cpu);
-	extern uint32_t percpu_get_online_count(void);
-	uint32_t ncpu = percpu_get_online_count();
-	if (ncpu > 64)
-		ncpu = 64;
-	tty_printf(tty, "--- net rx (NET_RX_CPU=%d) ---\n", net_rx_cpu());
-	for (uint32_t cpu = 0; cpu < ncpu; cpu++) {
-		tty_printf(
-			tty,
-			"  CPU%u rx_q=%u softirq_pending=0x%x ksoftirqd_state=%d\n",
-			cpu, net_rx_queue_len(cpu), softirq_pending_get(cpu),
-			ksoftirqd_state_get(cpu));
-	}
-
-	// Nonzero protocol counters — surfaces silent-drop paths at a glance.
-	tty_printf(tty, "--- net counters (nonzero) ---\n");
+	extern void tcp_ipv4_dump(struct tty * tty);
 	static const struct {
 		const char *name;
 		enum net_mib_idx idx;
@@ -4384,76 +2094,53 @@ void tcp_dump_table(struct tty *tty)
 		{ "AttemptFails", NET_MIB_TCP_ATTEMPTFAILS },
 		{ "EstabResets", NET_MIB_TCP_ESTABRESETS },
 		{ "PAWSDrop", NET_MIB_TCP_PAWSDROP },
-		{ "OOWSeqDrop", NET_MIB_TCP_OOWSEQDROP },
 		{ "ChallengeAck", NET_MIB_TCP_CHALLENGEACK },
 		{ "OOOQueueFull", NET_MIB_TCP_OOOQUEUEFULL },
-		{ "OOOOversize", NET_MIB_TCP_OOOOVERSIZE },
-		{ "OOOFinRefused", NET_MIB_TCP_OOOFINREFUSED },
 		{ "AcceptQFull", NET_MIB_TCP_ACCEPTQFULL },
-		{ "ListenerGone", NET_MIB_TCP_LISTENERGONE },
 		{ "RstDataLoss", NET_MIB_TCP_RSTDATALOSS },
 		{ "ConnTableFull", NET_MIB_TCP_CONNTABLEFULL },
-		{ "BacklogDrop", NET_MIB_TCP_BACKLOGDROP },
 		{ "PersistProbes", NET_MIB_TCP_PERSISTPROBES },
-		{ "TWReused", NET_MIB_TCP_TWREUSED },
 		{ "UdpNoPorts", NET_MIB_UDP_NOPORTS },
 		{ "UdpRcvBufErr", NET_MIB_UDP_RCVBUFERRORS },
 	};
+
+	tty_printf(tty, "=== TCP table ===\n");
+	tcp_ipv4_dump(tty);
+	tty_printf(tty, "--- tcp: %u sockets, %u orphans, %u TIME_WAIT, mem %llu%s ---\n",
+		   (unsigned)__atomic_load_n(&g_conn_count, __ATOMIC_RELAXED),
+		   (unsigned)tcp_orphan_count(), (unsigned)tcp_tw_count(),
+		   (unsigned long long)tcp_mem_allocated(),
+		   tcp_under_memory_pressure() ? " (pressure)" : "");
+	tty_printf(tty, "--- net counters (nonzero) ---\n");
 	for (unsigned i = 0; i < sizeof(mib_names) / sizeof(mib_names[0]); i++) {
 		uint64_t v = net_stats_read(mib_names[i].idx);
+
 		if (v)
-			tty_printf(tty, "  %s=%llu\n", mib_names[i].name, v);
+			tty_printf(tty, "  %s=%llu\n", mib_names[i].name,
+				   (unsigned long long)v);
 	}
-	uint64_t skb_fail = skb_get_alloc_failures();
-	if (skb_fail)
-		tty_printf(tty, "  SkbAllocFail=%llu\n", skb_fail);
+	for (int i = 0; i < TCPX_MAX; i++) {
+		uint64_t v = __atomic_load_n(&tcp_xmib[i], __ATOMIC_RELAXED);
+
+		if (v && tcp_xmib_names[i])
+			tty_printf(tty, "  %s=%llu\n", tcp_xmib_names[i],
+				   (unsigned long long)v);
+	}
+	{
+		uint64_t skb_fail = skb_get_alloc_failures();
+
+		if (skb_fail)
+			tty_printf(tty, "  SkbAllocFail=%llu\n",
+				   (unsigned long long)skb_fail);
+	}
 	tty_printf(tty, "=================\n");
 }
 
-// RFC 1191: clamp a connection's effective MSS when an ICMP frag-needed
-// arrives carrying the next-hop MTU.
-void tcp_handle_pmtu(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip,
-		     uint16_t remote_port, uint16_t new_mtu)
+void tcp_init(void)
 {
-	if (new_mtu < 68)
-		return;
-	uint16_t new_mss = (uint16_t)(new_mtu - sizeof(ipv4_header_t) -
-				      sizeof(tcp_header_t));
-	if (new_mss < 256)
-		new_mss = 256;
-	uint64_t flags;
-	spin_lock_irqsave(&tcp_lock, &flags);
-	for (tcp_conn_t *c = g_tcp_conn_list; c; c = c->list_next) {
-		if (!c->active)
-			continue;
-		if (c->local_port != local_port ||
-		    c->remote_port != remote_port)
-			continue;
-		if (c->local_ip != local_ip || c->remote_ip != remote_ip)
-			continue;
-		if (c->max_seg_size > new_mss)
-			c->max_seg_size = new_mss;
-		if (c->peer_mss > new_mss)
-			c->peer_mss = new_mss;
-	}
-	spin_unlock_irqrestore(&tcp_lock, flags);
-}
-
-// RFC 793 §3.5 abort: send RST and tear down the connection immediately.
-// Used by SO_LINGER l_onoff=1 l_linger=0.  The caller holds the socket
-// reference, so the connection is alive here; this drops the protocol
-// self-reference (tcp_conn_kill) and the caller drops the socket reference.
-void tcp_abort(tcp_conn_t *conn)
-{
-	if (!conn)
-		return;
-	uint64_t flags;
-	tcp_lock_acquire(&conn->lock, &flags);
-	if (conn->state != TCP_STATE_CLOSED && conn->dev) {
-		tcp_send_rst(conn->dev, conn->local_ip, conn->remote_ip,
-			     conn->local_port, conn->remote_port, conn->snd_nxt,
-			     conn->rcv_nxt);
-	}
-	tcp_conn_kill(conn);
-	tcp_lock_release(&conn->lock, flags);
+	tcp_hash_init();
+	net_timer_setup(&g_tcp_reclaim_timer, tcp_mem_reclaim_timer_fn);
+	tcp_minisocks_init();
+	tcp_tsq_init();
+	softirq_register(SOFTIRQ_TIMER, tcp_pending_softirq);
 }

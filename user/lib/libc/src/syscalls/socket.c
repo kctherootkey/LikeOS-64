@@ -6,6 +6,7 @@
 #include <sys/select.h>
 #include <sys/epoll.h>
 #include <poll.h>
+#include <signal.h>
 #include <errno.h>
 #include <netdb.h>
 #include "syscall.h"
@@ -199,6 +200,29 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags)
 	return (ssize_t)ret;
 }
 
+int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags)
+{
+	long ret = syscall4(SYS_SENDMMSG, sockfd, (long)msgvec, (long)vlen,
+			    flags);
+	if (ret < 0) {
+		errno = (int)-ret;
+		return -1;
+	}
+	return (int)ret;
+}
+
+int recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags,
+	     struct timespec *timeout)
+{
+	long ret = syscall5(SYS_RECVMMSG, sockfd, (long)msgvec, (long)vlen,
+			    flags, (long)timeout);
+	if (ret < 0) {
+		errno = (int)-ret;
+		return -1;
+	}
+	return (int)ret;
+}
+
 ssize_t sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 {
 	long ret = syscall4(SYS_SENDFILE, out_fd, in_fd, (long)offset,
@@ -302,6 +326,19 @@ int epoll_pwait(int epfd, struct epoll_event *events, int maxevents,
 {
 	long ret = syscall5(SYS_EPOLL_PWAIT, epfd, (long)events, maxevents,
 			    timeout, (long)sigmask);
+	if (ret < 0) {
+		errno = (int)-ret;
+		return -1;
+	}
+	return (int)ret;
+}
+
+int epoll_pwait2(int epfd, struct epoll_event *events, int maxevents,
+		 const struct timespec *timeout, const void *sigmask)
+{
+	long ret = syscall6(SYS_EPOLL_PWAIT2, epfd, (long)events, maxevents,
+			    (long)timeout, (long)sigmask,
+			    sigmask ? (long)sizeof(sigset_t) : 0);
 	if (ret < 0) {
 		errno = (int)-ret;
 		return -1;

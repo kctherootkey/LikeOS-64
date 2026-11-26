@@ -1,0 +1,8 @@
+# In SYN_SENT a RST is acceptable only if it acknowledges our SYN
+# (RFC 9293 3.10.7.3); a bare RST is ignored.
+# Copyright (C) 2026 The LikeOS Project
+0.000 socket c stream
+0.000 connect c 8080 = -EINPROGRESS
+0.000 > S 0:0(0) win * <mss 1460,sackOK,TS val * ecr 0,nop,wscale *>
+0.050 < R 0:0(0) win 0
+0.060 state c SYN_SENT

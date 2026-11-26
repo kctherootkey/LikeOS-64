@@ -2159,102 +2159,83 @@ static int irq_handler_body(uint64_t *regs)
 	// vectors).  The level-triggered NIC line would otherwise be ACK'd by
 	// the wrong handler and assert forever, hanging the system in an IRQ
 	// storm.
+	//
+	// A legacy line can be SHARED -- by two NICs, or a NIC and another
+	// device -- so every NIC on this line is asked in turn, in the order
+	// below, and each says whether the interrupt was its own (its
+	// interrupt-cause register).  The first that claims it ends the
+	// search; the line, if still asserted by another device, interrupts
+	// again at once and is offered round again.  If no NIC claims it, it
+	// falls through to the other devices below.  The first NIC whose
+	// line matched used to take the interrupt whatever its own status
+	// said, and nothing behind it on the line was ever serviced.  The
+	// handlers no longer acknowledge the local APIC themselves; this
+	// code does, once, for the claimed interrupt.
 	{
 		extern int g_e1000_initialized;
 		extern int g_e1000_legacy_irq;
-		if (g_e1000_initialized && g_e1000_legacy_irq >= 0 &&
-		    irq == g_e1000_legacy_irq) {
-			e1000_irq_handler();
-			softirq_drain(); // process queued RX skbs in deferred context
-			goto exit; // e1000_irq_handler calls lapic_eoi()
-		}
-	}
-	{
 		extern int g_e1000e_initialized;
 		extern int g_e1000e_legacy_irq;
-		extern void e1000e_irq_handler(void);
-		if (g_e1000e_initialized && g_e1000e_legacy_irq >= 0 &&
-		    irq == g_e1000e_legacy_irq) {
-			e1000e_irq_handler();
-			softirq_drain();
-			goto exit; // e1000e_irq_handler calls lapic_eoi()
-		}
-	}
-	{
 		extern int g_rtl8139_initialized;
 		extern int g_rtl8139_legacy_irq;
-		extern void rtl8139_irq_handler(void);
-		if (g_rtl8139_initialized && g_rtl8139_legacy_irq >= 0 &&
-		    irq == g_rtl8139_legacy_irq) {
-			rtl8139_irq_handler();
-			softirq_drain();
-			goto exit; // rtl8139_irq_handler calls lapic_eoi()
-		}
-	}
-	{
+		extern int rtl8139_irq_handler(void);
 		extern int g_pcnet_initialized;
 		extern int g_pcnet_legacy_irq;
-		extern void pcnet32_irq_handler(void);
-		if (g_pcnet_initialized && g_pcnet_legacy_irq >= 0 &&
-		    irq == g_pcnet_legacy_irq) {
-			pcnet32_irq_handler();
-			softirq_drain();
-			goto exit; // pcnet32_irq_handler calls lapic_eoi()
-		}
-	}
-	{
+		extern int pcnet32_irq_handler(void);
 		extern int g_ne2k_initialized;
 		extern int g_ne2k_legacy_irq;
-		extern void ne2k_irq_handler(void);
-		if (g_ne2k_initialized && g_ne2k_legacy_irq >= 0 &&
-		    irq == g_ne2k_legacy_irq) {
-			ne2k_irq_handler();
-			softirq_drain();
-			goto exit; // ne2k_irq_handler calls lapic_eoi()
-		}
-	}
-	{
+		extern int ne2k_irq_handler(void);
 		extern int g_vmxnet3_initialized;
 		extern int g_vmxnet3_legacy_irq;
-		extern void vmxnet3_irq_handler(void);
-		if (g_vmxnet3_initialized && g_vmxnet3_legacy_irq >= 0 &&
-		    irq == g_vmxnet3_legacy_irq) {
-			vmxnet3_irq_handler();
-			softirq_drain();
-			goto exit; // vmxnet3_irq_handler calls lapic_eoi()
-		}
-	}
-	{
+		extern int vmxnet3_irq_handler(void);
 		extern int g_eepro100_initialized;
 		extern int g_eepro100_legacy_irq;
-		extern void eepro100_irq_handler(void);
-		if (g_eepro100_initialized && g_eepro100_legacy_irq >= 0 &&
-		    irq == g_eepro100_legacy_irq) {
-			eepro100_irq_handler();
-			softirq_drain();
-			goto exit; // eepro100_irq_handler calls lapic_eoi()
-		}
-	}
-	{
+		extern int eepro100_irq_handler(void);
 		extern int g_igb_initialized;
 		extern int g_igb_legacy_irq;
-		extern void igb_irq_handler(void);
-		if (g_igb_initialized && g_igb_legacy_irq >= 0 &&
-		    irq == g_igb_legacy_irq) {
-			igb_irq_handler();
-			softirq_drain();
-			goto exit; // igb_irq_handler calls lapic_eoi()
-		}
-	}
-	{
+		extern int igb_irq_handler(void);
 		extern int g_tulip_initialized;
 		extern int g_tulip_legacy_irq;
-		extern void tulip_irq_handler(void);
-		if (g_tulip_initialized && g_tulip_legacy_irq >= 0 &&
-		    irq == g_tulip_legacy_irq) {
-			tulip_irq_handler();
-			softirq_drain();
-			goto exit; // tulip_irq_handler calls lapic_eoi()
+		extern int tulip_irq_handler(void);
+		extern int e1000e_irq_handler(void);
+		static const struct {
+			int *initialized;
+			int *legacy_irq;
+			int (*handler)(void);
+		} nic_irqs[] = {
+			{ &g_e1000_initialized, &g_e1000_legacy_irq,
+			  e1000_irq_handler },
+			{ &g_e1000e_initialized, &g_e1000e_legacy_irq,
+			  e1000e_irq_handler },
+			{ &g_rtl8139_initialized, &g_rtl8139_legacy_irq,
+			  rtl8139_irq_handler },
+			{ &g_pcnet_initialized, &g_pcnet_legacy_irq,
+			  pcnet32_irq_handler },
+			{ &g_ne2k_initialized, &g_ne2k_legacy_irq,
+			  ne2k_irq_handler },
+			{ &g_vmxnet3_initialized, &g_vmxnet3_legacy_irq,
+			  vmxnet3_irq_handler },
+			{ &g_eepro100_initialized, &g_eepro100_legacy_irq,
+			  eepro100_irq_handler },
+			{ &g_igb_initialized, &g_igb_legacy_irq,
+			  igb_irq_handler },
+			{ &g_tulip_initialized, &g_tulip_legacy_irq,
+			  tulip_irq_handler },
+		};
+
+		for (unsigned n = 0;
+		     n < sizeof(nic_irqs) / sizeof(nic_irqs[0]); n++) {
+			int line = *nic_irqs[n].legacy_irq;
+
+			if (!*nic_irqs[n].initialized || line < 0 ||
+			    irq != (uint8_t)line)
+				continue;
+			if (nic_irqs[n].handler()) {
+				lapic_eoi();
+				// process queued RX skbs in deferred context
+				softirq_drain();
+				goto exit;
+			}
 		}
 	}
 
@@ -2305,26 +2286,31 @@ static int irq_handler_body(uint64_t *regs)
 	}
 
 	// E1000 NIC MSI interrupt (vector 59)
+	// An MSI vector is the device's alone: acknowledged whatever the
+	// handler found.
 	if (int_no == E1000_MSI_VECTOR) {
-		e1000_irq_handler();
+		(void)e1000_irq_handler();
+		lapic_eoi();
 		softirq_drain();
-		goto exit; // e1000_irq_handler calls lapic_eoi()
+		goto exit;
 	}
 
 	// e1000e NIC MSI interrupt (vector 60)
 	if (int_no == E1000E_MSI_VECTOR) {
-		extern void e1000e_irq_handler(void);
-		e1000e_irq_handler();
+		extern int e1000e_irq_handler(void);
+		(void)e1000e_irq_handler();
+		lapic_eoi();
 		softirq_drain();
-		goto exit; // e1000e_irq_handler calls lapic_eoi()
+		goto exit;
 	}
 
 	// vmxnet3 paravirt NIC MSI interrupt (vector 61)
 	if (int_no == VMXNET3_MSI_VECTOR) {
-		extern void vmxnet3_irq_handler(void);
-		vmxnet3_irq_handler();
+		extern int vmxnet3_irq_handler(void);
+		(void)vmxnet3_irq_handler();
+		lapic_eoi();
 		softirq_drain();
-		goto exit; // vmxnet3_irq_handler calls lapic_eoi()
+		goto exit;
 	}
 
 	// Check for spurious IRQ7 (from master PIC)

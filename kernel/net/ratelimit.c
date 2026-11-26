@@ -24,7 +24,6 @@ net_rl_t g_udp_unreach_rl; //  20/s, burst  5
 
 net_rl_src_table_t g_icmp_src_rl; // per-source ICMP echo
 net_rl_src_table_t g_arp_src_rl; // per-source ARP request
-net_rl_src_table_t g_tcp_syn_rl; // per-source TCP SYN
 net_rl_src_table_t g_frag_src_rl; // per-source IP fragments
 net_rl_src_table_t g_arp_new_rl; // new ARP cache entries
 
@@ -48,7 +47,6 @@ void ratelimit_init(void)
 	// Per-source tables
 	net_rl_src_init(&g_icmp_src_rl, 1, 10); // 100/s per src, burst 10
 	net_rl_src_init(&g_arp_src_rl, 1, 5); //  50/s per src, burst  5
-	net_rl_src_init(&g_tcp_syn_rl, 1, 5); // 100/s per src, burst  5
 	net_rl_src_init(&g_frag_src_rl, 1, 20); // 100/s per src, burst 20
 	net_rl_src_init(&g_arp_new_rl, 1, 10); // 100/s per src, burst 10
 }

@@ -63,7 +63,10 @@ static int64_t ioctl_held(task_t *cur, vfs_file_t *file, uint64_t fd,
 			arg_len = sizeof(struct ifreq);
 			break;
 		case 0x5421: /* FIONBIO */
-		case 0x541B: /* FIONREAD */
+		case 0x541B: /* FIONREAD, SIOCINQ */
+		case SIOCOUTQ:
+		case SIOCOUTQNSD:
+		case SIOCATMARK:
 		case SIOCGIFCOUNT:
 			arg_len = sizeof(int);
 			break;

@@ -1,23 +1,281 @@
-// LikeOS ICMP (Internet Control Message Protocol)
+// LikeOS ICMP (Internet Control Message Protocol, RFC 792, RFC 1122)
+//
+// Receiving:
+//   * echo request -> echo reply (to the requester, from the address it
+//     was sent to, the request's TOS); not for a request sent to a
+//     broadcast or multicast address;
+//   * timestamp request -> timestamp reply (milliseconds since midnight
+//     UT); the same broadcast rule;
+//   * destination unreachable, time exceeded, parameter problem: the error
+//     is about a datagram we sent; the quoted header is checked and the
+//     error goes to the err_handler of the quoted protocol (TCP, UDP) and
+//     to the raw sockets of that protocol.  "Fragmentation needed" first
+//     lowers the path MTU of the destination (a path-MTU exception, at
+//     least 552 bytes, never raised by a report);
+//   * redirects and source quench are ignored (a host keeps its routes;
+//     source quench is deprecated, RFC 6633), as are address mask and
+//     information requests;
+//   * echo replies and errors quoting an echo also go to the kernel ping's
+//     reply queue (icmp_recv_reply).
+// Only echo, echo reply, timestamp, timestamp reply, address mask and
+// address mask reply may come as broadcast or multicast; the rest is
+// dropped then (an error to a broadcast address is bogus).
+//
+// Sending errors (icmp_send): never about an ICMP error, a datagram sent
+// to a broadcast or multicast address, a fragment other than the first,
+// or a datagram whose source is not a single host.  Rate limits: errors
+// (destination unreachable, source quench, time exceeded, parameter
+// problem) draw on a global token bucket of 1000 messages a second
+// (burst 50) and on one per destination (one a second, burst 6; not for
+// our own addresses).  Replies to echo and timestamp requests are not
+// limited.  An error quotes the offending datagram up to 576 bytes in all.
+//
+// Lock order: icmp_rl_lock and icmp_reply_lock are leaves.
 //
 // Copyright (C) 2026 The LikeOS Project
 
-#include <kernel/net/net.h>
+#include <kernel/net/ip.h>
+#include <kernel/net/stats.h>
+#include <kernel/net/fib.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/timer.h>
 #include <kernel/ke/sched.h>
 #include <kernel/dev/rand/random.h>
 #include <kernel/ke/syscall.h>
-#include <kernel/net/skb.h>
-#include <kernel/net/ratelimit.h>
+#include <kernel/mm/memory.h>
 #include <kernel/uapi/bug.h>
 
-// All TX sites use a per-call sk_buff from the size-classed pool; no shared
-// static TX buffer / TX spinlock is held across the lower-layer call, so
-// the receive path (which now runs in softirq context with IRQs enabled)
-// cannot deadlock against an in-flight echo / timestamp / addrmask reply.
+#ifndef ENONET
+#define ENONET 64 // Machine is not on the network
+#endif
 
 #define ICMP_REPLY_QUEUE_SIZE 16
+#define ICMP_ERR_MAX_LEN 576 // a whole error message, IP header included
+#define ICMP_MSGS_PER_SEC 1000
+#define ICMP_MSGS_BURST 50
+#define ICMP_RATELIMIT_MS 1000 // per destination
+#define ICMP_XRLIM_BURST 6
+#define ICMP_RATEMASK                                                    \
+	((1u << ICMP_DEST_UNREACH) | (1u << ICMP_SOURCE_QUENCH) |        \
+	 (1u << ICMP_TIME_EXCEEDED) | (1u << ICMP_PARAMETERPROB))
+#define ICMP_PEERS 256
+
+static inline uint16_t rd16(const uint8_t *p)
+{
+	return (uint16_t)((p[0] << 8) | p[1]);
+}
+
+static inline uint32_t rd32(const uint8_t *p)
+{
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+	       ((uint32_t)p[2] << 8) | p[3];
+}
+
+static inline void wr32(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)(v >> 24);
+	p[1] = (uint8_t)(v >> 16);
+	p[2] = (uint8_t)(v >> 8);
+	p[3] = (uint8_t)v;
+}
+
+static inline int ipv4_is_multicast(uint32_t a)
+{
+	return (a & 0xF0000000u) == 0xE0000000u;
+}
+
+// Which types are errors (an error is never answered with an error).
+static int icmp_type_is_error(uint8_t type)
+{
+	switch (type) {
+	case ICMP_DEST_UNREACH:
+	case ICMP_SOURCE_QUENCH:
+	case ICMP_REDIRECT:
+	case ICMP_TIME_EXCEEDED:
+	case ICMP_PARAMETERPROB:
+		return 1;
+	default:
+		return type > NR_ICMP_TYPES; // unknown: assume an error
+	}
+}
+
+// ============================================================================
+// Errors -> errno (RFC 1122 4.2.3.9; "fatal" = a hard error)
+// ============================================================================
+
+static const struct {
+	int err;
+	int fatal;
+} icmp_unreach_err[NR_ICMP_UNREACH + 1] = {
+	{ ENETUNREACH, 0 }, // NET_UNREACH
+	{ EHOSTUNREACH, 0 }, // HOST_UNREACH
+	{ ENOPROTOOPT, 1 }, // PROT_UNREACH
+	{ ECONNREFUSED, 1 }, // PORT_UNREACH
+	{ EMSGSIZE, 0 }, // FRAG_NEEDED
+	{ EOPNOTSUPP, 0 }, // SR_FAILED
+	{ ENETUNREACH, 1 }, // NET_UNKNOWN
+	{ EHOSTDOWN, 1 }, // HOST_UNKNOWN
+	{ ENONET, 1 }, // HOST_ISOLATED
+	{ ENETUNREACH, 1 }, // NET_ANO
+	{ EHOSTUNREACH, 1 }, // HOST_ANO
+	{ ENETUNREACH, 0 }, // NET_UNR_TOS
+	{ EHOSTUNREACH, 0 }, // HOST_UNR_TOS
+	{ EHOSTUNREACH, 1 }, // PKT_FILTERED
+	{ EHOSTUNREACH, 1 }, // PREC_VIOLATION
+	{ EHOSTUNREACH, 1 }, // PREC_CUTOFF
+};
+
+int icmp_err_convert(uint8_t type, uint8_t code, int *fatal)
+{
+	*fatal = 0;
+	switch (type) {
+	case ICMP_DEST_UNREACH:
+		if (code <= NR_ICMP_UNREACH) {
+			*fatal = icmp_unreach_err[code].fatal;
+			return icmp_unreach_err[code].err;
+		}
+		return EHOSTUNREACH;
+	case ICMP_PARAMETERPROB:
+		*fatal = 1;
+		return EPROTO;
+	case ICMP_TIME_EXCEEDED:
+	default:
+		return EHOSTUNREACH;
+	}
+}
+
+// ============================================================================
+// Rate limits
+// ============================================================================
+
+static spinlock_t icmp_rl_lock = SPINLOCK_INIT("icmp_rl");
+static uint64_t icmp_global_last_ms;
+static uint32_t icmp_global_credit = ICMP_MSGS_BURST;
+
+struct icmp_peer {
+	uint32_t addr; // 0: free
+	uint32_t tokens; // milliseconds of credit
+	uint64_t last_ms;
+};
+static struct icmp_peer icmp_peers[ICMP_PEERS];
+static uint64_t st_rl_global, st_rl_host, st_out, st_out_err;
+static uint64_t st_in, st_in_err, st_in_csum;
+
+static uint64_t icmp_now_ms(void)
+{
+	return timer_get_precise_us() / 1000;
+}
+
+/* The global bucket: 1000 messages a second, at most 50 at once. */
+static int icmp_global_allow_locked(uint64_t now)
+{
+	uint64_t delta = now - icmp_global_last_ms;
+
+	if (delta > 1000)
+		delta = 1000;
+	if (delta) {
+		uint64_t c = icmp_global_credit +
+			     delta * ICMP_MSGS_PER_SEC / 1000;
+
+		icmp_global_credit = (uint32_t)(c > ICMP_MSGS_BURST ?
+							ICMP_MSGS_BURST :
+							c);
+		icmp_global_last_ms = now;
+	}
+	return icmp_global_credit > 0;
+}
+
+/* The bucket of one destination: a message a second, bursts of six. */
+static int icmp_peer_allow_locked(uint32_t daddr, uint64_t now)
+{
+	uint32_t h = (daddr * 0x9E3779B1u) >> 24; // 256 slots
+	struct icmp_peer *p = NULL, *victim = NULL;
+	uint64_t tok;
+
+	for (uint32_t i = 0; i < 8; i++) { // probe a few slots
+		struct icmp_peer *c = &icmp_peers[(h + i) & (ICMP_PEERS - 1)];
+
+		if (c->addr == daddr) {
+			p = c;
+			break;
+		}
+		if (!victim || !c->addr ||
+		    (victim->addr && c->last_ms < victim->last_ms))
+			victim = c;
+	}
+	if (!p) {
+		p = victim;
+		p->addr = daddr;
+		p->tokens = ICMP_XRLIM_BURST * ICMP_RATELIMIT_MS;
+		p->last_ms = now;
+	}
+	tok = p->tokens + (now - p->last_ms);
+	p->last_ms = now;
+	if (tok > ICMP_XRLIM_BURST * ICMP_RATELIMIT_MS)
+		tok = ICMP_XRLIM_BURST * ICMP_RATELIMIT_MS;
+	if (tok >= ICMP_RATELIMIT_MS) {
+		p->tokens = (uint32_t)(tok - ICMP_RATELIMIT_MS);
+		return 1;
+	}
+	p->tokens = (uint32_t)tok;
+	return 0;
+}
+
+void icmp_rl_reset(void)
+{
+	uint64_t f;
+
+	spin_lock_irqsave(&icmp_rl_lock, &f);
+	icmp_global_credit = ICMP_MSGS_BURST;
+	icmp_global_last_ms = icmp_now_ms();
+	mm_memset(icmp_peers, 0, sizeof(icmp_peers));
+	spin_unlock_irqrestore(&icmp_rl_lock, f);
+}
+
+void icmp_get_stats(struct icmp_rl_stats *st)
+{
+	st->out_msgs = __atomic_load_n(&st_out, __ATOMIC_RELAXED);
+	st->out_errors = __atomic_load_n(&st_out_err, __ATOMIC_RELAXED);
+	st->rl_global = __atomic_load_n(&st_rl_global, __ATOMIC_RELAXED);
+	st->rl_host = __atomic_load_n(&st_rl_host, __ATOMIC_RELAXED);
+	st->in_msgs = __atomic_load_n(&st_in, __ATOMIC_RELAXED);
+	st->in_errors = __atomic_load_n(&st_in_err, __ATOMIC_RELAXED);
+	st->in_csum_errors = __atomic_load_n(&st_in_csum, __ATOMIC_RELAXED);
+}
+
+static void icmp_count_out(uint8_t type, int ok)
+{
+	if (!ok) {
+		NET_STATS_INC(NET_MIB_ICMP_OUTERRORS);
+		__atomic_fetch_add(&st_out_err, 1, __ATOMIC_RELAXED);
+		return;
+	}
+	NET_STATS_INC(NET_MIB_ICMP_OUTMSGS);
+	__atomic_fetch_add(&st_out, 1, __ATOMIC_RELAXED);
+	switch (type) {
+	case ICMP_ECHO_REPLY:
+		NET_STATS_INC(NET_MIB_ICMP_OUTECHOREPS);
+		break;
+	case ICMP_TIMESTAMP_REPLY:
+		NET_STATS_INC(NET_MIB_ICMP_OUTTIMESTAMPREPS);
+		break;
+	case ICMP_DEST_UNREACH:
+		NET_STATS_INC(NET_MIB_ICMP_OUTDESTUNREACHS);
+		break;
+	case ICMP_TIME_EXCEEDED:
+		NET_STATS_INC(NET_MIB_ICMP_OUTTIMEEXCDS);
+		break;
+	case ICMP_PARAMETERPROB:
+		NET_STATS_INC(NET_MIB_ICMP_OUTPARMPROBS);
+		break;
+	default:
+		break;
+	}
+}
+
+// ============================================================================
+// The kernel ping's reply queue
+// ============================================================================
 
 typedef struct {
 	uint32_t src_ip;
@@ -38,7 +296,6 @@ static spinlock_t icmp_reply_lock = SPINLOCK_INIT("icmp_reply");
 
 // Kernel-side timestamps for RTT (microseconds from timer_get_precise_us)
 static volatile uint64_t icmp_send_us = 0;
-static volatile uint64_t icmp_recv_us = 0;
 
 static void icmp_queue_reply(uint32_t src_ip, uint8_t type, uint8_t code,
 			     uint16_t id, uint16_t seq, uint8_t ttl)
@@ -65,205 +322,153 @@ static void icmp_queue_reply(uint32_t src_ip, uint8_t type, uint8_t code,
 	sched_wake_channel((void *)&icmp_reply_ready);
 }
 
-static void icmp_extract_reply_identity(const uint8_t *data, uint16_t len,
-					uint8_t type, uint16_t *id_out,
-					uint16_t *seq_out)
+// ============================================================================
+// Sending
+// ============================================================================
+
+/* Build an ICMP message (header + body) and send it to `daddr' from
+ * `saddr' (0: the route's).  Not under any lock. */
+static int icmp_xmit(uint32_t saddr, uint32_t daddr, uint8_t type,
+		     uint8_t code, uint32_t rest, const uint8_t *body,
+		     uint32_t blen, uint8_t tos, uint8_t ttl,
+		     struct ip_route *rt)
 {
-	if (type == ICMP_ECHO_REPLY || type == ICMP_ECHO_REQUEST) {
-		if (len >= sizeof(icmp_header_t)) {
-			const icmp_header_t *icmp = (const icmp_header_t *)data;
-			*id_out = net_ntohs(icmp->identifier);
-			*seq_out = net_ntohs(icmp->sequence);
-		}
-		return;
+	struct ip_tx tx;
+	sk_buff_t *skb = skb_alloc(8 + blen);
+	uint8_t *p;
+	uint16_t c;
+	int rc;
+
+	if (!skb) {
+		icmp_count_out(type, 0);
+		return -ENOBUFS;
 	}
-
-	if (len < sizeof(icmp_header_t) + sizeof(ipv4_header_t))
-		return;
-	const uint8_t *quoted = data + sizeof(icmp_header_t);
-	const ipv4_header_t *inner_ip = (const ipv4_header_t *)quoted;
-	uint8_t inner_ihl = (inner_ip->version_ihl & 0x0F) * 4;
-	if (inner_ihl < sizeof(ipv4_header_t) ||
-	    len < sizeof(icmp_header_t) + inner_ihl + sizeof(icmp_header_t))
-		return;
-	if (inner_ip->protocol != IP_PROTO_ICMP)
-		return;
-
-	const icmp_header_t *inner_icmp =
-		(const icmp_header_t *)(quoted + inner_ihl);
-	*id_out = net_ntohs(inner_icmp->identifier);
-	*seq_out = net_ntohs(inner_icmp->sequence);
+	p = skb_append(skb, 8 + blen);
+	p[0] = type;
+	p[1] = code;
+	p[2] = p[3] = 0;
+	wr32(p + 4, rest);
+	if (blen)
+		mm_memcpy(p + 8, body, blen);
+	c = csum_fold(csum_partial(p, 8 + blen, 0));
+	mm_memcpy(p + 2, &c, 2);
+	mm_memset(&tx, 0, sizeof(tx));
+	tx.saddr = saddr;
+	tx.daddr = daddr;
+	tx.proto = IP_PROTO_ICMP;
+	tx.ttl = ttl;
+	tx.tos = tos;
+	tx.mc_ttl = 1;
+	tx.pmtudisc = IP_PMTUDISC_DONT; // ICMP goes without DF
+	rc = ip_send_skb(skb, &tx, rt, NULL);
+	icmp_count_out(type, rc >= 0);
+	return rc;
 }
 
-int icmp_send_error_packet(net_device_t *dev, uint32_t dst_ip, uint8_t type,
-			   uint8_t code, const uint8_t *quoted_ip_packet,
-			   uint16_t quoted_len, uint32_t aux_data)
+void icmp_send(sk_buff_t *skb_in, uint8_t type, uint8_t code, uint32_t info)
 {
-	BUG_ON(dev == NULL);
-	BUILD_BUG_ON(sizeof(icmp_header_t) != 8);
-	if (!dev || !quoted_ip_packet)
-		return -1;
+	const uint8_t *iph;
+	struct inet_skb_parm *cb;
+	struct ip_route rt;
+	uint32_t ihl, avail, tot, qlen, saddr, daddr;
+	uint64_t now, f;
+	int limited = (ICMP_RATEMASK >> type) & 1;
+	uint8_t tos;
 
-	uint16_t copy_len = quoted_len;
-	if (copy_len > NET_MTU_DEFAULT - sizeof(icmp_header_t))
-		copy_len = (uint16_t)(NET_MTU_DEFAULT - sizeof(icmp_header_t));
-	uint16_t total = (uint16_t)(sizeof(icmp_header_t) + copy_len);
-
-	sk_buff_t *skb = skb_alloc(total);
-	if (!skb)
-		return -1;
-	skb->dev = dev;
-
-	uint8_t *buf = skb_append(skb, total);
-	icmp_header_t *icmp = (icmp_header_t *)buf;
-	icmp->type = type;
-	icmp->code = code;
-	icmp->checksum = 0;
-	icmp->identifier = net_htons((uint16_t)(aux_data >> 16));
-	icmp->sequence = net_htons((uint16_t)aux_data);
-
-	for (uint16_t i = 0; i < copy_len; i++)
-		buf[sizeof(icmp_header_t) + i] = quoted_ip_packet[i];
-
-	icmp->checksum = ipv4_checksum(buf, total);
-
-	int ret = ipv4_send(dev, dst_ip, IP_PROTO_ICMP, skb->data, skb->len);
-	skb_put(skb);
-	return ret;
-}
-
-// Process received ICMP packet
-void icmp_rx(net_device_t *dev, uint32_t src_ip, const uint8_t *data,
-	     uint16_t len, uint8_t rx_ttl)
-{
-	BUG_ON(dev == NULL);
-	BUG_ON(data == NULL);
-	if (len < sizeof(icmp_header_t))
+	if (!skb_in || skb_in->network_header == SKB_HDR_UNSET)
 		return;
-
-	const icmp_header_t *icmp = (const icmp_header_t *)data;
-
-	// Verify checksum over entire ICMP message
-	if (ipv4_checksum(data, len) != 0)
+	iph = skb_network_header(skb_in);
+	if (iph < skb_in->head || iph + IP_HDR_MIN > skb_in->tail)
 		return;
-
-	// Drop ICMP redirect — never update routing table from unsolicited redirects
-	if (icmp->type == ICMP_REDIRECT)
+	ihl = (uint32_t)(iph[0] & 0x0F) * 4;
+	avail = (uint32_t)(skb_in->tail - iph);
+	if (ihl < IP_HDR_MIN || ihl > avail)
 		return;
-
-	// Drop timestamp requests (information disclosure + amplification vector)
-	if (icmp->type == ICMP_TIMESTAMP)
+	cb = IPCB(skb_in);
+	// only about a datagram to one of our addresses, from one host
+	if (cb->rt_type != RTN_LOCAL || skb_in->pkt_type == PACKET_BROADCAST ||
+	    skb_in->pkt_type == PACKET_MULTICAST)
 		return;
-
-	// Drop address mask requests (information disclosure)
-	if (icmp->type == ICMP_ADDRMASK)
+	if (rd16(iph + 6) & IP_OFFSET)
+		return; // only the first fragment is answered
+	daddr = rd32(iph + 12); // the offender's source: where it goes
+	if (daddr == 0 || ipv4_is_multicast(daddr) ||
+	    ip_addr_is_broadcast(daddr) || (daddr & 0xFF000000u) == 0)
 		return;
-
-	WARN_RATELIMIT(icmp->type > 18 && icmp->type != ICMP_DEST_UNREACH &&
-			       icmp->type != ICMP_TIME_EXCEEDED,
-		       "icmp_rx: unknown type %u from %u.%u.%u.%u", icmp->type,
-		       (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
-		       (src_ip >> 8) & 0xFF, src_ip & 0xFF);
-
-	if (icmp->type == ICMP_ECHO_REQUEST && icmp->code == 0) {
-		// Global flood rate limit
-		uint64_t rl_flags;
-		spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
-		int global_ok = net_rl_allow(&g_icmp_reply_rl);
-		int src_ok = net_rl_src_allow(&g_icmp_src_rl, src_ip);
-		spin_unlock_irqrestore(&g_ratelimit_lock, rl_flags);
-		if (!global_ok || !src_ok)
-			goto skip_echo_reply;
-		// Echo reply: copy entire received message and flip the type byte.
-		// Length may be up to 65535 (reassembled IPv4 datagram); skb_alloc
-		// picks the small or jumbo pool class as needed.
-		sk_buff_t *skb = skb_alloc(len);
-		if (!skb)
+	if (icmp_type_is_error(type) && iph[9] == IP_PROTO_ICMP) {
+		// never an error about an error (nor about unknown types)
+		if (avail < ihl + 1 || icmp_type_is_error(iph[ihl]))
 			return;
-		skb->dev = dev;
-		uint8_t *buf = skb_append(skb, len);
-		for (uint16_t i = 0; i < len; i++)
-			buf[i] = data[i];
-		icmp_header_t *r = (icmp_header_t *)buf;
-		r->type = ICMP_ECHO_REPLY;
-		r->code = 0;
-		r->checksum = 0;
-		r->checksum = ipv4_checksum(buf, len);
-		ipv4_send(dev, src_ip, IP_PROTO_ICMP, skb->data, skb->len);
-		skb_put(skb);
 	}
-skip_echo_reply:
+	now = icmp_now_ms();
+	if (limited) {
+		int ok;
 
-	// RFC 1191 PMTUD: DEST_UNREACH/FRAG_NEEDED carries next-hop MTU in id+seq.
-	// Also dispatch any ICMP error to a matching socket.
-	if (icmp->type == ICMP_DEST_UNREACH ||
-	    icmp->type == ICMP_TIME_EXCEEDED ||
-	    icmp->type == ICMP_PARAM_PROBLEM) {
-		const uint8_t *inner = data + sizeof(icmp_header_t);
-		uint16_t ilen =
-			(len > sizeof(icmp_header_t)) ?
-				(uint16_t)(len - sizeof(icmp_header_t)) :
-				0;
-		uint16_t mtu_hint = 0;
-		if (icmp->type == ICMP_DEST_UNREACH &&
-		    icmp->code == ICMP_FRAG_NEEDED)
-			mtu_hint = net_ntohs(
-				icmp->sequence); // RFC 1191 places MTU in low 16 bits
-		icmp_dispatch_error(icmp->type, icmp->code, inner, ilen,
-				    mtu_hint);
+		spin_lock_irqsave(&icmp_rl_lock, &f);
+		ok = icmp_global_allow_locked(now);
+		spin_unlock_irqrestore(&icmp_rl_lock, f);
+		if (!ok) {
+			NET_STATS_INC(NET_MIB_ICMP_OUTRATELIMITGLOBAL);
+			__atomic_fetch_add(&st_rl_global, 1, __ATOMIC_RELAXED);
+			return;
+		}
 	}
+	/* From the address the datagram was sent to when that is ours,
+	 * otherwise from the route's. */
+	saddr = rd32(iph + 16);
+	if (!ip_addr_is_local(saddr))
+		saddr = 0;
+	if (ip_route_out(daddr, saddr, NULL, &rt) < 0)
+		return;
+	if (limited) {
+		int ok = 1;
 
-	// Store reply for userspace (echo reply, dest unreachable, time exceeded)
-	if (icmp->type == ICMP_ECHO_REPLY || icmp->type == ICMP_DEST_UNREACH ||
-	    icmp->type == ICMP_TIME_EXCEEDED) {
-		uint16_t reply_id = 0;
-		uint16_t reply_seq = 0;
-		icmp_recv_us = timer_get_precise_us();
-		icmp_extract_reply_identity(data, len, icmp->type, &reply_id,
-					    &reply_seq);
-		icmp_queue_reply(src_ip, icmp->type, icmp->code, reply_id,
-				 reply_seq, rx_ttl);
+		spin_lock_irqsave(&icmp_rl_lock, &f);
+		if (!rt.loopback)
+			ok = icmp_peer_allow_locked(daddr, now);
+		if (ok && icmp_global_credit)
+			icmp_global_credit--;
+		spin_unlock_irqrestore(&icmp_rl_lock, f);
+		if (!ok) {
+			NET_STATS_INC(NET_MIB_ICMP_OUTRATELIMITHOST);
+			__atomic_fetch_add(&st_rl_host, 1, __ATOMIC_RELAXED);
+			ip_route_put(&rt);
+			return;
+		}
 	}
+	tot = rd16(iph + 2);
+	if (tot < ihl)
+		tot = ihl;
+	qlen = tot < avail ? tot : avail;
+	if (qlen > ICMP_ERR_MAX_LEN - IP_HDR_MIN - 8)
+		qlen = ICMP_ERR_MAX_LEN - IP_HDR_MIN - 8;
+	tos = icmp_type_is_error(type) ? (uint8_t)((iph[1] & 0x1E) | 0xC0) :
+					 iph[1];
+	icmp_xmit(saddr, daddr, type, code, info, iph, qlen, tos, 0, &rt);
+	ip_route_put(&rt);
 }
 
-// Send ICMP echo request with configurable TTL
+// Send ICMP echo request with configurable TTL (the kernel ping)
 int icmp_send_echo(net_device_t *dev, uint32_t dst_ip, uint16_t id,
 		   uint16_t seq, const uint8_t *payload, uint16_t payload_len,
 		   uint8_t ttl)
 {
+	struct ip_route rt;
+	int rc;
+
 	if (!dev)
 		return -1;
-	uint16_t total = sizeof(icmp_header_t) + payload_len;
-	if (total > NET_MTU_DEFAULT)
+	if ((uint32_t)payload_len + 8 > NET_MTU_DEFAULT)
 		return -1;
-
-	sk_buff_t *skb = skb_alloc(total);
-	if (!skb)
+	if (ip_route_out(dst_ip, 0, dev, &rt) < 0)
 		return -1;
-	skb->dev = dev;
-
-	uint8_t *buf = skb_append(skb, total);
-	icmp_header_t *icmp = (icmp_header_t *)buf;
-	icmp->type = ICMP_ECHO_REQUEST;
-	icmp->code = 0;
-	icmp->identifier = net_htons(id);
-	icmp->sequence = net_htons(seq);
-	icmp->checksum = 0;
-
-	if (payload && payload_len > 0) {
-		for (uint16_t i = 0; i < payload_len; i++)
-			buf[sizeof(icmp_header_t) + i] = payload[i];
-	}
-
-	icmp->checksum = ipv4_checksum(buf, total);
-
 	// Record send timestamp before transmitting
 	icmp_send_us = timer_get_precise_us();
-
-	int ret = ipv4_send_ttl(dev, dst_ip, IP_PROTO_ICMP, skb->data, skb->len,
-				ttl);
-	skb_put(skb);
-	return ret;
+	rc = icmp_xmit(0, dst_ip, ICMP_ECHO_REQUEST, 0,
+		       ((uint32_t)id << 16) | seq, payload, payload_len, 0,
+		       ttl ? ttl : IP_DEFAULT_TTL, &rt);
+	ip_route_put(&rt);
+	return rc < 0 ? -1 : 0;
 }
 
 // Receive ICMP reply (blocking with timeout, filtered by ID and seq)
@@ -278,9 +483,8 @@ int icmp_recv_reply(uint32_t *src_ip, uint16_t expected_id, uint8_t *type_out,
 		while (!icmp_reply_ready) {
 			if (timer_ticks() - start > timeout_ticks)
 				return -1;
-			// Block the task until woken by icmp_rx or timeout
+			// Block the task until woken by icmp_rcv or timeout
 			cur->wait_channel = (void *)&icmp_reply_ready;
-			// Set a wakeup deadline so we wake on timeout even without a reply
 			uint64_t remaining =
 				timeout_ticks - (timer_ticks() - start);
 			if (remaining > timeout_ticks)
@@ -298,16 +502,10 @@ int icmp_recv_reply(uint32_t *src_ip, uint16_t expected_id, uint8_t *type_out,
 		for (int idx = icmp_reply_head; idx != icmp_reply_tail;
 		     idx = (idx + 1) % ICMP_REPLY_QUEUE_SIZE) {
 			icmp_reply_entry_t *entry = &icmp_reply_queue[idx];
-			// Match by (id, seq) for every type we deliver here:
-			//   ECHO_REPLY            -> id/seq are the peer's echoed values
-			//   DEST_UNREACH /        -> id/seq were extracted from the
-			//   TIME_EXCEEDED            embedded ICMP echo header inside
-			//                            the error packet by icmp_rx().  If
-			//                            the inner packet wasn't ICMP at all
-			//                            (e.g. our own kernel returned a
-			//                            port-unreachable for an outbound
-			//                            DNS UDP query), id/seq stay 0 and
-			//                            no real ping waiter matches.
+			/* Match by (id, seq): an echo reply carries the
+			 * values of the request; an error quoting an echo
+			 * request carries those of the quoted request (see
+			 * icmp_note_reply); others have 0/0. */
 			if (entry->id != expected_id ||
 			    entry->seq != expected_seq)
 				continue;
@@ -316,10 +514,8 @@ int icmp_recv_reply(uint32_t *src_ip, uint16_t expected_id, uint8_t *type_out,
 		}
 
 		if (found < 0) {
-			// Stale entries (e.g. echo replies for a previous seq) remain in the
-			// queue but don't match this caller.  Clear the readiness flag so
-			// the outer wait blocks for a new packet instead of busy-spinning
-			// through the unmatched queue forever.
+			/* Stale entries stay queued; wait for a new one
+			 * instead of spinning over them. */
 			icmp_reply_ready = 0;
 			spin_unlock_irqrestore(&icmp_reply_lock, flags);
 			continue;
@@ -356,69 +552,257 @@ int icmp_recv_reply(uint32_t *src_ip, uint16_t expected_id, uint8_t *type_out,
 }
 
 // ============================================================================
-// RFC 792 §3.2.1 — Dispatch an inbound ICMP error to its originating socket.
-// inner_ip points to the quoted IP header (always 8 bytes of L4 follows).
+// Receiving
 // ============================================================================
-void icmp_dispatch_error(uint8_t icmp_type, uint8_t icmp_code,
-			 const uint8_t *inner_ip, uint16_t inner_len,
-			 uint16_t mtu_hint)
+
+/* An echo reply, or an error quoting one of our echo requests: for the
+ * kernel ping. */
+static void icmp_note_reply(sk_buff_t *skb, uint32_t from)
 {
-	if (inner_len < sizeof(ipv4_header_t) + 8)
-		return;
-	const ipv4_header_t *ip = (const ipv4_header_t *)inner_ip;
-	uint8_t ihl = (ip->version_ihl & 0x0F) * 4;
-	if (ihl < sizeof(ipv4_header_t) || inner_len < ihl + 8)
-		return;
+	const uint8_t *p = skb->data;
+	uint32_t len = skb->len;
+	uint16_t id = 0, seq = 0;
 
-	uint32_t orig_src = net_ntohl(ip->src_addr);
-	uint32_t orig_dst = net_ntohl(ip->dst_addr);
-	uint8_t proto = ip->protocol;
-	const uint8_t *l4 = inner_ip + ihl;
-	uint16_t orig_sport = (uint16_t)((l4[0] << 8) | l4[1]);
-	uint16_t orig_dport = (uint16_t)((l4[2] << 8) | l4[3]);
+	if (p[0] == ICMP_ECHO_REPLY) {
+		id = rd16(p + 4);
+		seq = rd16(p + 6);
+	} else if (len >= 8 + IP_HDR_MIN) {
+		const uint8_t *in = p + 8;
+		uint32_t ihl = (uint32_t)(in[0] & 0x0F) * 4;
 
-	// Map ICMP type/code to errno
-	int err = 0;
-	switch (icmp_type) {
-	case ICMP_DEST_UNREACH:
-		switch (icmp_code) {
-		case ICMP_NET_UNREACH:
-			err = ENETUNREACH;
-			break;
-		case ICMP_HOST_UNREACH:
-			err = EHOSTUNREACH;
-			break;
-		case ICMP_PROTO_UNREACH:
-			err = ENOPROTOOPT;
-			break;
-		case ICMP_PORT_UNREACH:
-			err = ECONNREFUSED;
-			break;
-		case ICMP_FRAG_NEEDED:
-			// PMTUD: clamp PMTU cache; do NOT report as connection error
-			if (mtu_hint >= 68) {
-				pmtu_set(orig_dst, mtu_hint);
-				if (proto == IP_PROTO_TCP)
-					tcp_handle_pmtu(orig_src, orig_sport,
-							orig_dst, orig_dport,
-							mtu_hint);
-			}
-			return;
-		default:
-			err = EHOSTUNREACH;
-			break;
+		if (ihl >= IP_HDR_MIN && len >= 8 + ihl + 8 &&
+		    in[9] == IP_PROTO_ICMP) {
+			id = rd16(in + ihl + 4);
+			seq = rd16(in + ihl + 6);
 		}
+	}
+	icmp_queue_reply(from, p[0], p[1], id, seq, IPCB(skb)->ttl);
+}
+
+/* Hand a validated error to the quoted protocol and its raw sockets. */
+static void icmp_err_dispatch(struct icmp_err *e)
+{
+	const struct net_protocol *prot;
+	int fatal = 0;
+
+	e->err = icmp_err_convert(e->type, e->code, &fatal);
+	e->fatal = (uint8_t)fatal;
+	raw_icmp_error(e);
+	prot = inet_get_protocol(e->proto);
+	if (prot && prot->err_handler)
+		prot->err_handler(e);
+}
+
+uint32_t ip_update_pmtu(uint32_t daddr, uint32_t mtu, int *locked)
+{
+	uint32_t before = fib_exception_get_pmtu(daddr), after;
+
+	*locked = mtu < FIB_MIN_PMTU;
+	if (fib_exception_set_pmtu(daddr, mtu) < 0)
+		return 0;
+	after = fib_exception_get_pmtu(daddr);
+	if (after && after != before)
+		NET_STATS_INC(NET_MIB_ICMP_PMTUUPDATES);
+	return after;
+}
+
+/* An error about a datagram of ours: check the quote, hand it to the
+ * quoted protocol (which updates the path MTU for "fragmentation needed"
+ * when the datagram is one of its senders'). */
+static void icmp_unreach(sk_buff_t *skb)
+{
+	const uint8_t *p = skb->data;
+	const uint8_t *in = p + 8;
+	struct icmp_err e;
+	uint32_t ihl;
+
+	if (skb->len < 8 + IP_HDR_MIN)
+		goto bad;
+	ihl = (uint32_t)(in[0] & 0x0F) * 4;
+	if ((in[0] >> 4) != 4 || ihl < IP_HDR_MIN || skb->len < 8 + ihl + 8)
+		goto bad;
+	mm_memset(&e, 0, sizeof(e));
+	e.type = p[0];
+	e.code = p[1];
+	e.proto = in[9];
+	e.saddr = rd32(in + 12);
+	e.daddr = rd32(in + 16);
+	e.from = IPCB(skb)->saddr;
+	e.iph = in;
+	e.ihl = ihl;
+	e.l4 = in + ihl;
+	e.l4len = skb->len - 8 - ihl;
+	e.skb = skb;
+	switch (e.type) {
+	case ICMP_DEST_UNREACH:
+		if (e.code > NR_ICMP_UNREACH)
+			return;
+		/* "Fragmentation needed": the next-hop MTU (0 from routers
+		 * older than RFC 1191: the floor then).  The path MTU is
+		 * lowered by the protocol that finds the datagram's sender
+		 * -- a report about nobody's datagram changes nothing. */
+		if (e.code == ICMP_FRAG_NEEDED)
+			e.info = rd16(p + 6);
 		break;
 	case ICMP_TIME_EXCEEDED:
-		err = EHOSTUNREACH;
 		break;
-	case ICMP_PARAM_PROBLEM:
-		err = EPROTO;
+	case ICMP_PARAMETERPROB:
+		e.info = (uint32_t)p[4]; // the pointer
 		break;
 	default:
 		return;
 	}
+	icmp_err_dispatch(&e);
+	return;
+bad:
+	NET_STATS_INC(NET_MIB_ICMP_INERRORS);
+	__atomic_fetch_add(&st_in_err, 1, __ATOMIC_RELAXED);
+}
 
-	sock_post_icmp_error(proto, orig_src, orig_sport, orig_dst, orig_dport,
-			     err);
+/* Reply to an echo or timestamp request: to its source, from the address
+ * it was sent to, with its TOS. */
+static void icmp_reply(sk_buff_t *skb, uint8_t type, const uint8_t *body,
+		       uint32_t blen, uint32_t rest)
+{
+	struct inet_skb_parm *cb = IPCB(skb);
+	struct ip_route rt;
+	uint32_t saddr = ip_addr_is_local(cb->daddr) ? cb->daddr : 0;
+
+	if (ip_route_out(cb->saddr, saddr, NULL, &rt) < 0)
+		return;
+	icmp_xmit(saddr, cb->saddr, type, 0, rest, body, blen, cb->tos, 0,
+		  &rt);
+	ip_route_put(&rt);
+}
+
+static uint32_t icmp_ms_since_midnight(void)
+{
+	uint64_t ms = timer_get_realtime_ns() / 1000000ULL;
+
+	return (uint32_t)(ms % 86400000ULL);
+}
+
+int icmp_rcv(sk_buff_t *skb)
+{
+	struct inet_skb_parm *cb = IPCB(skb);
+	const uint8_t *p;
+	uint8_t type;
+
+	NET_STATS_INC(NET_MIB_ICMP_INMSGS);
+	__atomic_fetch_add(&st_in, 1, __ATOMIC_RELAXED);
+	if (skb->len < 8)
+		goto error;
+	// always verified: receive offload vouches for TCP and UDP only
+	if (csum_fold(skb_checksum(skb, 0, skb->len, 0)) != 0) {
+		NET_STATS_INC(NET_MIB_ICMP_INCSUMERRORS);
+		__atomic_fetch_add(&st_in_csum, 1, __ATOMIC_RELAXED);
+		goto error;
+	}
+	p = skb->data;
+	type = p[0];
+	if (type > NR_ICMP_TYPES)
+		goto error;
+	if (cb->rt_type == RTN_BROADCAST || cb->rt_type == RTN_MULTICAST) {
+		/* Only queries and their replies make sense to a group;
+		 * echo and timestamp requests to one are not answered
+		 * (smurf amplification). */
+		if (type == ICMP_ECHO_REQUEST || type == ICMP_TIMESTAMP)
+			goto drop;
+		if (type != ICMP_ECHO_REPLY && type != ICMP_TIMESTAMP_REPLY &&
+		    type != ICMP_ADDRMASK && type != ICMP_ADDRMASK_REPLY)
+			goto error;
+	}
+	switch (type) {
+	case ICMP_ECHO_REQUEST:
+		NET_STATS_INC(NET_MIB_ICMP_INECHOS);
+		if (p[1] == 0)
+			icmp_reply(skb, ICMP_ECHO_REPLY, p + 8, skb->len - 8,
+				   rd32(p + 4));
+		break;
+	case ICMP_TIMESTAMP:
+		NET_STATS_INC(NET_MIB_ICMP_INTIMESTAMPS);
+		if (skb->len < 8 + 12)
+			goto error;
+		{
+			uint8_t ts[12];
+			uint32_t now = icmp_ms_since_midnight();
+
+			mm_memcpy(ts, p + 8, 4); // originate, as sent
+			wr32(ts + 4, now); // receive
+			wr32(ts + 8, now); // transmit
+			icmp_reply(skb, ICMP_TIMESTAMP_REPLY, ts, sizeof(ts),
+				   rd32(p + 4));
+		}
+		break;
+	case ICMP_ECHO_REPLY:
+		icmp_note_reply(skb, cb->saddr);
+		break;
+	case ICMP_DEST_UNREACH:
+		NET_STATS_INC(NET_MIB_ICMP_INDESTUNREACHS);
+		icmp_unreach(skb);
+		icmp_note_reply(skb, cb->saddr);
+		break;
+	case ICMP_TIME_EXCEEDED:
+		NET_STATS_INC(NET_MIB_ICMP_INTIMEEXCDS);
+		icmp_unreach(skb);
+		icmp_note_reply(skb, cb->saddr);
+		break;
+	case ICMP_PARAMETERPROB:
+		NET_STATS_INC(NET_MIB_ICMP_INPARMPROBS);
+		icmp_unreach(skb);
+		break;
+	case ICMP_REDIRECT:
+		/* A host keeps its routes: an unsolicited redirect would
+		 * let anybody on the path move our traffic. */
+		NET_STATS_INC(NET_MIB_ICMP_INREDIRECTS);
+		break;
+	case ICMP_SOURCE_QUENCH:
+		NET_STATS_INC(NET_MIB_ICMP_INSRCQUENCHS); // RFC 6633
+		break;
+	default:
+		break; // address mask, information, replies: nothing to do
+	}
+drop:
+	skb_put(skb);
+	return 0;
+error:
+	NET_STATS_INC(NET_MIB_ICMP_INERRORS);
+	__atomic_fetch_add(&st_in_err, 1, __ATOMIC_RELAXED);
+	skb_put(skb);
+	return 0;
+}
+
+/* A datagram we sent could not be delivered and nothing on the wire says
+ * so (address resolution failed): the error goes to its sender as if a
+ * router had answered with `type'/`code'. */
+void icmp_dispatch_error(uint8_t icmp_type, uint8_t icmp_code,
+			 const uint8_t *inner_ip, uint16_t inner_len,
+			 uint16_t mtu_hint)
+{
+	struct icmp_err e;
+	uint32_t ihl;
+
+	if (!inner_ip || inner_len < IP_HDR_MIN + 8)
+		return;
+	ihl = (uint32_t)(inner_ip[0] & 0x0F) * 4;
+	if (ihl < IP_HDR_MIN || inner_len < ihl + 8)
+		return;
+	mm_memset(&e, 0, sizeof(e));
+	e.type = icmp_type;
+	e.code = icmp_code;
+	e.proto = inner_ip[9];
+	e.saddr = rd32(inner_ip + 12);
+	e.daddr = rd32(inner_ip + 16);
+	e.from = e.saddr;
+	e.iph = inner_ip;
+	e.ihl = ihl;
+	e.l4 = inner_ip + ihl;
+	e.l4len = (uint32_t)inner_len - ihl;
+	e.info = mtu_hint;
+	icmp_err_dispatch(&e);
+}
+
+void icmp_init(void)
+{
+	icmp_rl_reset();
 }

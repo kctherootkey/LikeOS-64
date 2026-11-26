@@ -8,7 +8,10 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/nic/ne2k.h>
+#include <kernel/dev/nic/nic_util.h>
 #include <kernel/net/net.h>
+#include <kernel/net/netdevice.h>
+#include <kernel/net/skb.h>
 #include <kernel/hal/pci.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
@@ -86,24 +89,16 @@ static void ne_delay_us(uint32_t us)
 }
 
 // ============================================================================
-// Remote DMA helpers — read/write internal SRAM via the data port
+// Remote DMA helpers — read/write internal SRAM via the data port.
+// The chip runs in word mode (DCR.WTS): every transfer moves 16-bit words,
+// so the byte count is rounded up to even -- a read stores the extra byte
+// (the buffer has room for it), a write sends one byte of padding (the
+// transmit length is programmed separately).  Byte mode (8-bit) is only
+// used for the address PROM before the chip is configured.
+// Caller holds the chip lock.
 // ============================================================================
-static void ne_dma_read(ne2k_dev_t *dev, uint16_t src, uint8_t *dst,
-			uint16_t len)
+static void ne_wait_rdc(ne2k_dev_t *dev)
 {
-	// Clear ISR.RDC, set up source address + byte count, then issue the
-	// "remote read" command and pull bytes from the data port.
-	ne_w8(dev, NE_P0_ISR, NE_INT_RDC);
-	ne_w8(dev, NE_P0_RBCR0, len & 0xFF);
-	ne_w8(dev, NE_P0_RBCR1, (len >> 8) & 0xFF);
-	ne_w8(dev, NE_P0_RSAR0, src & 0xFF);
-	ne_w8(dev, NE_P0_RSAR1, (src >> 8) & 0xFF);
-	ne_w8(dev, NE_CR, NE_CR_RD_RD | NE_CR_STA);
-
-	for (uint16_t i = 0; i < len; i++)
-		dst[i] = inb(dev->io_base + NE_DATA);
-
-	// Wait for DMA done
 	for (int i = 0; i < 1000; i++) {
 		if (ne_r8(dev, NE_P0_ISR) & NE_INT_RDC)
 			break;
@@ -112,25 +107,56 @@ static void ne_dma_read(ne2k_dev_t *dev, uint16_t src, uint8_t *dst,
 	ne_w8(dev, NE_P0_ISR, NE_INT_RDC);
 }
 
+static void ne_dma_setup(ne2k_dev_t *dev, uint16_t addr, uint16_t count,
+			 uint8_t cmd)
+{
+	ne_w8(dev, NE_P0_ISR, NE_INT_RDC);
+	ne_w8(dev, NE_P0_RBCR0, count & 0xFF);
+	ne_w8(dev, NE_P0_RBCR1, (count >> 8) & 0xFF);
+	ne_w8(dev, NE_P0_RSAR0, addr & 0xFF);
+	ne_w8(dev, NE_P0_RSAR1, (addr >> 8) & 0xFF);
+	ne_w8(dev, NE_CR, cmd | NE_CR_STA);
+}
+
+/* Byte-mode read (the PROM, before word mode is set up). */
+static void ne_dma_read8(ne2k_dev_t *dev, uint16_t src, uint8_t *dst,
+			 uint16_t len)
+{
+	ne_dma_setup(dev, src, len, NE_CR_RD_RD);
+	for (uint16_t i = 0; i < len; i++)
+		dst[i] = inb(dev->io_base + NE_DATA);
+	ne_wait_rdc(dev);
+}
+
+/* Word-mode read of `len' bytes; `dst' has room for len rounded up to
+ * even. */
+static void ne_dma_read(ne2k_dev_t *dev, uint16_t src, uint8_t *dst,
+			uint16_t len)
+{
+	uint16_t count = (uint16_t)((len + 1u) & ~1u);
+
+	ne_dma_setup(dev, src, count, NE_CR_RD_RD);
+	for (uint16_t i = 0; i < count; i += 2) {
+		uint16_t w = inw(dev->io_base + NE_DATA);
+
+		dst[i] = (uint8_t)w;
+		dst[i + 1] = (uint8_t)(w >> 8);
+	}
+	ne_wait_rdc(dev);
+}
+
+/* Word-mode write of `len' bytes from `src', which holds len rounded up to
+ * even. */
 static void ne_dma_write(ne2k_dev_t *dev, uint16_t dst, const uint8_t *src,
 			 uint16_t len)
 {
-	ne_w8(dev, NE_P0_ISR, NE_INT_RDC);
-	ne_w8(dev, NE_P0_RBCR0, len & 0xFF);
-	ne_w8(dev, NE_P0_RBCR1, (len >> 8) & 0xFF);
-	ne_w8(dev, NE_P0_RSAR0, dst & 0xFF);
-	ne_w8(dev, NE_P0_RSAR1, (dst >> 8) & 0xFF);
-	ne_w8(dev, NE_CR, NE_CR_RD_WR | NE_CR_STA);
+	uint16_t count = (uint16_t)((len + 1u) & ~1u);
 
-	for (uint16_t i = 0; i < len; i++)
-		outb(dev->io_base + NE_DATA, src[i]);
-
-	for (int i = 0; i < 1000; i++) {
-		if (ne_r8(dev, NE_P0_ISR) & NE_INT_RDC)
-			break;
-		ne_delay_us(10);
-	}
-	ne_w8(dev, NE_P0_ISR, NE_INT_RDC);
+	ne_dma_setup(dev, dst, count, NE_CR_RD_WR);
+	for (uint16_t i = 0; i < count; i += 2)
+		outw(dev->io_base + NE_DATA,
+		     (uint16_t)(src[i] | ((uint16_t)src[i + 1] << 8)));
+	ne_wait_rdc(dev);
 }
 
 // ============================================================================
@@ -161,7 +187,7 @@ static int ne_reset(ne2k_dev_t *dev)
 // byte appears twice** in the I/O space (real silicon and QEMU both do
 // this — see ne2000_reset() in QEMU which explicitly duplicates the
 // PROM contents into pairs).  So to recover the 6 MAC bytes we read
-// 12 bytes and keep every other one.  This matches the reference `ne.c`.
+// 12 bytes and keep every other one.
 // ============================================================================
 static void ne_read_mac(ne2k_dev_t *dev)
 {
@@ -179,60 +205,194 @@ static void ne_read_mac(ne2k_dev_t *dev)
 	ne_w8(dev, NE_P0_IMR, 0); // mask all
 	ne_w8(dev, NE_P0_ISR, 0xFF); // clear all
 
-	ne_dma_read(dev, 0x0000, prom, sizeof(prom));
+	ne_dma_read8(dev, 0x0000, prom, sizeof(prom));
 
 	// De-duplicate: take bytes 0, 2, 4, 6, 8, 10
 	for (int i = 0; i < 6; i++)
 		dev->mac_addr[i] = prom[i * 2];
 }
 
-// ============================================================================
-// Send a single Ethernet frame
-// ============================================================================
-static int ne2k_send(net_device_t *ndev, const uint8_t *data, uint16_t len)
+// Interrupt sources: all handled; the NAPI poll owns PRX/RXE while it runs
+#define NE_IMR_ALL                                                   \
+	(NE_INT_PRX | NE_INT_PTX | NE_INT_RXE | NE_INT_TXE | NE_INT_OVW | \
+	 NE_INT_CNT)
+#define NE_IMR_NAPI (NE_INT_PRX | NE_INT_RXE)
+
+/* The receive filter: page 1 MAR0..7 (a 64-bit hash of the multicast
+ * addresses, all ones for every multicast), RCR accept bits.  The chip
+ * keeps running; the receiver accepts broadcast only meanwhile.  Caller
+ * holds the chip lock. */
+static void ne_set_filter_locked(ne2k_dev_t *dev, const uint8_t mar[8],
+				 uint8_t rcr)
 {
-	BUG_ON(ndev == NULL);
-	ne2k_dev_t *dev = (ne2k_dev_t *)ndev->driver_data;
-	BUG_ON(dev == NULL);
+	ne_w8(dev, NE_P0_RCR, NE_RCR_AB);
+	ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_PS0 | NE_CR_STA);
+	for (int m = 0; m < 8; m++)
+		ne_w8(dev, NE_P1_MAR0 + m, mar[m]);
+	ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STA);
+	ne_w8(dev, NE_P0_RCR, rcr);
+}
 
-	if (len > 1518)
-		return -1;
+static void ne_compute_filter(ne2k_dev_t *dev, uint8_t mar[8], uint8_t *rcr)
+{
+	uint8_t mc[NETDEV_MC_MAX][6];
+	int all = 0, n = 0;
+	uint32_t flags = 0;
 
-	// Pad short frames to 60 bytes (MAC strips FCS — the chip will add 4
-	// CRC bytes for us).  Assemble in a small stack buffer.
-	uint8_t buf[1518];
-	uint16_t out_len = (len < 60) ? 60 : len;
-	mm_memcpy(buf, data, len);
-	if (out_len > len)
-		mm_memset(buf + len, 0, out_len - len);
-
-	// Serialize across CPUs: chip has a single TX buffer + CR doorbell;
-	// two concurrent senders would corrupt the in-flight frame.
-	uint64_t txflags;
-	spin_lock_irqsave(&dev->tx_lock, &txflags);
-
-	// Wait until any prior transmit has finished (CR.TXP must be 0).
-	for (int i = 0; i < 10000; i++) {
-		if (!(ne_r8(dev, NE_CR) & NE_CR_TXP))
-			break;
-		ne_delay_us(10);
+	if (dev->net_dev.core_ready) {
+		n = dev_mc_snapshot(&dev->net_dev, mc, NETDEV_MC_MAX, &all);
+		flags = __atomic_load_n(&dev->net_dev.flags, __ATOMIC_ACQUIRE);
 	}
+	for (int m = 0; m < 8; m++)
+		mar[m] = 0;
+	*rcr = NE_RCR_AB;
+	if (all || (flags & (IFF_ALLMULTI | IFF_PROMISC))) {
+		for (int m = 0; m < 8; m++)
+			mar[m] = 0xFF;
+		*rcr |= NE_RCR_AM;
+	} else if (n > 0) {
+		for (int i = 0; i < n; i++) {
+			uint32_t bit = nic_mc_hash64_be(mc[i]);
 
-	// Copy frame into TX buffer (page NE_TX_PAGE_START, address 0x4000)
-	ne_dma_write(dev, NE_TX_PAGE_START * NE_PAGE_SIZE, buf, out_len);
+			mar[bit >> 3] |= (uint8_t)(1u << (bit & 7));
+		}
+		*rcr |= NE_RCR_AM;
+	}
+	if (flags & IFF_PROMISC)
+		*rcr |= NE_RCR_PRO;
+}
 
-	// Program TX
+/* Program the reset chip (NS DP8390 sequence): stopped, word-mode DMA,
+ * receiver in monitor mode and transmitter in loopback while the ring
+ * pointers, the address and the filter go in, then started with the
+ * interrupts unmasked.  Both transmit buffers and the ring start empty.
+ * Caller holds the chip lock (or the device is not live yet). */
+static void ne_hw_init(ne2k_dev_t *dev)
+{
+	uint8_t mar[8], rcr;
+
+	ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STP);
+	// word transfers, normal operation, FIFO threshold 8 bytes
+	ne_w8(dev, NE_P0_DCR, NE_DCR_WTS | NE_DCR_LS | NE_DCR_FT_8B);
+	ne_w8(dev, NE_P0_RBCR0, 0);
+	ne_w8(dev, NE_P0_RBCR1, 0);
+	ne_w8(dev, NE_P0_RCR, NE_RCR_MON);
+	ne_w8(dev, NE_P0_TCR, NE_TCR_LB_INTERNAL);
+
+	// Ring pointers — standard 8390 convention:
+	//   BNRY = PSTART, CURR = PSTART + 1.  The ring-empty test in
+	//   the chip is `BNRY + 1 == CURR`, so this leaves the ring
+	//   empty as expected on entry.
 	ne_w8(dev, NE_P0_TPSR, NE_TX_PAGE_START);
-	ne_w8(dev, NE_P0_TBCR0, out_len & 0xFF);
-	ne_w8(dev, NE_P0_TBCR1, (out_len >> 8) & 0xFF);
+	ne_w8(dev, NE_P0_PSTART, NE_RX_PAGE_START);
+	ne_w8(dev, NE_P0_PSTOP, NE_RX_PAGE_STOP);
+	ne_w8(dev, NE_P0_BNRY, NE_RX_PAGE_START);
 
-	// Kick — STA + TXP, page 0, abort DMA bits cleared
+	// Clear interrupts and mask
+	ne_w8(dev, NE_P0_ISR, 0xFF);
+	ne_w8(dev, NE_P0_IMR, 0);
+
+	// Page 1 — program MAC, CURR
+	ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_PS0 | NE_CR_STP);
+	for (int m = 0; m < 6; m++)
+		ne_w8(dev, NE_P1_PAR0 + m, dev->mac_addr[m]);
+	ne_w8(dev, NE_P1_CURR, NE_RX_PAGE_START + 1);
+	ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STP);
+	dev->next_pkt = NE_RX_PAGE_START + 1;
+	dev->tx_len[0] = dev->tx_len[1] = 0;
+	dev->tx_active = -1;
+	dev->tx_next = 0;
+	dev->tx_stamp = 0;
+
+	// Back to page 0, start chip, filter, interrupts
+	ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STA);
+	ne_w8(dev, NE_P0_TCR, NE_TCR_LB_NORMAL);
+	ne_compute_filter(dev, mar, &rcr);
+	ne_set_filter_locked(dev, mar, rcr);
+	ne_w8(dev, NE_P0_ISR, 0xFF);
+	dev->imr = NE_IMR_ALL;
+	ne_w8(dev, NE_P0_IMR, dev->imr);
+}
+
+// ============================================================================
+// Transmit (net_device_t xmit hook): two buffers, one sent while the next
+// is loaded
+// ============================================================================
+
+/* Start sending buffer `i'.  Caller holds the chip lock. */
+static void ne_tx_start_locked(ne2k_dev_t *dev, int i)
+{
+	ne_w8(dev, NE_P0_TPSR, (uint8_t)(NE_TX_PAGE_START + i * NE_TX_PAGES));
+	ne_w8(dev, NE_P0_TBCR0, dev->tx_len[i] & 0xFF);
+	ne_w8(dev, NE_P0_TBCR1, (dev->tx_len[i] >> 8) & 0xFF);
 	ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_TXP | NE_CR_STA);
+	dev->tx_active = i;
+	{
+		uint64_t now = timer_ticks();
 
+		dev->tx_stamp = now ? now : 1;
+	}
+}
+
+/* The active transmission ended (PTX or TXE): free its buffer and start
+ * the other if it is loaded.  Caller holds the chip lock. */
+static void ne_tx_done_locked(ne2k_dev_t *dev, int error)
+{
+	int i = dev->tx_active;
+
+	if (i < 0)
+		return;
+	if (error)
+		dev->net_dev.tx_errors++;
+	dev->tx_len[i] = 0;
+	dev->tx_active = -1;
+	dev->tx_stamp = 0;
+	if (dev->tx_len[i ^ 1])
+		ne_tx_start_locked(dev, i ^ 1);
+	if (netif_queue_stopped(&dev->net_dev))
+		netif_wake_queue(&dev->net_dev);
+}
+
+static int ne2k_xmit(sk_buff_t *skb, net_device_t *ndev)
+{
+	ne2k_dev_t *dev = (ne2k_dev_t *)ndev->driver_data;
+	uint32_t len = skb->len;
+	uint8_t buf[1520];
+	uint64_t f;
+
+	BUG_ON(dev == NULL);
+	if (len == 0 || len > 1518) {
+		ndev->tx_dropped++;
+		skb_put(skb);
+		return NETDEV_TX_OK;
+	}
+	// Pad short frames to 60 bytes (the chip appends the CRC); one more
+	// byte of room for the word-mode transfer.
+	uint16_t out_len = (uint16_t)((len < 60) ? 60 : len);
+	mm_memcpy(buf, skb->data, len);
+	mm_memset(buf + len, 0, (size_t)(out_len - len) + 1);
+
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	int i = dev->tx_len[dev->tx_next] ? dev->tx_next ^ 1 : dev->tx_next;
+	if (dev->tx_len[i]) {
+		netif_stop_queue(ndev);
+		spin_unlock_irqrestore(&dev->tx_lock, f);
+		return NETDEV_TX_BUSY;
+	}
+	ne_dma_write(dev, (uint16_t)((NE_TX_PAGE_START + i * NE_TX_PAGES) *
+				     NE_PAGE_SIZE),
+		     buf, out_len);
+	dev->tx_len[i] = out_len;
+	dev->tx_next = i ^ 1;
+	if (dev->tx_active < 0)
+		ne_tx_start_locked(dev, i);
 	ndev->tx_packets++;
 	ndev->tx_bytes += out_len;
-	spin_unlock_irqrestore(&dev->tx_lock, txflags);
-	return 0;
+	if (dev->tx_len[0] && dev->tx_len[1])
+		netif_stop_queue(ndev);
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+	skb_put(skb);
+	return NETDEV_TX_OK;
 }
 
 // ============================================================================
@@ -274,91 +434,159 @@ static void ne2k_shutdown(net_device_t *ndev)
 }
 
 // ============================================================================
-// Drain RX ring — read packets between BNRY+1 and CURR
+// Receive (NAPI poll)
 // ============================================================================
-static void ne_drain_rx(ne2k_dev_t *dev)
+
+/* Throw the ring away and start it empty.  Caller holds the chip lock. */
+static void ne_rx_ring_reset_locked(ne2k_dev_t *dev)
 {
-	WARN_ON(dev->next_pkt < NE_RX_PAGE_START ||
-		dev->next_pkt >
-			NE_RX_PAGE_STOP); /* next_pkt outside RX ring [PSTART,PSTOP] - ring pointer corrupted */
-	while (1) {
-		// Read CURR from page 1
-		ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_PS0 | NE_CR_STA);
-		uint8_t curr = ne_r8(dev, NE_P1_CURR);
-		// Switch back to page 0
-		ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STA);
+	ne_w8(dev, NE_P0_BNRY, NE_RX_PAGE_START);
+	ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_PS0 | NE_CR_STA);
+	ne_w8(dev, NE_P1_CURR, NE_RX_PAGE_START + 1);
+	ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STA);
+	dev->next_pkt = NE_RX_PAGE_START + 1;
+}
 
-		if (curr == dev->next_pkt)
-			break; // ring empty
+/* Take the next frame out of the ring into rx_bounce.  Returns its length,
+ * 0 when the ring is empty, -1 when the ring was corrupt (and reset).
+ * Caller holds the chip lock. */
+static int ne_rx_one_locked(ne2k_dev_t *dev)
+{
+	// Read CURR from page 1
+	ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_PS0 | NE_CR_STA);
+	uint8_t curr = ne_r8(dev, NE_P1_CURR);
+	ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STA);
 
-		// Read 4-byte packet header at <next_pkt>:0
-		// header[0] = receive status
-		// header[1] = next packet page
-		// header[2..3] = length (LE, includes 4-byte header itself)
-		uint8_t hdr[4];
-		ne_dma_read(dev, dev->next_pkt * NE_PAGE_SIZE, hdr, 4);
+	if (curr == dev->next_pkt)
+		return 0; // ring empty
 
-		uint8_t status = hdr[0];
-		uint8_t next_pkt = hdr[1];
-		uint16_t length = (uint16_t)hdr[2] | ((uint16_t)hdr[3] << 8);
+	// The 4-byte header at <next_pkt>:0: receive status, next page,
+	// length (LE, including the header)
+	uint8_t hdr[4];
+	ne_dma_read(dev, (uint16_t)(dev->next_pkt * NE_PAGE_SIZE), hdr, 4);
 
-		// Sanity-check: a valid packet has status bit 0 (PRX) set, the
-		// next-page lies in the RX ring, and the length is plausible.
-		if (!(status & 0x01) || next_pkt < NE_RX_PAGE_START ||
-		    next_pkt > NE_RX_PAGE_STOP || length < 4 || length > 1522) {
-			// Corrupt — reset ring pointers and bail.
-			dev->net_dev.rx_errors++;
-			ne_w8(dev, NE_P0_BNRY, NE_RX_PAGE_START);
-			ne_w8(dev, NE_CR,
-			      NE_CR_RD_ABORT | NE_CR_PS0 | NE_CR_STA);
-			ne_w8(dev, NE_P1_CURR, NE_RX_PAGE_START + 1);
-			ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STA);
-			dev->next_pkt = NE_RX_PAGE_START + 1;
-			return;
-		}
+	uint8_t status = hdr[0];
+	uint8_t next_pkt = hdr[1];
+	uint16_t length = (uint16_t)hdr[2] | ((uint16_t)hdr[3] << 8);
 
-		uint16_t payload_len =
-			length - 4; // strip the in-RAM 4-byte header
-		if (payload_len > 1518)
-			payload_len = 1518;
-
-		uint8_t pkt[1518];
-		// Packet may wrap the ring — split into two reads if so.
-		uint16_t addr = dev->next_pkt * NE_PAGE_SIZE + 4;
-		uint16_t end = NE_RX_PAGE_STOP * NE_PAGE_SIZE;
-		if (addr + payload_len <= end) {
-			ne_dma_read(dev, addr, pkt, payload_len);
-		} else {
-			uint16_t first = end - addr;
-			ne_dma_read(dev, addr, pkt, first);
-			ne_dma_read(dev, NE_RX_PAGE_START * NE_PAGE_SIZE,
-				    pkt + first, payload_len - first);
-		}
-
-		net_rx_packet(&dev->net_dev, pkt, payload_len);
-
-		// Advance: BNRY = next_pkt - 1 (with wrap to PSTOP-1 at PSTART)
-		uint8_t new_bnry = (next_pkt == NE_RX_PAGE_START) ?
-					   (NE_RX_PAGE_STOP - 1) :
-					   (next_pkt - 1);
-		ne_w8(dev, NE_P0_BNRY, new_bnry);
-
-		WARN_ON(next_pkt < NE_RX_PAGE_START ||
-			next_pkt >
-				NE_RX_PAGE_STOP); /* next_pkt from packet header outside RX ring bounds - chip/memory corruption */
-		dev->next_pkt = next_pkt;
+	// Sanity-check: a valid packet has status bit 0 (PRX) set, the
+	// next-page lies in the RX ring, and the length is plausible.
+	if (!(status & NE_RSR_PRX) || next_pkt < NE_RX_PAGE_START ||
+	    next_pkt >= NE_RX_PAGE_STOP || length < 4 + 14 || length > 1522) {
+		dev->net_dev.rx_errors++;
+		ne_rx_ring_reset_locked(dev);
+		return -1;
 	}
+
+	uint16_t payload_len = length - 4; // strip the in-RAM 4-byte header
+	if (payload_len > 1518)
+		payload_len = 1518;
+
+	// Packet may wrap the ring — split into two reads if so.
+	uint16_t addr = (uint16_t)(dev->next_pkt * NE_PAGE_SIZE + 4);
+	uint16_t end = NE_RX_PAGE_STOP * NE_PAGE_SIZE;
+	if (addr + payload_len <= end) {
+		ne_dma_read(dev, addr, dev->rx_bounce, payload_len);
+	} else {
+		uint16_t first = end - addr; // even: both ends are
+		ne_dma_read(dev, addr, dev->rx_bounce, first);
+		ne_dma_read(dev, NE_RX_PAGE_START * NE_PAGE_SIZE,
+			    dev->rx_bounce + first, payload_len - first);
+	}
+
+	// Advance: BNRY = next_pkt - 1 (with wrap to PSTOP-1 at PSTART)
+	uint8_t new_bnry = (next_pkt == NE_RX_PAGE_START) ?
+				   (NE_RX_PAGE_STOP - 1) :
+				   (next_pkt - 1);
+	ne_w8(dev, NE_P0_BNRY, new_bnry);
+	dev->next_pkt = next_pkt;
+	return payload_len;
+}
+
+static int ne2k_poll(struct napi_struct *n, int budget)
+{
+	ne2k_dev_t *dev = (ne2k_dev_t *)n->dev->driver_data;
+	net_device_t *nd = &dev->net_dev;
+	uint64_t f;
+	int work = 0;
+
+	while (work < budget) {
+		int len;
+
+		spin_lock_irqsave(&dev->tx_lock, &f);
+		len = ne_rx_one_locked(dev);
+		spin_unlock_irqrestore(&dev->tx_lock, f);
+		if (len == 0)
+			break;
+		work++;
+		if (len < 0)
+			continue;
+		sk_buff_t *skb = skb_alloc((uint32_t)len);
+
+		if (!skb) {
+			nd->rx_dropped++;
+			continue;
+		}
+		skb->dev = nd;
+		mm_memcpy(skb_append(skb, (uint32_t)len), dev->rx_bounce,
+			  (size_t)len);
+		nd->rx_packets++;
+		nd->rx_bytes += (uint32_t)len;
+		if (dev->rx_bounce[0] & 1)
+			nd->multicast++;
+		napi_gro_receive(&dev->napi, skb);
+	}
+	if (work < budget && napi_complete_done(n, work)) {
+		spin_lock_irqsave(&dev->tx_lock, &f);
+		dev->imr = NE_IMR_ALL;
+		ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STA);
+		ne_w8(dev, NE_P0_IMR, dev->imr);
+		spin_unlock_irqrestore(&dev->tx_lock, f);
+	}
+	return work;
+}
+
+/* Receive ring overflow (the DP8390 procedure): stop, let the receive
+ * finish, clear the remote byte count, note whether a transmission was cut
+ * short, restart in loopback, empty the ring, back to normal and resend
+ * what was cut short.  The ring's frames are dropped.  Caller holds the
+ * chip lock. */
+static void ne_rx_overrun_locked(ne2k_dev_t *dev)
+{
+	int was_txing = (ne_r8(dev, NE_CR) & NE_CR_TXP) != 0;
+
+	dev->st_overruns++;
+	dev->net_dev.rx_dropped++;
+	ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STP);
+	ne_delay_us(2000);
+	ne_w8(dev, NE_P0_RBCR0, 0);
+	ne_w8(dev, NE_P0_RBCR1, 0);
+	int resend = was_txing &&
+		     !(ne_r8(dev, NE_P0_ISR) & (NE_INT_PTX | NE_INT_TXE));
+	ne_w8(dev, NE_P0_TCR, NE_TCR_LB_INTERNAL);
+	ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STA);
+	ne_rx_ring_reset_locked(dev);
+	ne_w8(dev, NE_P0_ISR, NE_INT_OVW);
+	ne_w8(dev, NE_P0_TCR, NE_TCR_LB_NORMAL);
+	if (resend)
+		ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_TXP | NE_CR_STA);
 }
 
 // ============================================================================
 // Top-half IRQ handler
 // ============================================================================
-void ne2k_irq_handler(void)
+/* Returns 1 when the interrupt was this card's, 0 otherwise (shared line);
+ * the dispatcher acknowledges the local APIC.
+ *
+ * The whole handler runs under the chip lock: the DP8390 has one command
+ * register, one register page select and one remote-DMA engine, which the
+ * transmit hook and the poll drive too.  Transmit completion is handled
+ * here (it starts the other buffer); received frames go to the NAPI poll
+ * with PRX/RXE masked until it is done. */
+int ne2k_irq_handler(void)
 {
-	if (!g_ne2k_initialized) {
-		lapic_eoi();
-		return;
-	}
+	if (!g_ne2k_initialized)
+		return 0;
 
 	// Feed entropy from NIC IRQ timing
 	{
@@ -369,43 +597,109 @@ void ne2k_irq_handler(void)
 	}
 
 	ne2k_dev_t *dev = &g_ne2k;
+	uint64_t lflags;
+	int sched = 0;
+
+	spin_lock_irqsave(&dev->tx_lock, &lflags);
 
 	// Force page 0 so we can read ISR
 	ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STA);
 
-	uint8_t isr = ne_r8(dev, NE_P0_ISR);
-	if (isr == 0) {
-		lapic_eoi();
-		return;
+	uint8_t raw = ne_r8(dev, NE_P0_ISR);
+	/* Ours when a source we enabled is pending (RST and RDC never are;
+	 * receive sources latched while the poll runs are not either). */
+	uint8_t isr = raw & NE_IMR_ALL;
+	if (raw == 0xFF || !(isr & dev->imr)) {
+		spin_unlock_irqrestore(&dev->tx_lock, lflags);
+		return 0;
 	}
 
 	// Ack handled bits (W1C)
 	ne_w8(dev, NE_P0_ISR, isr);
 
-	if (isr & NE_INT_PRX)
-		ne_drain_rx(dev);
+	if (isr & (NE_INT_PTX | NE_INT_TXE))
+		ne_tx_done_locked(dev, (isr & NE_INT_TXE) != 0);
 	if (isr & NE_INT_RXE)
 		dev->net_dev.rx_errors++;
-	if (isr & NE_INT_TXE)
-		dev->net_dev.tx_errors++;
-	if (isr & NE_INT_OVW) {
-		// Ring overflow — reset, then drain whatever is left
-		dev->net_dev.rx_dropped++;
-		ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STP);
-		ne_w8(dev, NE_P0_RBCR0, 0);
-		ne_w8(dev, NE_P0_RBCR1, 0);
-		ne_w8(dev, NE_P0_TCR, NE_TCR_LB_INTERNAL);
-		ne_w8(dev, NE_P0_BNRY, NE_RX_PAGE_START);
-		ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_PS0 | NE_CR_STP);
-		ne_w8(dev, NE_P1_CURR, NE_RX_PAGE_START + 1);
-		ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STA);
-		dev->next_pkt = NE_RX_PAGE_START + 1;
-		ne_w8(dev, NE_P0_TCR, NE_TCR_LB_NORMAL);
+	if (isr & NE_INT_OVW)
+		ne_rx_overrun_locked(dev);
+	if (isr & NE_INT_CNT) {
+		dev->st_rx_frame += ne_r8(dev, NE_P0_CNTR0);
+		dev->st_rx_crc += ne_r8(dev, NE_P0_CNTR1);
+		dev->st_missed += ne_r8(dev, NE_P0_CNTR2);
 	}
-	// PTX, RDC, CNT — nothing to do (TX completion polled in send(),
-	// counters auto-clear on read).
+	if ((isr & (NE_INT_PRX | NE_INT_RXE)) && (dev->imr & NE_IMR_NAPI)) {
+		dev->imr &= (uint8_t)~NE_IMR_NAPI;
+		ne_w8(dev, NE_P0_IMR, dev->imr);
+		sched = 1;
+	}
+	spin_unlock_irqrestore(&dev->tx_lock, lflags);
+	if (sched || (isr & (NE_INT_PRX | NE_INT_RXE)))
+		napi_schedule(&dev->napi);
+	return 1;
+}
 
-	lapic_eoi();
+// ============================================================================
+// Receive filter, statistics, watchdog
+// ============================================================================
+static void ne2k_set_rx_mode(net_device_t *ndev)
+{
+	ne2k_dev_t *dev = (ne2k_dev_t *)ndev->driver_data;
+
+	__atomic_store_n(&dev->rx_mode_pending, 1, __ATOMIC_RELEASE);
+	net_housekeeping_kick();
+}
+
+static void ne2k_get_stats64(net_device_t *ndev, struct net_device_stats64 *s)
+{
+	ne2k_dev_t *dev = (ne2k_dev_t *)ndev->driver_data;
+
+	s->rx_frame_errors = dev->st_rx_frame;
+	s->rx_crc_errors = dev->st_rx_crc;
+	s->rx_missed_errors = dev->st_missed;
+	s->rx_over_errors = dev->st_overruns;
+	s->rx_errors += dev->st_rx_frame + dev->st_rx_crc;
+}
+
+static void ne2k_tx_timeout(net_device_t *ndev)
+{
+	ne2k_dev_t *dev = (ne2k_dev_t *)ndev->driver_data;
+
+	__atomic_store_n(&dev->reset_pending, 1, __ATOMIC_RELEASE);
+}
+
+// Network housekeeping softirq, CPU 0, ~10 Hz and when kicked.
+static void ne2k_watchdog(net_device_t *ndev)
+{
+	ne2k_dev_t *dev = (ne2k_dev_t *)ndev->driver_data;
+	uint64_t f, now = timer_ticks();
+
+	if (!dev || !g_ne2k_initialized)
+		return;
+	if (__atomic_exchange_n(&dev->rx_mode_pending, 0, __ATOMIC_ACQ_REL)) {
+		uint8_t mar[8], rcr;
+
+		ne_compute_filter(dev, mar, &rcr);
+		spin_lock_irqsave(&dev->tx_lock, &f);
+		ne_set_filter_locked(dev, mar, rcr);
+		spin_unlock_irqrestore(&dev->tx_lock, f);
+	}
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	if (dev->tx_active >= 0 && dev->tx_stamp &&
+	    now - dev->tx_stamp > net_ms_to_ticks(5000))
+		__atomic_store_n(&dev->reset_pending, 1, __ATOMIC_RELEASE);
+	if (__atomic_exchange_n(&dev->reset_pending, 0, __ATOMIC_ACQ_REL)) {
+		/* Transmit timeout: reset and reprogram the chip; the
+		 * frames in its buffers and ring are dropped. */
+		kprintf("NE2K: transmit timed out, resetting the chip\n");
+		dev->net_dev.tx_errors += (dev->tx_len[0] ? 1 : 0) +
+					  (dev->tx_len[1] ? 1 : 0);
+		(void)ne_reset(dev);
+		ne_hw_init(dev);
+		if (netif_queue_stopped(&dev->net_dev))
+			netif_wake_queue(&dev->net_dev);
+	}
+	spin_unlock_irqrestore(&dev->tx_lock, f);
 }
 
 // ============================================================================
@@ -441,6 +735,7 @@ void ne2k_init(void)
 
 		ne2k_dev_t *dev = &g_ne2k;
 		dev->pci_dev = &devs[i];
+		dev->tx_lock = (spinlock_t)SPINLOCK_INIT("ne2k_tx");
 
 		pci_enable_busmaster_mem(dev->pci_dev);
 
@@ -471,50 +766,12 @@ void ne2k_init(void)
 			dev->mac_addr[0], dev->mac_addr[1], dev->mac_addr[2],
 			dev->mac_addr[3], dev->mac_addr[4], dev->mac_addr[5]);
 
-		// Standard NE2000 init sequence (NS DP8390 datasheet):
-		//   1. Stop chip, 8-bit DMA, FT=8
-		//   2. Clear remote byte count
-		//   3. RX in monitor; TX in internal loopback (defer accept until
-		//      after we've programmed the MAC and ring pointers)
-		//   4. Page 0: ring pointers (PSTART/PSTOP/BNRY/TPSR)
-		//   5. Clear ISR, mask interrupts
-		//   6. Page 1: program PAR0..5 from MAC, MAR0..7 = 0xFF, CURR
-		//   7. Page 0: STA + abort DMA, RX/TX in normal mode, unmask IRQs
+		/* Chip stopped, interrupts masked until the device is
+		 * registered (ne_hw_init programs and starts it). */
 		ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STP);
-		ne_w8(dev, NE_P0_DCR, NE_DCR_LS | NE_DCR_FT_8B);
-		ne_w8(dev, NE_P0_RBCR0, 0);
-		ne_w8(dev, NE_P0_RBCR1, 0);
-		ne_w8(dev, NE_P0_RCR, NE_RCR_MON);
-		ne_w8(dev, NE_P0_TCR, NE_TCR_LB_INTERNAL);
-
-		// Ring pointers — standard 8390 convention:
-		//   BNRY = PSTART, CURR = PSTART + 1.  The ring-empty test in
-		//   the chip is `BNRY + 1 == CURR`, so this leaves the ring
-		//   empty as expected on entry.
-		ne_w8(dev, NE_P0_TPSR, NE_TX_PAGE_START);
-		ne_w8(dev, NE_P0_PSTART, NE_RX_PAGE_START);
-		ne_w8(dev, NE_P0_PSTOP, NE_RX_PAGE_STOP);
-		ne_w8(dev, NE_P0_BNRY, NE_RX_PAGE_START);
-
-		// Clear interrupts and mask
-		ne_w8(dev, NE_P0_ISR, 0xFF);
 		ne_w8(dev, NE_P0_IMR, 0);
-
-		// Page 1 — program MAC, multicast accept-all, CURR
-		ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_PS0 | NE_CR_STP);
-		for (int m = 0; m < 6; m++)
-			ne_w8(dev, NE_P1_PAR0 + m, dev->mac_addr[m]);
-		for (int m = 0; m < 8; m++)
-			ne_w8(dev, NE_P1_MAR0 + m, 0xFF);
-		ne_w8(dev, NE_P1_CURR, NE_RX_PAGE_START + 1);
-
-		// Back to page 0, start chip
-		ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STA);
-		ne_w8(dev, NE_P0_TCR, NE_TCR_LB_NORMAL);
-		ne_w8(dev, NE_P0_RCR,
-		      NE_RCR_AB | NE_RCR_AM); // accept BC+MC + own MAC
-
-		dev->next_pkt = NE_RX_PAGE_START + 1;
+		ne_w8(dev, NE_P0_ISR, 0xFF);
+		dev->imr = 0;
 
 		// Resolve IRQ via ACPI _PRT first; chip has no MSI capability.
 		uint8_t irq = 0xFF;
@@ -579,7 +836,6 @@ void ne2k_init(void)
 
 		// Initialise net_device fields BEFORE enabling device IRQs.
 		dev->net_dev.lock = (spinlock_t)SPINLOCK_INIT("ne2k");
-		dev->tx_lock = (spinlock_t)SPINLOCK_INIT("ne2k_tx");
 		dev->net_dev.rx_packets = 0;
 		dev->net_dev.tx_packets = 0;
 		dev->net_dev.rx_bytes = 0;
@@ -588,13 +844,12 @@ void ne2k_init(void)
 		dev->net_dev.tx_errors = 0;
 		dev->net_dev.rx_dropped = 0;
 		dev->link_up = 1;
+		dev->net_dev.driver_data = dev;
+		// the poll exists before the handler can be called
+		netif_napi_add(&dev->net_dev, &dev->napi, ne2k_poll,
+			       NAPI_POLL_WEIGHT);
+		napi_enable(&dev->napi);
 		g_ne2k_initialized = 1;
-
-		// Enable interrupts of interest
-		ne_w8(dev, NE_P0_ISR, 0xFF);
-		ne_w8(dev, NE_P0_IMR,
-		      NE_INT_PRX | NE_INT_PTX | NE_INT_RXE | NE_INT_TXE |
-			      NE_INT_OVW);
 
 		// Wire up net_device_t and register
 		dev->net_dev.name = "eth0";
@@ -605,12 +860,25 @@ void ne2k_init(void)
 		dev->net_dev.netmask = 0;
 		dev->net_dev.gateway = 0;
 		dev->net_dev.dns_server = 0;
-		dev->net_dev.send = ne2k_send;
+		dev->net_dev.send = NULL;
+		dev->net_dev.xmit = ne2k_xmit;
 		dev->net_dev.link_status = ne2k_link_status;
 		dev->net_dev.shutdown = ne2k_shutdown;
-		dev->net_dev.driver_data = dev;
+		dev->net_dev.watchdog = ne2k_watchdog;
+		dev->net_dev.tx_timeout = ne2k_tx_timeout;
+		dev->net_dev.set_rx_mode = ne2k_set_rx_mode;
+		dev->net_dev.get_stats64 = ne2k_get_stats64;
 
 		net_register(&dev->net_dev);
+
+		// Program and start the chip, interrupts on
+		{
+			uint64_t f;
+
+			spin_lock_irqsave(&dev->tx_lock, &f);
+			ne_hw_init(dev);
+			spin_unlock_irqrestore(&dev->tx_lock, f);
+		}
 		kprintf("NE2K: Driver initialized successfully\n");
 		return; // first device only
 	}

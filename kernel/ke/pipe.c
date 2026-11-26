@@ -13,6 +13,7 @@
 #include <kernel/fs/file.h>
 
 extern void poll_notify_wq(struct wait_queue_head *);
+extern void eventpoll_release(void *entry);
 
 bool pipe_is_end(const void *ptr)
 {
@@ -120,6 +121,22 @@ bool pipe_end_hold(pipe_end_t *end)
 	return true;
 }
 
+bool pipe_end_tryhold(pipe_end_t *end)
+{
+	int old;
+
+	if (!end || end->magic != PIPE_MAGIC)
+		return false;
+	old = __atomic_load_n(&end->refcount, __ATOMIC_RELAXED);
+	while (old > 0) {
+		if (__atomic_compare_exchange_n(&end->refcount, &old, old + 1,
+						false, __ATOMIC_ACQ_REL,
+						__ATOMIC_RELAXED))
+			return true;
+	}
+	return false;
+}
+
 void pipe_close_end(pipe_end_t *end)
 {
 	BUG_ON(end == NULL);
@@ -137,6 +154,10 @@ void pipe_close_end(pipe_end_t *end)
 	 * looked this end up is still running. */
 	if (__atomic_sub_fetch(&end->refcount, 1, __ATOMIC_ACQ_REL) > 0)
 		return;
+
+	/* epoll sets watching this end let go of it first, while the end and
+	 * its pipe are still whole. */
+	eventpoll_release(end);
 
 	// Invalidate magic BEFORE freeing to prevent double-close via stale pointer
 	end->magic = 0;

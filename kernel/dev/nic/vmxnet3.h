@@ -13,6 +13,7 @@
 #include <kernel/uapi/types.h>
 #include <kernel/hal/pci.h>
 #include <kernel/net/net.h>
+#include <kernel/net/netdevice.h>
 #include <kernel/ke/sched.h>
 
 // ============================================================================
@@ -82,6 +83,20 @@
 // ============================================================================
 #define VMXNET3_IC_DISABLE_ALL 0x1
 
+// Interrupt moderation levels (intrConf.modLevels[])
+#define VMXNET3_IML_NONE 0
+#define VMXNET3_IML_ADAPTIVE 8 // the device adapts the rate to the load
+
+// uptFeatures
+#define VMXNET3_UPT1_F_RXCSUM 0x0001ULL // the device verifies RX checksums
+
+// Events (DriverShared.ecr; acknowledged by writing them to REG_ECR)
+#define VMXNET3_ECR_RQERR 0x1
+#define VMXNET3_ECR_TQERR 0x2
+#define VMXNET3_ECR_LINK 0x4
+#define VMXNET3_ECR_DIC 0x8
+#define VMXNET3_ECR_DEBUG 0x10
+
 // ============================================================================
 // Driver constants (deliberately small — keep memory footprint modest)
 // ============================================================================
@@ -97,7 +112,9 @@
  * to cwnd-halve.  vmxnet3 hardware supports up to 4096; 1024 is plenty
  * and matches the e1000 / igb config.  Ring 2 stays minimal (we don't
  * actually use it; host just validates the size is legal). */
-#define VMXNET3_NUM_TX_DESC 32
+/* 256 transmit descriptors (one frame each): a full window of a fast
+ * sender at 32 dropped frames the moment the host lagged. */
+#define VMXNET3_NUM_TX_DESC 256
 #define VMXNET3_NUM_RX_DESC 1024
 #define VMXNET3_NUM_RX2_DESC 32
 #define VMXNET3_NUM_TX_COMP VMXNET3_NUM_TX_DESC
@@ -372,18 +389,40 @@ typedef struct {
 	uint8_t tx_gen; // generation we write into new TX descs
 	uint16_t tx_comp_next;
 	uint8_t tx_comp_gen; // generation we expect on TX completion
-	spinlock_t tx_lock; // Serializes vmxnet3_send() across CPUs
+	/* Descriptors handed to the device and not yet completed, and the
+	 * oldest of them.  The ring is only VMXNET3_NUM_TX_DESC long, and a
+	 * slot must not be refilled before the device has completed it. */
+	uint16_t tx_cons;
+	uint16_t tx_inflight;
+	// Serializes vmxnet3_send() and the TX completion drain across CPUs.
+	spinlock_t tx_lock;
+	/* RX ring 0 refill position (next2fill) and the generation the next
+	 * refill is written with; it flips each time rx_prod wraps. */
 	uint16_t rx_prod;
 	uint8_t rx_gen;
 	uint16_t rx_comp_next;
 	uint8_t rx_comp_gen;
 
-	// Multicast filter table (1-byte placeholder; we accept all multicast)
+	// Multicast filter table: up to NETDEV_MC_MAX 6-byte addresses
 	uint8_t *mf_table;
 	uint64_t mf_table_phys;
 
 	int link_up;
+	uint32_t link_speed; // Mb/s from GET_LINK
 	uint8_t msi_vector; // 0 if MSI not in use
+
+	/* The command register (CMD write + result read) is one shared
+	 * channel: every user holds cmd_lock (interrupts off, a leaf). */
+	spinlock_t cmd_lock;
+	struct napi_struct napi;
+	volatile int link_change_pending; // event or link_status: re-query
+	volatile int rx_mode_pending; // set_rx_mode: apply in the watchdog
+	volatile int reset_pending; // queue error or TX hang: reset device
+	uint64_t link_poll_tick;
+	uint64_t tx_progress_tick; // last TX completion (or idle ring)
+	uint64_t stats_tick;
+	uint64_t st_rx_nobuf, st_rx_err, st_tx_err, st_tx_discard;
+	uint64_t st_resets;
 
 	net_device_t net_dev;
 } vmxnet3_dev_t;
@@ -392,6 +431,6 @@ typedef struct {
 // Public API
 // ============================================================================
 void vmxnet3_init(void);
-void vmxnet3_irq_handler(void);
+int vmxnet3_irq_handler(void);
 
 #endif // _KERNEL_VMXNET3_H_

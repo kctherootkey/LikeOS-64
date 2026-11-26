@@ -16,6 +16,7 @@
 #include <kernel/uapi/types.h>
 #include <kernel/hal/pci.h>
 #include <kernel/net/net.h>
+#include <kernel/net/netdevice.h>
 #include <kernel/ke/sched.h>
 
 // ============================================================================
@@ -165,12 +166,26 @@ typedef struct __attribute__((packed)) {
  * driver well under the hardware max while absorbing realistic
  * peer-cwnd bursts. */
 #define PCNET_NUM_RX_DESC 256 // log2 = 8 → rlen = 8 << 4 = 0x80
-#define PCNET_NUM_TX_DESC 16
+#define PCNET_NUM_TX_DESC 64 // log2 = 6
 #define PCNET_RX_BUF_SIZE 2048
 #define PCNET_TX_BUF_SIZE 2048
 
 #define PCNET_RX_LEN_LOG2 8
-#define PCNET_TX_LEN_LOG2 4
+#define PCNET_TX_LEN_LOG2 6
+
+// TMD2 (the TX descriptor's misc word) error bits
+#define TXM_RTRY (1u << 26) // too many retries (collisions)
+#define TXM_LCAR (1u << 27) // carrier lost
+#define TXM_LCOL (1u << 28) // late collision
+#define TXM_UFLO (1u << 30) // FIFO underflow: the transmitter stopped
+#define TXM_BUFF (1u << 31)
+
+// CSR3 interrupt masks the NAPI poll holds while it runs
+#define CSR3_NAPI_MASK                                                 \
+	(CSR3_BABLM | CSR3_MISSM | CSR3_MERRM | CSR3_RINTM | CSR3_TINTM | \
+	 CSR3_IDONM)
+// The logical address filter registers (CSR8..11) and the PROM mode bit
+#define PCNET_INIT_MODE_PROM 0x8000
 
 // ============================================================================
 // Per-device state
@@ -179,32 +194,42 @@ typedef struct {
 	const pci_device_t *pci_dev;
 	uint16_t io_base;
 	uint8_t mac_addr[6];
-
 	// DMA-coherent init block
 	pcnet_init_block_t *init_block;
 	uint64_t init_block_phys;
-
-	// RX ring
+	// RX ring: rx_cur = next to look at; only the NAPI poll and the
+	// restart (both CPU 0 softirq) touch it
 	pcnet_rx_desc_t *rx_descs;
 	uint64_t rx_descs_phys;
 	uint8_t *rx_bufs[PCNET_NUM_RX_DESC];
 	uint64_t rx_bufs_phys[PCNET_NUM_RX_DESC];
 	uint16_t rx_cur;
-
-	// TX ring
+	// TX ring: tx_cur filled, tx_clean reclaimed, under tx_lock;
+	// tx_stamp: tick queued (0 = free)
 	pcnet_tx_desc_t *tx_descs;
 	uint64_t tx_descs_phys;
 	uint8_t *tx_bufs[PCNET_NUM_TX_DESC];
 	uint64_t tx_bufs_phys[PCNET_NUM_TX_DESC];
+	uint64_t tx_stamp[PCNET_NUM_TX_DESC];
 	uint16_t tx_cur;
-	spinlock_t tx_lock; // Serializes pcnet_send() across CPUs
-
+	uint16_t tx_clean;
+	spinlock_t tx_lock; // the TX ring
+	/* RAP selects the register RDP/BDP then reads or writes: every
+	 * register access is the pair, under reg_lock (interrupts off, a
+	 * leaf; taken inside tx_lock). */
+	spinlock_t reg_lock;
 	int link_up;
-
+	int link_seen; // BCR4's link indicator was seen "up" once
+	struct napi_struct napi;
+	volatile int restart_pending; // TX underflow, hang, filter change
+	volatile int rx_mode_pending;
+	uint64_t st_missed, st_merr, st_babl, st_tx_aborted, st_tx_carrier;
+	uint64_t st_tx_window, st_tx_fifo, st_rx_crc, st_rx_frame,
+		st_rx_fifo, st_restarts;
 	net_device_t net_dev;
 } pcnet_dev_t;
 
 void pcnet32_init(void);
-void pcnet32_irq_handler(void);
+int pcnet32_irq_handler(void);
 
 #endif // _KERNEL_PCNET32_H_

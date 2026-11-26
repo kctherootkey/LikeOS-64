@@ -1,0 +1,17 @@
+# A duplicate of out-of-order data is reported as a D-SACK block, first
+# in the option (RFC 2883); the filled hole is ACKed at once, without SACK.
+# Copyright (C) 2026 The LikeOS Project
+0.000 socket s stream
+0.000 bind s 8080
+0.000 listen s 16
+0.100 < S 0:0(0) win 65535 <mss 1460,sackOK,TS val 100 ecr 0,nop,wscale 7>
+0.100 > S. 0:0(0) ack 1 win * <mss 1460,sackOK,TS val * ecr 100,nop,wscale *>
+0.200 < . 1:1(0) ack 1 win 512 <nop,nop,TS val 200 ecr echo>
+0.200 accept s c
+0.300 < P. 1001:2001(1000) ack 1 win 512 <nop,nop,TS val 300 ecr echo>
+0.300 > . 1:1(0) ack 1 win * <nop,nop,TS val * ecr *,sack 1001:2001>
+0.310 < P. 1001:2001(1000) ack 1 win 512 <nop,nop,TS val 310 ecr echo>
+0.310 > . 1:1(0) ack 1 win * <nop,nop,TS val * ecr *,sack 1001:2001 1001:2001>
+0.320 < P. 1:1001(1000) ack 1 win 512 <nop,nop,TS val 320 ecr echo>
+0.320 > . 1:1(0) ack 2001 win * <nop,nop,TS val * ecr *>
+0.330 recv c 4000 = 2000

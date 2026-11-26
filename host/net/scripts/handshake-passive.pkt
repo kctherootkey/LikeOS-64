@@ -1,0 +1,10 @@
+# Passive open: SYN in, SYN-ACK out with our options, ACK in, accept.
+# Copyright (C) 2026 The LikeOS Project
+0.000 socket s stream
+0.000 bind s 8080
+0.000 listen s 16
+0.100 < S 0:0(0) win 65535 <mss 1460,sackOK,TS val 100 ecr 0,nop,wscale 7>
+0.100 > S. 0:0(0) ack 1 win * <mss 1460,sackOK,TS val * ecr 100,nop,wscale *>
+0.200 < . 1:1(0) ack 1 win 512 <nop,nop,TS val 200 ecr echo>
+0.200 accept s c
+0.200 state c ESTABLISHED

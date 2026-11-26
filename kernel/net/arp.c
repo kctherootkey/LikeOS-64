@@ -1,311 +1,269 @@
-// LikeOS ARP (Address Resolution Protocol)
+// LikeOS ARP (Address Resolution Protocol, RFC 826) on the neighbour
+// subsystem
+//
+// The IPv4 neighbour table (arp_tbl) with its solicitation, error report
+// and constructor, the processing of received ARP packets, and the
+// administrative and diagnostic interfaces (ioctls, arping, netstat).
+//
+// Learning: a request for one of our addresses creates (or refreshes) the
+// sender's entry; any other ARP packet only refreshes an entry that exists
+// -- to REACHABLE for a reply addressed to us, to STALE otherwise -- and a
+// different address replaces the known one only after the entry's lock
+// time (or from a gratuitous announcement).  Ordinary IP traffic teaches
+// the table nothing.  A packet that claims one of our own addresses from
+// another station is an address conflict: counted, never learned, and our
+// address is defended with a gratuitous ARP at most every 10 seconds
+// (RFC 5227 2.4).
 //
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/net/net.h>
+#include <kernel/net/neighbour.h>
+#include <kernel/net/netdevice.h>
 #include <kernel/io/console.h>
-#include <kernel/mm/slab.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/timer.h>
 #include <kernel/net/skb.h>
 #include <kernel/net/ratelimit.h>
+#include <kernel/mm/memory.h>
 #include <kernel/uapi/bug.h>
 
+#define ARP_DEFEND_INTERVAL_MS 10000
+
+static void arp_solicit(neighbour_t *n, uint32_t saddr, int unicast,
+			const uint8_t ha[NEIGH_HALEN]);
+static void arp_error_report(neighbour_t *n, sk_buff_t *skb);
+static void arp_constructor(neighbour_t *n);
+
+static const struct neigh_ops arp_ops = {
+	.solicit = arp_solicit,
+	.error_report = arp_error_report,
+	.constructor = arp_constructor,
+};
+
+struct neigh_table arp_tbl = {
+	.id = "arp_tbl",
+	.parms = {
+		.base_reachable_time_ms = 30000,
+		.retrans_time_ms = 1000,
+		.delay_probe_time_ms = 5000,
+		.gc_staletime_ms = 60000,
+		.locktime_ms = 1000,
+		.ucast_probes = 3,
+		.mcast_probes = 3,
+		.app_probes = 0,
+		.mcast_reprobes = 0,
+		.queue_len_bytes = 212992,
+	},
+	.ops = &arp_ops,
+	.gc_thresh1 = 128,
+	.gc_thresh2 = 512,
+	.gc_thresh3 = 1024,
+	.gc_interval_ms = 30000,
+};
+
+static volatile uint64_t arp_conflicts;
+static uint64_t arp_last_defend;
+
+static inline int ip_is_multicast(uint32_t ip)
+{
+	return (ip & 0xF0000000U) == 0xE0000000U;
+}
+
+static inline int ip_is_loopback(uint32_t ip)
+{
+	return (ip & 0xFF000000U) == 0x7F000000U;
+}
+
+static inline int mac_is_zero(const uint8_t *m)
+{
+	return !(m[0] | m[1] | m[2] | m[3] | m[4] | m[5]);
+}
+
+static inline uint32_t rd32be(const void *p)
+{
+	const uint8_t *b = p;
+
+	return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+	       ((uint32_t)b[2] << 8) | b[3];
+}
+
 // ============================================================================
-// ARP Table
+// Sending
 // ============================================================================
-#define ARP_TABLE_SIZE 64
 
-typedef struct {
-	uint32_t ip;
-	uint8_t mac[ETH_ALEN];
-	uint64_t timestamp;
-	int valid;
-} arp_entry_t;
-
-static arp_entry_t arp_table[ARP_TABLE_SIZE];
-static spinlock_t arp_lock = SPINLOCK_INIT("arp");
-
-// ============================================================================
-// ARP Pending-skb queue
-//
-// When the IPv4 send path encounters an ARP cache miss, it builds the
-// outgoing IP datagram into an sk_buff and hands it to arp_queue_pending().
-// arp_request() is fired in the background and the IP-layer call returns
-// immediately, so no upper-layer lock is ever held across an ARP wait.
-//
-// When arp_add_entry() learns a (ip, mac) binding -- either from an ARP
-// reply, a gratuitous ARP, or eth_rx snooping the source of an inbound
-// IPv4 frame -- arp_drain_pending() walks the pending list, dequeues every
-// entry destined for that ip, and transmits each via eth_send() with the
-// pending-list lock dropped.
-// ============================================================================
-#define ARP_PENDING_MAX 128
-/* Entries older than this are dropped on the next learn / probe.  In SECONDS:
- * converted at the use site, because the tick rate is measured at boot and a
- * baked-in tick count means a different duration on a different machine. */
-#define ARP_PENDING_TIMEOUT_SECS 1
-
-typedef struct arp_pending {
-	int in_use;
-	uint32_t next_hop_ip; // host order
-	net_device_t *dev;
-	sk_buff_t *skb; // owns reference; data = full IPv4 datagram
-	uint64_t enqueued_tick;
-} arp_pending_t;
-
-static arp_pending_t arp_pending_pool[ARP_PENDING_MAX];
-static spinlock_t arp_pending_lock = SPINLOCK_INIT("arp_pending");
-
-void arp_init(void)
+/* One ARP packet: `frame_dst' is the Ethernet destination (NULL:
+ * broadcast); the body carries sender (sip, sha) and target (tip, tha;
+ * NULL: zeros). */
+static int arp_send(net_device_t *dev, uint16_t op, const uint8_t *frame_dst,
+		    uint32_t sip, const uint8_t *sha, uint32_t tip,
+		    const uint8_t *tha)
 {
-	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-		arp_table[i].valid = 0;
-	}
-	for (int i = 0; i < ARP_PENDING_MAX; i++) {
-		arp_pending_pool[i].in_use = 0;
-		arp_pending_pool[i].skb = NULL;
-	}
-}
-
-// Take ownership of `skb` and queue it for transmit once we learn the
-// MAC for `next_hop_ip`.  Returns 0 on success (skb consumed) or -1 if the
-// pending pool is full (caller still owns skb and must drop it).
-int arp_queue_pending(net_device_t *dev, uint32_t next_hop_ip, sk_buff_t *skb)
-{
-	if (!dev || !skb)
-		return -1;
-
-	uint64_t now = timer_ticks();
-	uint64_t flags;
-	spin_lock_irqsave(&arp_pending_lock, &flags);
-
-	// First pass: find a free slot, opportunistically GC expired entries.
-	int slot = -1;
-	sk_buff_t *expired_skbs[ARP_PENDING_MAX];
-	int expired_count = 0;
-	for (int i = 0; i < ARP_PENDING_MAX; i++) {
-		if (arp_pending_pool[i].in_use &&
-		    now - arp_pending_pool[i].enqueued_tick >
-			    timer_s_to_ticks(ARP_PENDING_TIMEOUT_SECS)) {
-			expired_skbs[expired_count++] = arp_pending_pool[i].skb;
-			arp_pending_pool[i].in_use = 0;
-			arp_pending_pool[i].skb = NULL;
-		}
-		if (slot < 0 && !arp_pending_pool[i].in_use)
-			slot = i;
-	}
-	if (slot < 0) {
-		spin_unlock_irqrestore(&arp_pending_lock, flags);
-		// Drop expired skbs (collected above) outside the lock.
-		for (int i = 0; i < expired_count; i++)
-			skb_put(expired_skbs[i]);
-		return -1;
-	}
-	arp_pending_pool[slot].in_use = 1;
-	arp_pending_pool[slot].next_hop_ip = next_hop_ip;
-	arp_pending_pool[slot].dev = dev;
-	arp_pending_pool[slot].skb = skb;
-	arp_pending_pool[slot].enqueued_tick = now;
-	spin_unlock_irqrestore(&arp_pending_lock, flags);
-
-	for (int i = 0; i < expired_count; i++)
-		skb_put(expired_skbs[i]);
-
-	// Fire an ARP request in the background; safe to call without holding
-	// arp_pending_lock because arp_request only touches dev and emits a frame.
-	arp_request(dev, next_hop_ip);
-	return 0;
-}
-
-// Drain pending skbs whose next_hop matches `ip`, transmitting each via
-// eth_send.  Called from arp_add_entry() on every learned binding.
-static void arp_drain_pending(uint32_t ip, const uint8_t mac[ETH_ALEN])
-{
-	sk_buff_t *ready_skbs[ARP_PENDING_MAX];
-	net_device_t *ready_devs[ARP_PENDING_MAX];
-	int ready_count = 0;
-	sk_buff_t *expired_skbs[ARP_PENDING_MAX];
-	int expired_count = 0;
-
-	uint64_t now = timer_ticks();
-	uint64_t flags;
-	spin_lock_irqsave(&arp_pending_lock, &flags);
-	for (int i = 0; i < ARP_PENDING_MAX; i++) {
-		if (!arp_pending_pool[i].in_use)
-			continue;
-		if (now - arp_pending_pool[i].enqueued_tick >
-		    timer_s_to_ticks(ARP_PENDING_TIMEOUT_SECS)) {
-			expired_skbs[expired_count++] = arp_pending_pool[i].skb;
-			arp_pending_pool[i].in_use = 0;
-			arp_pending_pool[i].skb = NULL;
-			continue;
-		}
-		if (arp_pending_pool[i].next_hop_ip == ip) {
-			ready_skbs[ready_count] = arp_pending_pool[i].skb;
-			ready_devs[ready_count] = arp_pending_pool[i].dev;
-			ready_count++;
-			arp_pending_pool[i].in_use = 0;
-			arp_pending_pool[i].skb = NULL;
-		}
-	}
-	spin_unlock_irqrestore(&arp_pending_lock, flags);
-
-	// Transmit ready skbs without holding arp_pending_lock.  Each skb
-	// already contains the full IPv4 datagram; we only prepend an Ethernet
-	// header via eth_send.
-	for (int i = 0; i < ready_count; i++) {
-		sk_buff_t *skb = ready_skbs[i];
-		eth_send(ready_devs[i], mac, ETH_P_IP, skb->data, skb->len);
-		skb_put(skb);
-	}
-	for (int i = 0; i < expired_count; i++)
-		skb_put(expired_skbs[i]);
-}
-
-void arp_add_entry(uint32_t ip, const uint8_t mac[ETH_ALEN])
-{
-	uint64_t flags;
-
-	// Phase 1: check for an existing entry (update path, always allowed).
-	spin_lock_irqsave(&arp_lock, &flags);
-	int found = 0;
-	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-		if (arp_table[i].valid && arp_table[i].ip == ip) {
-			for (int m = 0; m < ETH_ALEN; m++)
-				arp_table[i].mac[m] = mac[m];
-			arp_table[i].timestamp = timer_ticks();
-			found = 1;
-			break;
-		}
-	}
-	spin_unlock_irqrestore(&arp_lock, flags);
-
-	if (found) {
-		arp_drain_pending(ip, mac);
-		return;
-	}
-
-	// Phase 2: new entry — rate-limit to prevent ARP table flood attacks.
-	uint64_t rl_flags;
-	spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
-	int new_ok = net_rl_src_allow(&g_arp_new_rl, ip);
-	spin_unlock_irqrestore(&g_ratelimit_lock, rl_flags);
-	if (!new_ok)
-		return;
-
-	// Phase 3: insert new entry.
-	spin_lock_irqsave(&arp_lock, &flags);
-	// Find free entry
-	int slot = -1;
-	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-		if (!arp_table[i].valid) {
-			slot = i;
-			break;
-		}
-	}
-	if (slot < 0) {
-		// Table full - evict oldest
-		slot = 0;
-		uint64_t oldest_time = arp_table[0].timestamp;
-		for (int i = 1; i < ARP_TABLE_SIZE; i++) {
-			if (arp_table[i].timestamp < oldest_time) {
-				oldest_time = arp_table[i].timestamp;
-				slot = i;
-			}
-		}
-	}
-	arp_table[slot].ip = ip;
-	for (int m = 0; m < ETH_ALEN; m++)
-		arp_table[slot].mac[m] = mac[m];
-	arp_table[slot].timestamp = timer_ticks();
-	arp_table[slot].valid = 1;
-	spin_unlock_irqrestore(&arp_lock, flags);
-
-	// Drain any pending skbs waiting on this IP (no arp_lock held).
-	arp_drain_pending(ip, mac);
-}
-
-// Lookup MAC for an IP. Returns 0 on success, -1 if not cached.
-int arp_resolve(net_device_t *dev, uint32_t ip, uint8_t mac_out[ETH_ALEN])
-{
-	// Broadcast address
-	if (ip == 0xFFFFFFFF || ip == (dev->ip_addr | ~dev->netmask)) {
-		for (int i = 0; i < ETH_ALEN; i++)
-			mac_out[i] = 0xFF;
-		return 0;
-	}
-
-	uint64_t flags;
-	spin_lock_irqsave(&arp_lock, &flags);
-
-	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-		if (arp_table[i].valid && arp_table[i].ip == ip) {
-			for (int m = 0; m < ETH_ALEN; m++)
-				mac_out[m] = arp_table[i].mac[m];
-			spin_unlock_irqrestore(&arp_lock, flags);
-			return 0;
-		}
-	}
-
-	spin_unlock_irqrestore(&arp_lock, flags);
-
-	// Not in cache - send ARP request
-	arp_request(dev, ip);
-	return -1;
-}
-
-// Cache-only lookup (no ARP request sent on miss).
-// Returns 0 on hit, -1 on miss.
-int arp_cache_lookup(uint32_t ip, uint8_t mac_out[ETH_ALEN])
-{
-	uint64_t flags;
-	spin_lock_irqsave(&arp_lock, &flags);
-
-	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-		if (arp_table[i].valid && arp_table[i].ip == ip) {
-			for (int m = 0; m < ETH_ALEN; m++)
-				mac_out[m] = arp_table[i].mac[m];
-			spin_unlock_irqrestore(&arp_lock, flags);
-			return 0;
-		}
-	}
-
-	spin_unlock_irqrestore(&arp_lock, flags);
-	return -1;
-}
-
-// Send ARP request
-void arp_request(net_device_t *dev, uint32_t target_ip)
-{
-	BUG_ON(dev == NULL);
-	BUILD_BUG_ON(sizeof(arp_header_t) != 28);
 	uint8_t pkt[sizeof(arp_header_t)];
 	arp_header_t *arp = (arp_header_t *)pkt;
 
+	BUILD_BUG_ON(sizeof(arp_header_t) != 28);
+	if (!dev)
+		return -1;
 	arp->hw_type = net_htons(ARP_HW_ETHER);
 	arp->proto_type = net_htons(ETH_P_IP);
 	arp->hw_len = ETH_ALEN;
 	arp->proto_len = 4;
-	arp->opcode = net_htons(ARP_OP_REQUEST);
-
-	for (int i = 0; i < ETH_ALEN; i++) {
-		arp->sender_mac[i] = dev->mac_addr[i];
-		arp->target_mac[i] = 0x00;
-	}
-	arp->sender_ip = net_htonl(dev->ip_addr);
-	arp->target_ip = net_htonl(target_ip);
-
-	eth_send(dev, eth_broadcast_addr, ETH_P_ARP, pkt, sizeof(arp_header_t));
+	arp->opcode = net_htons(op);
+	mm_memcpy(arp->sender_mac, sha ? sha : dev->mac_addr, ETH_ALEN);
+	arp->sender_ip = net_htonl(sip);
+	if (tha)
+		mm_memcpy(arp->target_mac, tha, ETH_ALEN);
+	else
+		mm_memset(arp->target_mac, 0, ETH_ALEN);
+	arp->target_ip = net_htonl(tip);
+	return eth_send(dev, frame_dst ? frame_dst : eth_broadcast_addr,
+			ETH_P_ARP, pkt, sizeof(arp_header_t));
 }
 
-// Blocking ARP request/reply for arping
+void arp_request(net_device_t *dev, uint32_t target_ip)
+{
+	BUG_ON(dev == NULL);
+	arp_send(dev, ARP_OP_REQUEST, NULL, dev->ip_addr, NULL, target_ip,
+		 NULL);
+}
+
+void arp_gratuitous(net_device_t *dev, uint32_t ip)
+{
+	BUG_ON(dev == NULL);
+	if (!dev)
+		return;
+	/* An announcement (RFC 5227 3): a reply with sender and target both
+	 * the address, to everyone. */
+	arp_send(dev, ARP_OP_REPLY, NULL, ip, NULL, ip, eth_broadcast_addr);
+}
+
+// ============================================================================
+// Neighbour ops
+// ============================================================================
+
+static void arp_constructor(neighbour_t *n)
+{
+	net_device_t *dev = n->dev;
+	uint32_t key = n->key;
+
+	if (!dev || dev == net_get_loopback() || (dev->flags & IFF_NOARP)) {
+		n->nud_state = NUD_NOARP;
+		mm_memset(n->ha, 0, NEIGH_HALEN);
+	} else if (key == 0xFFFFFFFFU ||
+		   (dev->netmask && dev->netmask != 0xFFFFFFFFU &&
+		    key == (dev->ip_addr | ~dev->netmask))) {
+		n->nud_state = NUD_NOARP;
+		mm_memset(n->ha, 0xFF, NEIGH_HALEN);
+	} else if (ip_is_multicast(key)) {
+		// RFC 1112: 01:00:5e + the low 23 bits of the group
+		n->nud_state = NUD_NOARP;
+		n->ha[0] = 0x01;
+		n->ha[1] = 0x00;
+		n->ha[2] = 0x5E;
+		n->ha[3] = (uint8_t)((key >> 16) & 0x7F);
+		n->ha[4] = (uint8_t)(key >> 8);
+		n->ha[5] = (uint8_t)key;
+	}
+}
+
+static void arp_solicit(neighbour_t *n, uint32_t saddr, int unicast,
+			const uint8_t ha[NEIGH_HALEN])
+{
+	net_device_t *dev = n->dev;
+
+	/* The waiting packet's source when it is the device's address, the
+	 * device's address otherwise. */
+	if (!saddr || saddr != dev->ip_addr)
+		saddr = dev->ip_addr;
+	arp_send(dev, ARP_OP_REQUEST, unicast ? ha : NULL, saddr, NULL,
+		 n->key, NULL);
+}
+
+/* Resolution failed for a queued datagram: a locally sent one is answered
+ * like a router would answer it, with ICMP host unreachable to its sender
+ * -- here directly to the socket it came from. */
+static void arp_error_report(neighbour_t *n, sk_buff_t *skb)
+{
+	(void)n;
+	if (skb->len >= sizeof(ipv4_header_t) + 8) {
+		const ipv4_header_t *ip = (const ipv4_header_t *)skb->data;
+		uint32_t src = net_ntohl(ip->src_addr);
+		int local = 0;
+
+		for (int i = 0; i < net_device_count(); i++) {
+			net_device_t *d = net_get_device(i);
+
+			if (d && d->ip_addr && d->ip_addr == src)
+				local = 1;
+		}
+		if (local)
+			icmp_dispatch_error(ICMP_DEST_UNREACH,
+					    ICMP_HOST_UNREACH, skb->data,
+					    (uint16_t)(skb->len > 0xFFFF ?
+								0xFFFF :
+								skb->len),
+					    0);
+	}
+	skb_put(skb);
+}
+
+// ============================================================================
+// IPv4 output and confirmation
+// ============================================================================
+
+int ip_neigh_output(net_device_t *dev, uint32_t nexthop, sk_buff_t *skb)
+{
+	neighbour_t *n = __neigh_lookup(&arp_tbl, nexthop, dev, 1);
+	int rc;
+
+	if (!n) {
+		dev->tx_dropped++;
+		skb_put(skb);
+		return -1;
+	}
+	rc = neigh_output(n, skb);
+	neigh_release(n);
+	return rc;
+}
+
+void ip_neigh_confirm(net_device_t *dev, uint32_t nexthop)
+{
+	neighbour_t *n = neigh_lookup(&arp_tbl, nexthop, dev);
+
+	if (n) {
+		neigh_confirm(n);
+		neigh_release(n);
+	}
+}
+
+// ============================================================================
+// Receiving
+// ============================================================================
+
+// Blocking ARP request/reply for arping, and the RFC 5227 probe.
 static volatile uint32_t arp_reply_ip = 0;
 static volatile uint8_t arp_reply_mac[ETH_ALEN];
 static volatile int arp_reply_ready = 0;
+static volatile uint32_t arp_probe_ip; // address being probed, 0: none
+static volatile int arp_probe_conflict;
 
-// Process received ARP packet
-void arp_rx(net_device_t *dev, const uint8_t *data, uint16_t len)
+static void arp_note_conflict(net_device_t *dev, uint32_t ip)
+{
+	uint64_t now = timer_ticks();
+
+	__atomic_fetch_add(&arp_conflicts, 1, __ATOMIC_RELAXED);
+	/* Defend the address (RFC 5227 2.4 (b)): one announcement, and
+	 * none again within the defend interval. */
+	if (!arp_last_defend ||
+	    now - arp_last_defend >= net_ms_to_ticks(ARP_DEFEND_INTERVAL_MS)) {
+		arp_last_defend = now ? now : 1;
+		arp_gratuitous(dev, ip);
+	}
+}
+
+void arp_rcv(net_device_t *dev, const uint8_t *data, uint16_t len,
+	     uint8_t pkt_type)
 {
 	BUG_ON(dev == NULL);
 	BUG_ON(data == NULL);
@@ -313,116 +271,314 @@ void arp_rx(net_device_t *dev, const uint8_t *data, uint16_t len)
 		return;
 
 	const arp_header_t *arp = (const arp_header_t *)data;
+	if (net_ntohs(arp->hw_type) != ARP_HW_ETHER ||
+	    net_ntohs(arp->proto_type) != ETH_P_IP || arp->hw_len != ETH_ALEN ||
+	    arp->proto_len != 4)
+		return;
+	uint16_t op = net_ntohs(arp->opcode);
+	if (op != ARP_OP_REQUEST && op != ARP_OP_REPLY)
+		return;
+	if (pkt_type == PACKET_OTHERHOST || pkt_type == PACKET_LOOPBACK ||
+	    dev == net_get_loopback())
+		return;
 
-	if (net_ntohs(arp->hw_type) != ARP_HW_ETHER)
-		return;
-	if (net_ntohs(arp->proto_type) != ETH_P_IP)
-		return;
-	if (arp->hw_len != ETH_ALEN || arp->proto_len != 4)
-		return;
+	uint32_t sip = rd32be(&arp->sender_ip);
+	uint32_t tip = rd32be(&arp->target_ip);
+	const uint8_t *sha = arp->sender_mac;
+	const uint8_t *tha = arp->target_mac;
+	uint32_t our = dev->ip_addr;
 
-	uint32_t sender_ip = net_ntohl(arp->sender_ip);
-	uint32_t target_ip = net_ntohl(arp->target_ip);
-	WARN_RATELIMIT((sender_ip & 0xFF000000U) == 0x7F000000U,
-		       "arp_rx: loopback sender IP");
-	WARN_RATELIMIT(arp->hw_len != ETH_ALEN || arp->proto_len != 4,
-		       "arp_rx: unexpected hw_len=%u proto_len=%u", arp->hw_len,
-		       arp->proto_len);
+	if (ip_is_multicast(tip) || ip_is_loopback(tip))
+		return;
+	if (sha[0] & 0x01)
+		return; // a group address cannot be a station's address
+	if (ip_is_loopback(sip) || ip_is_multicast(sip))
+		return;
 	{
 		uint64_t rl_flags;
 		spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
-		int arp_src_ok = net_rl_src_allow(&g_arp_src_rl, sender_ip);
+		int arp_src_ok = net_rl_src_allow(&g_arp_src_rl, sip);
 		spin_unlock_irqrestore(&g_ratelimit_lock, rl_flags);
 		if (!arp_src_ok)
 			return;
 	}
 
-	// Gratuitous ARP filter: sender_ip == target_ip means gratuitous.
-	// Only UPDATE an existing cache entry; do NOT create new entries —
-	// prevents cache poisoning of IPs we have never resolved.
-	int is_gratuitous = (sender_ip == target_ip && sender_ip != 0);
-	if (is_gratuitous) {
-		// Update existing entry only
-		uint64_t lk;
-		spin_lock_irqsave(&arp_lock, &lk);
-		for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-			if (arp_table[i].valid &&
-			    arp_table[i].ip == sender_ip) {
-				for (int m = 0; m < ETH_ALEN; m++)
-					arp_table[i].mac[m] =
-						arp->sender_mac[m];
-				arp_table[i].timestamp = timer_ticks();
-				break;
-			}
+	// RFC 5227: another station probing or using the address we probe
+	if (arp_probe_ip && kmemcmp(sha, dev->mac_addr, ETH_ALEN) != 0 &&
+	    (sip == arp_probe_ip || (sip == 0 && tip == arp_probe_ip)))
+		arp_probe_conflict = 1;
+
+	if (sip == 0) {
+		/* Duplicate-address probe: answer one for our address so the
+		 * prober backs off; learn nothing. */
+		if (op == ARP_OP_REQUEST && our && tip == our) {
+			uint64_t rl_flags;
+			spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
+			int reply_ok = net_rl_allow(&g_arp_reply_rl);
+			spin_unlock_irqrestore(&g_ratelimit_lock, rl_flags);
+			if (reply_ok)
+				arp_send(dev, ARP_OP_REPLY, sha, tip, NULL, 0,
+					 sha);
 		}
-		spin_unlock_irqrestore(&arp_lock, lk);
 		return;
 	}
 
-	// Update ARP cache with sender info
-	arp_add_entry(sender_ip, arp->sender_mac);
+	if (our && sip == our) {
+		if (kmemcmp(sha, dev->mac_addr, ETH_ALEN) != 0)
+			arp_note_conflict(dev, our);
+		return; // never learn our own address
+	}
 
-	uint16_t opcode = net_ntohs(arp->opcode);
+	if (op == ARP_OP_REQUEST && our && tip == our) {
+		/* For us: the sender is a neighbour now.  New entries are
+		 * rate limited (a flood of requests from made-up senders
+		 * would otherwise churn the table). */
+		neighbour_t *n = neigh_lookup(&arp_tbl, sip, dev);
 
-	if (opcode == ARP_OP_REQUEST && target_ip == dev->ip_addr &&
-	    dev->ip_addr != 0) {
-		// ARP reply rate limit
+		if (n) {
+			neigh_update(n, sha, NUD_STALE,
+				     NEIGH_UPDATE_F_OVERRIDE);
+		} else {
+			uint64_t rl_flags;
+			spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
+			int new_ok = net_rl_src_allow(&g_arp_new_rl, sip);
+			spin_unlock_irqrestore(&g_ratelimit_lock, rl_flags);
+			if (new_ok)
+				n = neigh_event_ns(&arp_tbl, sha, sip, dev);
+		}
+		if (n) {
+			arp_tbl.stats.rcv_probes_mcast +=
+				pkt_type != PACKET_HOST;
+			arp_tbl.stats.rcv_probes_ucast +=
+				pkt_type == PACKET_HOST;
+			neigh_release(n);
+		}
 		uint64_t rl_flags;
 		spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
 		int reply_ok = net_rl_allow(&g_arp_reply_rl);
 		spin_unlock_irqrestore(&g_ratelimit_lock, rl_flags);
-		if (!reply_ok)
-			return;
+		if (reply_ok)
+			arp_send(dev, ARP_OP_REPLY, sha, our, NULL, sip, sha);
+	} else {
+		/* Anything else refreshes an entry we have.  A gratuitous
+		 * announcement (sender == target address) may replace the
+		 * address at once; otherwise only after the lock time, so a
+		 * second, late reply does not flip the entry. */
+		neighbour_t *n = neigh_lookup(&arp_tbl, sip, dev);
 
-		// Send ARP reply
-		uint8_t reply[sizeof(arp_header_t)];
-		arp_header_t *r = (arp_header_t *)reply;
+		if (n) {
+			int is_garp = tip == sip &&
+				      (op == ARP_OP_REQUEST ||
+				       mac_is_zero(tha) ||
+				       kmemcmp(tha, eth_broadcast_addr,
+					       ETH_ALEN) == 0 ||
+				       kmemcmp(tha, sha, ETH_ALEN) == 0);
+			uint8_t state = (op == ARP_OP_REPLY &&
+					 pkt_type == PACKET_HOST) ?
+						NUD_REACHABLE :
+						NUD_STALE;
+			int override =
+				is_garp ||
+				(int64_t)(timer_ticks() -
+					  (n->updated +
+					   net_ms_to_ticks(
+						   arp_tbl.parms.locktime_ms))) >=
+					0;
 
-		r->hw_type = net_htons(ARP_HW_ETHER);
-		r->proto_type = net_htons(ETH_P_IP);
-		r->hw_len = ETH_ALEN;
-		r->proto_len = 4;
-		r->opcode = net_htons(ARP_OP_REPLY);
-
-		for (int i = 0; i < ETH_ALEN; i++) {
-			r->sender_mac[i] = dev->mac_addr[i];
-			r->target_mac[i] = arp->sender_mac[i];
+			neigh_update(n, sha, state,
+				     override ? NEIGH_UPDATE_F_OVERRIDE : 0);
+			neigh_release(n);
 		}
-		r->sender_ip = net_htonl(dev->ip_addr);
-		r->target_ip = arp->sender_ip;
-
-		eth_send(dev, arp->sender_mac, ETH_P_ARP, reply,
-			 sizeof(arp_header_t));
 	}
 
-	// Wake anyone waiting for an ARP reply
-	if (opcode == ARP_OP_REPLY) {
-		arp_reply_ip = sender_ip;
+	// Wake anyone waiting for an ARP reply (arping)
+	if (op == ARP_OP_REPLY) {
+		arp_reply_ip = sip;
 		for (int i = 0; i < ETH_ALEN; i++)
-			arp_reply_mac[i] = arp->sender_mac[i];
+			arp_reply_mac[i] = sha[i];
 		arp_reply_ready = 1;
 		sched_wake_channel((void *)&arp_reply_ready);
 	}
 }
 
-// Get ARP table entries for userspace
+void arp_rx(net_device_t *dev, const uint8_t *data, uint16_t len)
+{
+	arp_rcv(dev, data, len, PACKET_HOST);
+}
+
+// ============================================================================
+// Table interfaces
+// ============================================================================
+
+/* Link events: entries learned over a link that went away cannot be
+ * trusted when it comes back (another network, another gateway). */
+static void arp_netdev_event(struct netdev_notifier *nb, unsigned long ev,
+			     net_device_t *dev)
+{
+	(void)nb;
+	switch (ev) {
+	case NETDEV_CHANGE:
+		if (!netif_carrier_ok(dev))
+			neigh_flush_dev(&arp_tbl, dev, 1);
+		break;
+	case NETDEV_CHANGEADDR:
+		neigh_flush_dev(&arp_tbl, dev, 1);
+		break;
+	case NETDEV_DOWN:
+		neigh_flush_dev(&arp_tbl, dev, 0);
+		break;
+	default:
+		break;
+	}
+}
+
+static struct netdev_notifier arp_notifier = {
+	.fn = arp_netdev_event,
+};
+
+void arp_init(void)
+{
+	neigh_table_init(&arp_tbl);
+	register_netdevice_notifier(&arp_notifier);
+}
+
+// Lookup MAC for an IP. Returns 0 on success, -1 if not resolved (and a
+// resolution is started).
+int arp_resolve(net_device_t *dev, uint32_t ip, uint8_t mac_out[ETH_ALEN])
+{
+	neighbour_t *n;
+	int rc = -1;
+
+	// Broadcast address
+	if (ip == 0xFFFFFFFF || ip == (dev->ip_addr | ~dev->netmask)) {
+		for (int i = 0; i < ETH_ALEN; i++)
+			mac_out[i] = 0xFF;
+		return 0;
+	}
+	n = __neigh_lookup(&arp_tbl, ip, dev, 1);
+	if (!n)
+		return -1;
+	if (n->nud_state & NUD_VALID) {
+		uint64_t f;
+
+		spin_lock_irqsave(&n->lock, &f);
+		mm_memcpy(mac_out, n->ha, ETH_ALEN);
+		spin_unlock_irqrestore(&n->lock, f);
+		rc = 0;
+	} else {
+		neigh_event_send(n, NULL);
+	}
+	neigh_release(n);
+	return rc;
+}
+
+// Cache-only lookup (no request sent on a miss).  0 on hit, -1 on miss.
+int arp_cache_lookup(uint32_t ip, uint8_t mac_out[ETH_ALEN])
+{
+	for (int i = 0; i < net_device_count(); i++) {
+		net_device_t *d = net_get_device(i);
+		neighbour_t *nb = d ? neigh_lookup(&arp_tbl, ip, d) : NULL;
+		int hit = 0;
+
+		if (!nb)
+			continue;
+		if (nb->nud_state & NUD_VALID) {
+			uint64_t f;
+
+			spin_lock_irqsave(&nb->lock, &f);
+			mm_memcpy(mac_out, nb->ha, ETH_ALEN);
+			spin_unlock_irqrestore(&nb->lock, f);
+			hit = 1;
+		}
+		neigh_release(nb);
+		if (hit)
+			return 0;
+	}
+	return -1;
+}
+
+// Queue an IPv4 datagram (skb->data at the IP header) for `next_hop_ip'.
+// Takes ownership of skb and returns 0; -1 (skb not taken) on bad input.
+int arp_queue_pending(net_device_t *dev, uint32_t next_hop_ip, sk_buff_t *skb)
+{
+	if (!dev || !skb)
+		return -1;
+	skb->dev = dev;
+	ip_neigh_output(dev, next_hop_ip, skb);
+	return 0;
+}
+
+/* The device an administrative entry for `ip' belongs to: the one the
+ * address is routed through, else the default device. */
+static net_device_t *arp_admin_dev(uint32_t ip)
+{
+	uint32_t nh = ip;
+	net_device_t *dev = route_lookup(ip, &nh);
+
+	if (!dev || dev == net_get_loopback())
+		dev = net_get_default_device();
+	return dev;
+}
+
+int arp_set_entry(uint32_t ip, const uint8_t mac[ETH_ALEN], int permanent)
+{
+	net_device_t *dev = arp_admin_dev(ip);
+	neighbour_t *n;
+
+	if (!dev)
+		return -1;
+	n = __neigh_lookup(&arp_tbl, ip, dev, 1);
+	if (!n)
+		return -1;
+	neigh_update(n, mac, permanent ? NUD_PERMANENT : NUD_STALE,
+		     NEIGH_UPDATE_F_OVERRIDE | NEIGH_UPDATE_F_ADMIN);
+	neigh_release(n);
+	return 0;
+}
+
+// A static (permanent) entry: SIOCSARP with ATF_PERM, and the tests.
+void arp_add_entry(uint32_t ip, const uint8_t mac[ETH_ALEN])
+{
+	arp_set_entry(ip, mac, 1);
+}
+
+// `arp -d': remove the entry for `ip' on every device.
+void arp_del_entry(uint32_t ip)
+{
+	neigh_delete(&arp_tbl, ip, NULL);
+}
+
+// The resolved entries, for netstat / arp.
 int net_get_arp_table(net_arp_info_t *entries, int max_entries)
 {
-	uint64_t flags;
-	spin_lock_irqsave(&arp_lock, &flags);
+	struct neigh_dump_entry buf[16];
 	int count = 0;
-	for (int i = 0; i < ARP_TABLE_SIZE && count < max_entries; i++) {
-		if (arp_table[i].valid) {
-			entries[count].ip = arp_table[i].ip;
-			for (int m = 0; m < ETH_ALEN; m++)
-				entries[count].mac[m] = arp_table[i].mac[m];
-			entries[count].valid = 1;
-			entries[count].pad = 0;
-			count++;
+
+	BUG_ON(max_entries < 0);
+	// In chunks of 16 (small stack); the table may change in between.
+	while (count < max_entries) {
+		int want = max_entries - count;
+		int got;
+
+		if (want > 16)
+			want = 16;
+		got = neigh_dump(&arp_tbl, buf, want, NUD_VALID, count);
+		for (int i = 0; i < got; i++) {
+			entries[count + i].ip = buf[i].key;
+			mm_memcpy(entries[count + i].mac, buf[i].ha, ETH_ALEN);
+			entries[count + i].valid = 1;
+			entries[count + i].pad = 0;
 		}
+		count += got;
+		if (got < want)
+			break;
 	}
-	spin_unlock_irqrestore(&arp_lock, flags);
 	return count;
+}
+
+uint64_t arp_get_conflicts(void)
+{
+	return __atomic_load_n(&arp_conflicts, __ATOMIC_RELAXED);
 }
 
 // Blocking ARP request/reply for arping
@@ -457,81 +613,29 @@ int arp_recv_reply(uint32_t target_ip, uint8_t mac_out[6],
 }
 
 // ============================================================================
-// Static / programmatic delete (used by `arp -d` and tests).
-// ============================================================================
-void arp_del_entry(uint32_t ip)
-{
-	uint64_t flags;
-	spin_lock_irqsave(&arp_lock, &flags);
-	for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-		if (arp_table[i].valid && arp_table[i].ip == ip) {
-			arp_table[i].valid = 0;
-		}
-	}
-	spin_unlock_irqrestore(&arp_lock, flags);
-}
-
-// ============================================================================
 // RFC 5227 ARP probe (DAD).  Sends 3 probes ~200ms apart with sender_ip=0.
-// Returns 0 if no collision (no reply for `ip` seen), -1 on collision.
+// Returns 0 if no conflict was seen, -1 if another station uses or probes
+// for `ip'.
 // ============================================================================
 int arp_probe(net_device_t *dev, uint32_t ip)
 {
 	if (!dev)
 		return -1;
 
-	arp_reply_ready = 0;
-	arp_reply_ip = 0;
-
-	uint8_t pkt[sizeof(arp_header_t)];
-	arp_header_t *arp = (arp_header_t *)pkt;
-	arp->hw_type = net_htons(ARP_HW_ETHER);
-	arp->proto_type = net_htons(ETH_P_IP);
-	arp->hw_len = ETH_ALEN;
-	arp->proto_len = 4;
-	arp->opcode = net_htons(ARP_OP_REQUEST);
-	for (int i = 0; i < ETH_ALEN; i++) {
-		arp->sender_mac[i] = dev->mac_addr[i];
-		arp->target_mac[i] = 0x00;
-	}
-	arp->sender_ip = 0; // RFC 5227: probe uses 0.0.0.0 as sender
-	arp->target_ip = net_htonl(ip);
-
+	arp_probe_conflict = 0;
+	arp_probe_ip = ip;
 	for (int probe = 0; probe < 3; probe++) {
-		eth_send(dev, eth_broadcast_addr, ETH_P_ARP, pkt,
-			 sizeof(arp_header_t));
+		arp_send(dev, ARP_OP_REQUEST, NULL, 0, NULL, ip, NULL);
 		// Wait ~200ms for any reply, at the measured tick rate.
 		uint64_t deadline = timer_ticks() + timer_ms_to_ticks(200);
 		while (timer_ticks() < deadline) {
-			if (arp_reply_ready && arp_reply_ip == ip)
+			if (arp_probe_conflict) {
+				arp_probe_ip = 0;
 				return -1;
+			}
 			__asm__ volatile("pause");
 		}
 	}
+	arp_probe_ip = 0;
 	return 0;
-}
-
-// ============================================================================
-// Gratuitous ARP: announce ownership of `ip` to the LAN with a reply that
-// has both sender_ip and target_ip set to `ip`.
-// ============================================================================
-void arp_gratuitous(net_device_t *dev, uint32_t ip)
-{
-	BUG_ON(dev == NULL);
-	if (!dev)
-		return;
-	uint8_t pkt[sizeof(arp_header_t)];
-	arp_header_t *arp = (arp_header_t *)pkt;
-	arp->hw_type = net_htons(ARP_HW_ETHER);
-	arp->proto_type = net_htons(ETH_P_IP);
-	arp->hw_len = ETH_ALEN;
-	arp->proto_len = 4;
-	arp->opcode = net_htons(ARP_OP_REPLY);
-	for (int i = 0; i < ETH_ALEN; i++) {
-		arp->sender_mac[i] = dev->mac_addr[i];
-		arp->target_mac[i] = 0xFF;
-	}
-	arp->sender_ip = net_htonl(ip);
-	arp->target_ip = net_htonl(ip);
-	eth_send(dev, eth_broadcast_addr, ETH_P_ARP, pkt, sizeof(arp_header_t));
 }

@@ -14,6 +14,9 @@
 
 #include <kernel/dev/nic/eepro100.h>
 #include <kernel/net/net.h>
+#include <kernel/net/netdevice.h>
+#include <kernel/net/skb.h>
+#include <kernel/dev/nic/nic_util.h>
 #include <kernel/hal/pci.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
@@ -207,6 +210,43 @@ static inline uint8_t *e100_rx_payload(eepro100_dev_t *d, uint16_t i)
 // Allocate TX CB ring + RX RFD ring (each in one contiguous block of
 // low-physical memory so that 32-bit `link` fields can hold the addresses).
 // ============================================================================
+
+/* Both rings in their initial state: every CB a NOP linked into a circle,
+ * every RFD armed for the chip (the last one with EL, so the RU stops
+ * there rather than overrunning frames not taken yet). */
+static void e100_rings_reset(eepro100_dev_t *d)
+{
+	for (uint16_t i = 0; i < EEPRO100_NUM_TX_DESC; i++) {
+		eepro100_cb_t *cb = e100_tx_cb(d, i);
+		cb->status = 0;
+		cb->command = EEPRO100_CMD_NOP;
+		cb->link = (uint32_t)e100_tx_cb_phys(
+			d, (i + 1) % EEPRO100_NUM_TX_DESC);
+		cb->tbd_addr = 0xFFFFFFFFu;
+		cb->tcb_bytes = 0;
+		cb->tx_threshold = 0xE0;
+		cb->tbd_count = 0;
+		d->tx_stamp[i] = 0;
+	}
+	d->tx_prod = 0;
+	d->tx_cons = 0;
+	d->cu_started = 0;
+
+	for (uint16_t i = 0; i < EEPRO100_NUM_RX_DESC; i++) {
+		eepro100_rfd_t *rfd = e100_rx_rfd(d, i);
+		rfd->status = 0;
+		rfd->command =
+			(i == EEPRO100_NUM_RX_DESC - 1) ? EEPRO100_CMD_EL : 0;
+		rfd->link = (uint32_t)e100_rx_rfd_phys(
+			d, (i + 1) % EEPRO100_NUM_RX_DESC);
+		rfd->rx_buf_addr = 0; // 0 = buffer immediately after header
+		rfd->count = 0;
+		rfd->size = EEPRO100_RX_BUF_SIZE;
+	}
+	d->rx_cur = 0;
+	__asm__ volatile("mfence" ::: "memory");
+}
+
 static int e100_alloc_rings(eepro100_dev_t *d)
 {
 	uint32_t tx_bytes =
@@ -230,50 +270,18 @@ static int e100_alloc_rings(eepro100_dev_t *d)
 	d->rx_blocks_phys = rx_phys;
 
 	// Zero everything (descriptor fields and buffer area).
-	for (uint32_t i = 0; i < tx_bytes; i++)
-		d->tx_blocks[i] = 0;
-	for (uint32_t i = 0; i < rx_bytes; i++)
-		d->rx_blocks[i] = 0;
-
-	// Pre-initialise the TX CB ring.  Each CB starts as a NOP that the CU
-	// will simply skip; we'll patch slots into CmdTx on demand.  link
-	// fields form a circular ring so the CU can keep walking forever.
-	for (uint16_t i = 0; i < EEPRO100_NUM_TX_DESC; i++) {
-		eepro100_cb_t *cb = e100_tx_cb(d, i);
-		cb->status = 0;
-		cb->command = EEPRO100_CMD_NOP;
-		cb->link = (uint32_t)e100_tx_cb_phys(
-			d, (i + 1) % EEPRO100_NUM_TX_DESC);
-		cb->tbd_addr = 0xFFFFFFFFu;
-		cb->tcb_bytes = 0;
-		cb->tx_threshold = 0xE0;
-		cb->tbd_count = 0;
-	}
-	d->tx_prod = 0;
-	d->tx_cons = 0;
-
-	// Pre-initialise the RX RFD ring.  All RFDs are linked into a circular
-	// list and pre-armed for the chip — the LAST one carries the EL bit so
-	// the RU stops gracefully if we fail to drain in time.
-	for (uint16_t i = 0; i < EEPRO100_NUM_RX_DESC; i++) {
-		eepro100_rfd_t *rfd = e100_rx_rfd(d, i);
-		rfd->status = 0;
-		rfd->command =
-			(i == EEPRO100_NUM_RX_DESC - 1) ? EEPRO100_CMD_EL : 0;
-		rfd->link = (uint32_t)e100_rx_rfd_phys(
-			d, (i + 1) % EEPRO100_NUM_RX_DESC);
-		rfd->rx_buf_addr = 0; // 0 = buffer immediately after header
-		rfd->count = 0;
-		rfd->size = EEPRO100_RX_BUF_SIZE;
-	}
-	d->rx_cur = 0;
+	mm_memset(d->tx_blocks, 0, tx_bytes);
+	mm_memset(d->rx_blocks, 0, rx_bytes);
+	e100_rings_reset(d);
 	return 0;
 }
 
 // ============================================================================
 // Issue a single one-shot CB (CmdConfigure / CmdIASetup) and wait for it
-// to complete.  We borrow tx_blocks slot 0 for this — it will be re-armed
-// as a NOP afterwards, before normal TX traffic begins.
+// to complete, with the CU idle (bring-up and reset only).  We borrow
+// tx_blocks slot 0 for this — it is re-armed as a NOP afterwards, before
+// normal TX traffic begins, and the CU is left idle (EL): the first frame
+// starts it with CU_START.
 // ============================================================================
 static int e100_issue_setup_cb(eepro100_dev_t *d, uint16_t cmd_type,
 			       const uint8_t *payload, uint32_t payload_len)
@@ -301,14 +309,19 @@ static int e100_issue_setup_cb(eepro100_dev_t *d, uint16_t cmd_type,
 
 	// Poll for CB completion (status.C = 1)
 	for (int i = 0; i < 100000; i++) {
-		if (cb->status & EEPRO100_STATUS_C) {
+		if (((volatile eepro100_cb_t *)cb)->status &
+		    EEPRO100_STATUS_C) {
 			// Acknowledge any CU bits the chip set
-			uint8_t st = e100_r8(d, EEPRO100_SCB_STATUS);
+			uint8_t st = e100_r8(d, EEPRO100_SCB_ACK);
 			if (st)
 				e100_w8(d, EEPRO100_SCB_ACK, st);
 			// Restore slot 0 to a NOP so normal TX can reuse it later
 			cb->status = 0;
 			cb->command = EEPRO100_CMD_NOP;
+			cb->tbd_addr = 0xFFFFFFFFu;
+			cb->tcb_bytes = 0;
+			cb->tx_threshold = 0xE0;
+			cb->tbd_count = 0;
 			cb->link = (uint32_t)e100_tx_cb_phys(d, 1);
 			return 0;
 		}
@@ -340,8 +353,8 @@ static int e100_load_bases(eepro100_dev_t *d)
 
 // ============================================================================
 // 22-byte CmdConfigure payload.  The values below are the well-known
-// "safe" defaults used by the reference e100 driver; only a handful of bits
-// matter to QEMU's eepro100 emulation:
+// "safe" defaults for the 8255x; only a handful of bits matter to QEMU's
+// eepro100 emulation:
 //
 //   byte[0]   = 22       (configuration byte count)
 //   byte[7]   bit0 = 0   (don't discard short frames — DHCP/ARP need them)
@@ -350,7 +363,7 @@ static int e100_load_bases(eepro100_dev_t *d)
 //   byte[18]  bit2 = 0   (don't transfer received CRC)
 //   byte[18]  bit3 = 0   (drop frames larger than 1518 bytes)
 //   byte[20]  bit6 = 0   (no Multiple-IA mode)
-//   byte[21]  bit3 = 1   (Multicast All — we have no real hash filter)
+//   byte[21]  bit3 = 1   (Multicast All — no hash filter programmed)
 // ============================================================================
 static const uint8_t e100_default_config[22] = {
 	/* 0  */ 0x16,
@@ -377,118 +390,215 @@ static const uint8_t e100_default_config[22] = {
 	/* 21 */ 0x08,
 };
 
-// ============================================================================
-// Send one Ethernet frame
-// ============================================================================
-static int eepro100_send(net_device_t *ndev, const uint8_t *data, uint16_t len)
+/* Bring the reset chip up: bases, Configure, IA Setup, then the receive
+ * unit on the RFD ring.  The CU stays idle until the first frame. */
+static int e100_hw_setup(eepro100_dev_t *d)
 {
-	eepro100_dev_t *d = (eepro100_dev_t *)ndev->driver_data;
-
-	if (len > EEPRO100_TX_BUF_SIZE)
-		return -1;
-	uint16_t out_len = (len < 60) ? 60 : len;
-
-	// Serialize across CPUs: tx_prod/tx_cons, CB ring, SCB doorbell.
-	uint64_t txflags;
-	spin_lock_irqsave(&d->tx_lock, &txflags);
-
-	uint16_t slot = d->tx_prod;
-	WARN_ON(slot >=
-		EEPRO100_NUM_TX_DESC); /* tx_prod out of TX CB ring bounds - ring wrap logic corrupted */
-	eepro100_cb_t *cb = e100_tx_cb(d, slot);
-
-	// If the producer is about to lap the consumer, claim back any
-	// descriptors the chip has finished with (status.C set).
-	while (1) {
-		if (d->tx_cons == slot &&
-		    (cb->status & EEPRO100_STATUS_C) == 0 &&
-		    cb->command != EEPRO100_CMD_NOP) {
-			// Ring full — drop frame
-			ndev->tx_errors++;
-			spin_unlock_irqrestore(&d->tx_lock, txflags);
-			return -1;
-		}
-		if (!(e100_tx_cb(d, d->tx_cons)->status & EEPRO100_STATUS_C) &&
-		    e100_tx_cb(d, d->tx_cons)->command != EEPRO100_CMD_NOP)
-			break;
-		d->tx_cons = (d->tx_cons + 1) % EEPRO100_NUM_TX_DESC;
-		if (d->tx_cons == slot)
-			break;
-	}
-
-	// Copy payload into the slot's inline buffer
-	uint8_t *buf = e100_tx_payload(d, slot);
-	mm_memcpy(buf, data, len);
-	if (out_len > len)
-		mm_memset(buf + len, 0, out_len - len);
-
-	// Build the CmdTx CB.  Simplified mode: tbd_addr = 0xFFFFFFFF means
-	// "data follows the CB header" (which it does — see e100_tx_payload).
-	cb->status = 0;
-	cb->tbd_addr = 0xFFFFFFFFu;
-	cb->tcb_bytes = out_len;
-	cb->tx_threshold = 0xE0;
-	cb->tbd_count = 0;
-	cb->link =
-		(uint32_t)e100_tx_cb_phys(d, (slot + 1) % EEPRO100_NUM_TX_DESC);
-	// EL = stop CU on this CB, so we don't run off into stale NOPs
-	cb->command = EEPRO100_CMD_EL | EEPRO100_CMD_TX;
-	__asm__ volatile("mfence" ::: "memory");
-
-	// Kick the CU.  Because we always set EL on the most-recent CB, the
-	// CU is in "Suspended" state after the previous TX completes — issuing
-	// CU_START with the new CB's address restarts execution from there.
-	if (e100_wait_scb(d) < 0) {
-		ndev->tx_errors++;
-		spin_unlock_irqrestore(&d->tx_lock, txflags);
+	if (e100_load_bases(d) < 0) {
+		kprintf("eepro100: load-base sequence failed\n");
 		return -1;
 	}
-	e100_w32(d, EEPRO100_SCB_POINTER, (uint32_t)e100_tx_cb_phys(d, slot));
-	e100_w8(d, EEPRO100_SCB_CMD,
-		d->cu_started ? EEPRO100_CU_START : EEPRO100_CU_START);
-	d->cu_started = 1;
-
-	d->tx_prod = (slot + 1) % EEPRO100_NUM_TX_DESC;
-	ndev->tx_packets++;
-	ndev->tx_bytes += out_len;
-	spin_unlock_irqrestore(&d->tx_lock, txflags);
+	if (e100_issue_setup_cb(d, EEPRO100_CMD_CONFIGURE, e100_default_config,
+				sizeof(e100_default_config)) < 0) {
+		kprintf("eepro100: CmdConfigure failed\n");
+		return -1;
+	}
+	if (e100_issue_setup_cb(d, EEPRO100_CMD_IASETUP, d->mac_addr, 6) < 0) {
+		kprintf("eepro100: CmdIASetup failed\n");
+		return -1;
+	}
 	return 0;
 }
 
+static void e100_ru_start(eepro100_dev_t *d)
+{
+	if (e100_wait_scb(d) == 0) {
+		e100_w32(d, EEPRO100_SCB_POINTER,
+			 (uint32_t)e100_rx_rfd_phys(d, d->rx_cur));
+		e100_w8(d, EEPRO100_SCB_CMD, EEPRO100_RU_START);
+	}
+}
+
 // ============================================================================
-// Link status callback — ask the PHY's BMSR via the MDI window.  For QEMU
-// this always reports link-up while a netdev is attached.
+// Transmit (net_device_t xmit hook)
 // ============================================================================
-// Polled-only: this chip has no link-change interrupt, so all hot-plug
-// detection happens here on each call.  Edge logic mirrors the IRQ-
-// driven NICs: print UP/DOWN once, and on a DOWN edge invalidate the
-// DHCP lease so the next dhclient does a full DISCOVER against the new
-// network.
+#define EEPRO100_TX_WAKE_THRESH 4
+
+static uint32_t e100_tx_unused(const eepro100_dev_t *d)
+{
+	return nic_ring_unused(d->tx_prod, d->tx_cons, EEPRO100_NUM_TX_DESC);
+}
+
+/* Reclaim completed CBs (status.C), oldest first.  Caller holds tx_lock. */
+static void e100_tx_clean_locked(eepro100_dev_t *d)
+{
+	while (d->tx_cons != d->tx_prod) {
+		volatile eepro100_cb_t *cb = e100_tx_cb(d, d->tx_cons);
+		uint16_t st = cb->status;
+
+		if (!(st & EEPRO100_STATUS_C))
+			break;
+		if (!(st & EEPRO100_STATUS_OK)) {
+			d->net_dev.tx_errors++;
+			d->st_tx_bad++;
+		}
+		d->tx_stamp[d->tx_cons] = 0;
+		d->tx_cons = (uint16_t)((d->tx_cons + 1) % EEPRO100_NUM_TX_DESC);
+	}
+	if (netif_queue_stopped(&d->net_dev) &&
+	    e100_tx_unused(d) >= EEPRO100_TX_WAKE_THRESH)
+		netif_wake_queue(&d->net_dev);
+}
+
+/* Queue the CB at tx_prod (filled by the caller except command and link)
+ * and get the CU to it: the new CB carries S (the CU suspends after it)
+ * and I (CX interrupt on completion); the S of the CB before it is
+ * cleared, so a CU still working there runs on into the new one, and a
+ * CU already suspended there is resumed.  The very first CB after the
+ * setup commands (CU idle) goes with CU_START.  Caller holds tx_lock (the
+ * SCB command register is shared with the receive unit's commands). */
+static int e100_queue_cb_locked(eepro100_dev_t *d, uint16_t type)
+{
+	uint16_t slot = d->tx_prod;
+	volatile eepro100_cb_t *cb = e100_tx_cb(d, slot);
+	volatile eepro100_cb_t *prev = e100_tx_cb(
+		d,
+		(uint16_t)((slot + EEPRO100_NUM_TX_DESC - 1) %
+			   EEPRO100_NUM_TX_DESC));
+
+	cb->status = 0;
+	cb->link = (uint32_t)e100_tx_cb_phys(
+		d, (uint16_t)((slot + 1) % EEPRO100_NUM_TX_DESC));
+	cb->command = (uint16_t)(type | EEPRO100_CMD_S | EEPRO100_CMD_I);
+	__asm__ volatile("mfence" ::: "memory");
+	if (d->cu_started)
+		prev->command &= (uint16_t)~EEPRO100_CMD_S;
+	__asm__ volatile("mfence" ::: "memory");
+
+	if (e100_wait_scb(d) < 0)
+		return -1;
+	if (!d->cu_started) {
+		e100_w32(d, EEPRO100_SCB_POINTER,
+			 (uint32_t)e100_tx_cb_phys(d, slot));
+		e100_w8(d, EEPRO100_SCB_CMD, EEPRO100_CU_START);
+		d->cu_started = 1;
+	} else {
+		e100_w8(d, EEPRO100_SCB_CMD, EEPRO100_CU_RESUME);
+	}
+	{
+		uint64_t now = timer_ticks();
+
+		d->tx_stamp[slot] = now ? now : 1;
+	}
+	d->tx_prod = (uint16_t)((slot + 1) % EEPRO100_NUM_TX_DESC);
+	return 0;
+}
+
+static int eepro100_xmit(sk_buff_t *skb, net_device_t *ndev)
+{
+	eepro100_dev_t *d = (eepro100_dev_t *)ndev->driver_data;
+	uint32_t len = skb->len;
+	uint64_t f;
+
+	BUG_ON(d == NULL);
+	if (len == 0 || len > EEPRO100_TX_BUF_SIZE) {
+		ndev->tx_dropped++;
+		skb_put(skb);
+		return NETDEV_TX_OK;
+	}
+	uint32_t out_len = (len < 60) ? 60 : len;
+
+	spin_lock_irqsave(&d->tx_lock, &f);
+	if (e100_tx_unused(d) == 0) {
+		e100_tx_clean_locked(d);
+		if (e100_tx_unused(d) == 0) {
+			netif_stop_queue(ndev);
+			spin_unlock_irqrestore(&d->tx_lock, f);
+			return NETDEV_TX_BUSY;
+		}
+	}
+
+	uint16_t slot = d->tx_prod;
+	volatile eepro100_cb_t *cb = e100_tx_cb(d, slot);
+	uint8_t *buf = e100_tx_payload(d, slot);
+
+	mm_memcpy(buf, skb->data, len);
+	if (out_len > len)
+		mm_memset(buf + len, 0, out_len - len);
+	// Simplified mode: tbd_addr = 0xFFFFFFFF, the data follows the CB
+	cb->tbd_addr = 0xFFFFFFFFu;
+	cb->tcb_bytes = (uint16_t)out_len;
+	cb->tx_threshold = 0xE0;
+	cb->tbd_count = 0;
+	if (e100_queue_cb_locked(d, EEPRO100_CMD_TX) < 0) {
+		ndev->tx_errors++;
+		__atomic_store_n(&d->reset_pending, 1, __ATOMIC_RELEASE);
+	} else {
+		ndev->tx_packets++;
+		ndev->tx_bytes += out_len;
+	}
+	if (e100_tx_unused(d) == 0)
+		netif_stop_queue(ndev);
+	spin_unlock_irqrestore(&d->tx_lock, f);
+	skb_put(skb);
+	return NETDEV_TX_OK;
+}
+
+// ============================================================================
+// Link status — the PHY's BMSR via the MDI window.  For QEMU this always
+// reports link-up while a netdev is attached.
+// ============================================================================
+static int e100_mdi_link(eepro100_dev_t *d)
+{
+	int up = -1;
+
+	// BMSR link status is latched low: the second read is the state now
+	for (int pass = 0; pass < 2; pass++) {
+		// MDI Read | PHY 1 | reg 1 (BMSR)
+		e100_w32(d, EEPRO100_SCB_MDI,
+			 (2u << 26) | (1u << 21) | (1u << 16));
+		up = -1;
+		for (int i = 0; i < 1000; i++) {
+			uint32_t r = e100_r32(d, EEPRO100_SCB_MDI);
+			if (r & (1u << 28)) { // R bit (operation ready)
+				up = (r & (1u << 2)) ? 1 : 0;
+				break;
+			}
+			e100_delay_us(10);
+		}
+	}
+	return up;
+}
+
+/* Link supervision (watchdog): the carrier follows the PHY once it has
+ * reported a link at all. */
+static void e100_link_check(eepro100_dev_t *d)
+{
+	int now_up = e100_mdi_link(d);
+
+	if (now_up < 0 || now_up == d->link_up)
+		return;
+	if (now_up)
+		d->link_seen = 1;
+	d->link_up = now_up;
+	kprintf("eepro100: Link %s\n", now_up ? "UP" : "DOWN");
+	if (now_up) {
+		netif_carrier_on(&d->net_dev);
+	} else {
+		dhcp_invalidate(&d->net_dev);
+		if (d->link_seen)
+			netif_carrier_off(&d->net_dev);
+	}
+}
+
 static int eepro100_link_status(net_device_t *ndev)
 {
 	eepro100_dev_t *d = (eepro100_dev_t *)ndev->driver_data;
-	// MDI Read | PHY 1 | reg 1 (BMSR)
-	uint32_t mdi = (2u << 26) | (1u << 21) | (1u << 16);
-	e100_w32(d, EEPRO100_SCB_MDI, mdi);
-	int now_up = 0;
-	for (int i = 0; i < 1000; i++) {
-		uint32_t r = e100_r32(d, EEPRO100_SCB_MDI);
-		if (r & (1u << 28)) { // R bit (operation ready)
-			now_up = (r & (1u << 2)) ?
-					 1 :
-					 0; // BMSR.Link Status = bit 2
-			break;
-		}
-		e100_delay_us(10);
-	}
-	int was_up = d->link_up;
-	if (now_up != was_up) {
-		d->link_up = now_up;
-		kprintf("eepro100: Link %s\n", now_up ? "UP" : "DOWN");
-		if (!now_up)
-			dhcp_invalidate(ndev);
-	}
-	return now_up;
+
+	// the watchdog owns the MDI window; this asks it to look now
+	d->link_poll_tick = 0;
+	net_housekeeping_kick();
+	return d->link_up;
 }
 
 // Quiesce the controller ahead of an ACPI S5 transition.  Per the 8255x
@@ -521,27 +631,50 @@ static void eepro100_shutdown(net_device_t *ndev)
 }
 
 // ============================================================================
-// Drain RX RFDs that the chip has filled in
+// Receive (NAPI poll)
 // ============================================================================
-static void e100_drain_rx(eepro100_dev_t *d)
+static volatile int e100_rnr_pending; // the RU ran out of RFDs
+
+static int e100_rx_clean(eepro100_dev_t *d, int budget)
 {
-	while (1) {
-		WARN_ON(d->rx_cur >=
-			EEPRO100_NUM_RX_DESC); /* rx_cur out of RX RFD ring bounds - ring wrap logic corrupted */
+	net_device_t *nd = &d->net_dev;
+	int work = 0;
+
+	while (work < budget) {
 		eepro100_rfd_t *rfd = e100_rx_rfd(d, d->rx_cur);
 		// The chip writes the RFD behind the compiler's back: read
 		// status.C through volatile, and read count only after it.
-		if (!(((volatile eepro100_rfd_t *)rfd)->status &
-		      EEPRO100_STATUS_C))
+		uint16_t st = ((volatile eepro100_rfd_t *)rfd)->status;
+
+		if (!(st & EEPRO100_STATUS_C))
 			break;
 		__asm__ volatile("" ::: "memory");
 
-		uint16_t len = rfd->count & 0x3FFF;
-		if (len > 0 && len <= EEPRO100_RX_BUF_SIZE) {
-			net_rx_packet(&d->net_dev,
-				      e100_rx_payload(d, d->rx_cur), len);
+		uint16_t len = ((volatile eepro100_rfd_t *)rfd)->count &
+			       EEPRO100_RFD_COUNT_MASK;
+		if (!(st & EEPRO100_STATUS_OK)) {
+			// the chip flagged the frame (CRC, alignment, ...)
+			nd->rx_errors++;
+			d->st_rx_bad++;
+		} else if (len == 0 || len > EEPRO100_RX_BUF_SIZE) {
+			nd->rx_errors++;
+			d->st_rx_long++;
 		} else {
-			d->net_dev.rx_errors++;
+			sk_buff_t *skb = skb_alloc(len);
+
+			if (skb) {
+				const uint8_t *b = e100_rx_payload(d, d->rx_cur);
+
+				skb->dev = nd;
+				mm_memcpy(skb_append(skb, len), b, len);
+				nd->rx_packets++;
+				nd->rx_bytes += len;
+				if (b[0] & 1)
+					nd->multicast++;
+				napi_gro_receive(&d->napi, skb);
+			} else {
+				nd->rx_dropped++;
+			}
 		}
 
 		// Re-arm this RFD: clear status/count, place EL on the newly-
@@ -549,25 +682,52 @@ static void e100_drain_rx(eepro100_dev_t *d)
 		// behind, and clear EL on the previous EL-holder.
 		uint16_t prev = (d->rx_cur + EEPRO100_NUM_RX_DESC - 1) %
 				EEPRO100_NUM_RX_DESC;
-		e100_rx_rfd(d, prev)->command = 0;
 		rfd->status = 0;
 		rfd->count = 0;
 		rfd->command = EEPRO100_CMD_EL;
 		__asm__ volatile("mfence" ::: "memory");
+		e100_rx_rfd(d, prev)->command = 0;
+		__asm__ volatile("mfence" ::: "memory");
 
 		d->rx_cur = (d->rx_cur + 1) % EEPRO100_NUM_RX_DESC;
+		work++;
 	}
+	return work;
+}
+
+static int eepro100_poll(struct napi_struct *n, int budget)
+{
+	eepro100_dev_t *d = (eepro100_dev_t *)n->dev->driver_data;
+	uint64_t f;
+	int work;
+
+	spin_lock_irqsave(&d->tx_lock, &f);
+	e100_tx_clean_locked(d);
+	spin_unlock_irqrestore(&d->tx_lock, f);
+	work = e100_rx_clean(d, budget);
+	if (__atomic_exchange_n(&e100_rnr_pending, 0, __ATOMIC_ACQ_REL)) {
+		/* The RU ran out of RFDs and stopped: the ones just freed
+		 * are armed again -- restart it at the first of them. */
+		spin_lock_irqsave(&d->tx_lock, &f);
+		e100_ru_start(d);
+		spin_unlock_irqrestore(&d->tx_lock, f);
+	}
+	if (work < budget && napi_complete_done(n, work))
+		e100_w8(d, EEPRO100_SCB_INTMASK, 0x00);
+	return work;
 }
 
 // ============================================================================
 // Top-half IRQ handler — dispatched from kernel/ke/interrupt.c
 // ============================================================================
-void eepro100_irq_handler(void)
+/* Returns 1 when the interrupt was this device's, 0 otherwise (shared
+ * legacy line); the dispatcher acknowledges the local APIC.  Everything
+ * goes to the NAPI poll, with the device's interrupts masked until it is
+ * done. */
+int eepro100_irq_handler(void)
 {
-	if (!g_eepro100_initialized) {
-		lapic_eoi();
-		return;
-	}
+	if (!g_eepro100_initialized)
+		return 0;
 
 	// Entropy from IRQ timing
 	{
@@ -582,34 +742,96 @@ void eepro100_irq_handler(void)
 
 	// The STAT/ACK bits (CX/FR/CNA/RNR/MDI/SWI) live in the SCBAck byte
 	// (offset 1), NOT the SCBStatus byte (offset 0, which holds CUS/RUS
-	// state).  Reading offset 0 would always come back without those bits
-	// set — we'd ack zero, the chip would keep INTx asserted, and we'd
-	// melt under an IRQ storm.
+	// state).
 	uint8_t st = e100_r8(d, EEPRO100_SCB_ACK);
-	if (!st) {
-		// Not ours (shared legacy IRQ) or already acked.
-		lapic_eoi();
-		return;
-	}
+	if (!st || st == 0xFF)
+		return 0; // not ours (shared legacy IRQ) or already acked
 
 	// Acknowledge every status bit we observed, in one shot.  QEMU's
 	// eepro100_acknowledge() ANDs scb_stat with ~SCBAck, so writing the
 	// bits back clears them and deasserts INTx.
 	e100_w8(d, EEPRO100_SCB_ACK, st);
 
-	if (st & EEPRO100_STAT_FR)
-		e100_drain_rx(d);
 	if (st & EEPRO100_STAT_RNR) {
-		// RU exhausted its descriptor list — re-arm and resume.
+		d->st_rnr++;
 		d->net_dev.rx_dropped++;
-		if (e100_wait_scb(d) == 0) {
-			e100_w32(d, EEPRO100_SCB_POINTER,
-				 (uint32_t)e100_rx_rfd_phys(d, d->rx_cur));
-			e100_w8(d, EEPRO100_SCB_CMD, EEPRO100_RU_START);
-		}
+		__atomic_store_n(&e100_rnr_pending, 1, __ATOMIC_RELEASE);
 	}
+	e100_w8(d, EEPRO100_SCB_INTMASK, EEPRO100_INT_MASK_ALL);
+	napi_schedule(&d->napi);
+	return 1;
+}
 
-	lapic_eoi();
+// ============================================================================
+// Statistics, watchdog
+// ============================================================================
+static void eepro100_get_stats64(net_device_t *ndev,
+				 struct net_device_stats64 *s)
+{
+	eepro100_dev_t *d = (eepro100_dev_t *)ndev->driver_data;
+
+	s->rx_crc_errors = d->st_rx_bad;
+	s->rx_length_errors = d->st_rx_long;
+	s->rx_over_errors = d->st_rnr;
+}
+
+static void eepro100_tx_timeout(net_device_t *ndev)
+{
+	eepro100_dev_t *d = (eepro100_dev_t *)ndev->driver_data;
+
+	__atomic_store_n(&d->reset_pending, 1, __ATOMIC_RELEASE);
+}
+
+/* Reset and bring the chip up again (a command never completed): the
+ * frames in both rings are dropped.  Watchdog context (CPU 0): the poll
+ * is not running; tx_lock keeps the transmit hook out. */
+static void e100_restart(eepro100_dev_t *d)
+{
+	uint64_t f;
+
+	spin_lock_irqsave(&d->tx_lock, &f);
+	e100_w8(d, EEPRO100_SCB_INTMASK, EEPRO100_INT_MASK_ALL);
+	d->net_dev.tx_errors += (uint32_t)((d->tx_prod + EEPRO100_NUM_TX_DESC -
+					    d->tx_cons) %
+					   EEPRO100_NUM_TX_DESC);
+	e100_port_reset(d);
+	e100_rings_reset(d);
+	if (e100_hw_setup(d) == 0)
+		e100_ru_start(d);
+	e100_w8(d, EEPRO100_SCB_ACK, 0xFF);
+	e100_w8(d, EEPRO100_SCB_INTMASK, 0x00);
+	if (netif_queue_stopped(&d->net_dev))
+		netif_wake_queue(&d->net_dev);
+	spin_unlock_irqrestore(&d->tx_lock, f);
+	napi_schedule(&d->napi);
+}
+
+// Network housekeeping softirq, CPU 0, ~10 Hz and when kicked.
+static void eepro100_watchdog(net_device_t *ndev)
+{
+	eepro100_dev_t *d = (eepro100_dev_t *)ndev->driver_data;
+	uint64_t f, now = timer_ticks();
+	int hang = 0;
+
+	if (!d || !g_eepro100_initialized)
+		return;
+	if (!d->link_poll_tick ||
+	    now - d->link_poll_tick >= net_ms_to_ticks(1000)) {
+		d->link_poll_tick = now ? now : 1;
+		e100_link_check(d);
+	}
+	spin_lock_irqsave(&d->tx_lock, &f);
+	e100_tx_clean_locked(d);
+	if (d->tx_cons != d->tx_prod && d->tx_stamp[d->tx_cons] &&
+	    now - d->tx_stamp[d->tx_cons] > net_ms_to_ticks(5000))
+		hang = 1;
+	spin_unlock_irqrestore(&d->tx_lock, f);
+	if (hang) {
+		kprintf("eepro100: transmit timed out, resetting the chip\n");
+		__atomic_store_n(&d->reset_pending, 1, __ATOMIC_RELEASE);
+	}
+	if (__atomic_exchange_n(&d->reset_pending, 0, __ATOMIC_ACQ_REL))
+		e100_restart(d);
 }
 
 // ============================================================================
@@ -619,18 +841,16 @@ static int e100_map_csr(eepro100_dev_t *d)
 {
 	uint32_t bar0 = d->pci_dev->bar[0];
 	if (!(bar0 & 1)) {
-		// MMIO (memory-mapped CSR window — 4KB)
+		// MMIO (memory-mapped CSR window — 4KB), strictly uncached
 		uint64_t phys = bar0 & 0xFFFFFFF0ULL;
 		if ((bar0 & 0x06) == 0x04) {
 			phys |= ((uint64_t)d->pci_dev->bar[1]) << 32;
 		}
 		d->mmio_phys = phys;
-		uint64_t virt = (uint64_t)phys_to_virt(phys);
-		if (!mm_is_page_mapped(virt)) {
-			mm_map_page(virt, phys,
-				    PAGE_PRESENT | PAGE_WRITABLE |
-					    PAGE_CACHE_DISABLE |
-					    PAGE_WRITE_THROUGH);
+		uint64_t virt = mm_map_device_mmio(phys, 1);
+		if (!virt) {
+			kprintf("eepro100: cannot map the CSR BAR\n");
+			return -1;
 		}
 		d->mmio_base = (volatile uint8_t *)virt;
 		d->use_io = 0;
@@ -743,6 +963,7 @@ void eepro100_init(void)
 		d->model_name = name;
 		d->use_io = 0;
 		d->cu_started = 0;
+		d->tx_lock = (spinlock_t)SPINLOCK_INIT("eepro100_tx");
 
 		// Enable PCI memory + bus-master.  pci_enable_busmaster_mem()
 		// doesn't touch I/O Space Enable; if we end up using BAR1 we
@@ -783,26 +1004,10 @@ void eepro100_init(void)
 		if (e100_alloc_rings(d) < 0)
 			return;
 
-		// Tell the chip where its CU/RU bases live (= 0; we use absolute
-		// physical addresses everywhere).
-		if (e100_load_bases(d) < 0) {
-			kprintf("eepro100: load-base sequence failed\n");
+		// CU/RU bases (absolute addresses everywhere), Configure,
+		// Individual Address Setup.
+		if (e100_hw_setup(d) < 0)
 			return;
-		}
-
-		// Send a CmdConfigure, then CmdIASetup.  Both block until the CB
-		// reports status.C.
-		if (e100_issue_setup_cb(d, EEPRO100_CMD_CONFIGURE,
-					e100_default_config,
-					sizeof(e100_default_config)) < 0) {
-			kprintf("eepro100: CmdConfigure failed\n");
-			return;
-		}
-		if (e100_issue_setup_cb(d, EEPRO100_CMD_IASETUP, d->mac_addr,
-					6) < 0) {
-			kprintf("eepro100: CmdIASetup failed\n");
-			return;
-		}
 
 		// Resolve the legacy IRQ via ACPI _PRT (with the bridge-swizzle
 		// dance from e1000.c / pcnet32.c) and program the IOAPIC.  No
@@ -869,7 +1074,6 @@ void eepro100_init(void)
 		// Initialise net_device fields BEFORE enabling chip-side
 		// interrupts (same rationale as e1000.c — see comment there).
 		d->net_dev.lock = (spinlock_t)SPINLOCK_INIT("eepro100");
-		d->tx_lock = (spinlock_t)SPINLOCK_INIT("eepro100_tx");
 		d->net_dev.rx_packets = 0;
 		d->net_dev.tx_packets = 0;
 		d->net_dev.rx_bytes = 0;
@@ -877,22 +1081,20 @@ void eepro100_init(void)
 		d->net_dev.rx_errors = 0;
 		d->net_dev.tx_errors = 0;
 		d->net_dev.rx_dropped = 0;
+		d->net_dev.driver_data = d;
+		// the poll exists before the handler can be called
+		netif_napi_add(&d->net_dev, &d->napi, eepro100_poll,
+			       NAPI_POLL_WEIGHT);
+		napi_enable(&d->napi);
 		g_eepro100_initialized = 1;
 
-		// Hand the RX RFD ring to the chip and unmask SCB interrupts.
-		if (e100_wait_scb(d) == 0) {
-			e100_w32(d, EEPRO100_SCB_POINTER,
-				 (uint32_t)e100_rx_rfd_phys(d, 0));
-			e100_w8(d, EEPRO100_SCB_CMD, EEPRO100_RU_START);
-		}
-		// SCBIntmask: bit 0 = Mask-All; clearing it (write 0) unmasks
-		// every per-event mask bit.  Per-event bits in the upper nibble
-		// ([1..6]) are also clear, so FR/RNR/CX/CNA all fire.
-		e100_w8(d, EEPRO100_SCB_INTMASK, 0x00);
-
 		// Initial link check
-		d->net_dev.driver_data = d;
-		d->link_up = eepro100_link_status(&d->net_dev);
+		{
+			int up = e100_mdi_link(d);
+
+			d->link_up = up > 0;
+			d->link_seen = d->link_up;
+		}
 		kprintf("eepro100: Link %s\n", d->link_up ? "UP" : "DOWN");
 
 		// Wire up net_device_t and register
@@ -904,12 +1106,27 @@ void eepro100_init(void)
 		d->net_dev.netmask = 0;
 		d->net_dev.gateway = 0;
 		d->net_dev.dns_server = 0;
-		d->net_dev.send = eepro100_send;
+		d->net_dev.send = NULL;
+		d->net_dev.xmit = eepro100_xmit;
 		d->net_dev.link_status = eepro100_link_status;
 		d->net_dev.shutdown = eepro100_shutdown;
-		d->net_dev.driver_data = d;
+		d->net_dev.watchdog = eepro100_watchdog;
+		d->net_dev.tx_timeout = eepro100_tx_timeout;
+		d->net_dev.get_stats64 = eepro100_get_stats64;
+		d->link_poll_tick = timer_ticks();
 
 		net_register(&d->net_dev);
+
+		// Hand the RX RFD ring to the chip and unmask SCB interrupts
+		// (bit 0 = Mask-All; the per-event bits are clear too).
+		{
+			uint64_t f;
+
+			spin_lock_irqsave(&d->tx_lock, &f);
+			e100_ru_start(d);
+			spin_unlock_irqrestore(&d->tx_lock, f);
+		}
+		e100_w8(d, EEPRO100_SCB_INTMASK, 0x00);
 		kprintf("eepro100: Driver initialized successfully\n");
 		return;
 	}

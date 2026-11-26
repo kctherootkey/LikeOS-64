@@ -72,6 +72,18 @@ extern "C" {
 #define SO_SNDTIMEO     21
 #define SO_BINDTODEVICE 25
 #define SO_ACCEPTCONN   30  /* read-only: is this socket listening? */
+#define SO_PRIORITY     12
+#define SO_RCVLOWAT     18  /* bytes a stream needs queued to poll readable */
+#define SO_SNDLOWAT     19  /* read-only (1) */
+#define SO_TIMESTAMP    29  /* datagrams carry their receive time (timeval) */
+#define SO_TIMESTAMPNS  35  /* ... as a timespec */
+#define SO_MARK         36
+#define SO_PROTOCOL     38  /* read-only */
+#define SO_DOMAIN       39  /* read-only */
+#define SO_PEEK_OFF     42
+#define SO_MAX_PACING_RATE 47 /* bytes/s cap; setting it turns TCP pacing on */
+#define SCM_TIMESTAMP   SO_TIMESTAMP
+#define SCM_TIMESTAMPNS SO_TIMESTAMPNS
 
 /* What SO_PEERCRED returns on a UNIX socket: who is on the other end.
  *
@@ -111,8 +123,10 @@ struct linger {
 #define MSG_DONTWAIT    0x40
 #define MSG_EOR         0x80
 #define MSG_WAITALL     0x100
+#define MSG_ERRQUEUE    0x2000 /* read the socket's error queue */
 #define MSG_NOSIGNAL    0x4000
 #define MSG_MORE        0x8000
+#define MSG_WAITFORONE  0x10000 /* recvmmsg: wait for the first only */
 #define MSG_CMSG_CLOEXEC 0x40000000
 
 typedef uint32_t socklen_t;
@@ -174,6 +188,12 @@ struct cmsghdr {
 #define SCM_RIGHTS      0x01
 #define SCM_CREDENTIALS 0x02
 
+/* One message of sendmmsg()/recvmmsg(), and how many bytes it carried. */
+struct mmsghdr {
+    struct msghdr msg_hdr;
+    unsigned int  msg_len;
+};
+
 // Socket syscall wrappers
 int socket(int domain, int type, int protocol);
 int socketpair(int domain, int type, int protocol, int sv[2]);
@@ -190,6 +210,10 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags);
 ssize_t recv(int sockfd, void *buf, size_t len, int flags);
 ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags);
 ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags);
+struct timespec;
+int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags);
+int recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags,
+             struct timespec *timeout);
 ssize_t sendfile(int out_fd, int in_fd, int64_t *offset, size_t count);
 int shutdown(int sockfd, int how);
 int setsockopt(int sockfd, int level, int optname,

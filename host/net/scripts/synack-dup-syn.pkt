@@ -1,0 +1,17 @@
+# The peer resends its SYN (our SYN-ACK was lost): it is answered at once,
+# and the SYN-ACK timer counts again from that answer -- no timer SYN-ACK
+# right behind it.  A third SYN within 500 ms of the answer gets none.
+# The ACK of the answer's TSval (the first SYN's, as before) completes it.
+# Copyright (C) 2026 The LikeOS Project
+0.000 socket s stream
+0.000 bind s 8080
+0.000 listen s 16
+0.100 < S 0:0(0) win 65535 <mss 1460,sackOK,TS val 100 ecr 0,nop,wscale 7>
+0.100 > S. 0:0(0) ack 1 win * <mss 1460,sackOK,TS val * ecr 100,nop,wscale *>
+0.900 < S 0:0(0) win 65535 <mss 1460,sackOK,TS val 900 ecr 0,nop,wscale 7>
+0.900 > S. 0:0(0) ack 1 win * <mss 1460,sackOK,TS val * ecr 100,nop,wscale *>
+1.200 < S 0:0(0) win 65535 <mss 1460,sackOK,TS val 1200 ecr 0,nop,wscale 7>
+1.900 > S. 0:0(0) ack 1 win * <mss 1460,sackOK,TS val * ecr 100,nop,wscale *>
+2.000 < . 1:1(0) ack 1 win 512 <nop,nop,TS val 2000 ecr echo>
+2.000 accept s c
+2.010 state c ESTABLISHED

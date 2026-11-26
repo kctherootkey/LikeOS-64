@@ -3932,6 +3932,11 @@ void sched_remove_task(task_t *task)
 	 * readers elsewhere may hold their own). */
 	task_paths_release(task);
 	if (task->signals.sigfd_wq) {
+		/* epoll sets watching a signalfd registered on this queue
+		 * (kernel/net/eventpoll.c) leave it before it goes. */
+		extern void eventpoll_wq_free(struct wait_queue_head *h);
+
+		eventpoll_wq_free(task->signals.sigfd_wq);
 		kfree(task->signals.sigfd_wq);
 		task->signals.sigfd_wq = NULL;
 	}

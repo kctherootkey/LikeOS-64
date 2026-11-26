@@ -1,6 +1,9 @@
-// LikeOS IGMPv2 (RFC 2236) - minimal: send Membership Report on join,
-// send Leave Group on drop, respond to General Query with reports for joined
-// groups.  Does not maintain timers per group; queries get an immediate reply.
+// LikeOS IGMPv2 (RFC 2236): a Membership Report on join (repeated once
+// after a random delay of up to the Unsolicited Report Interval), Leave
+// Group on the last drop, and the answer to a query: a report for each
+// joined group the query covers, after a random delay of up to the query's
+// Max Response Time (a report that would go later is moved earlier, never
+// later), so the hosts of a LAN do not all answer at once.
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -8,6 +11,12 @@
 #include <kernel/io/console.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/ke/syscall.h> /* errno constants returned to the socket layer */
+#include <kernel/net/net_timer.h>
+#include <kernel/dev/rand/random.h>
+#include <kernel/ke/timer.h>
+
+#define IGMP_UNSOLICITED_REPORT_MS 10000
+#define IGMP_ALL_HOSTS 0xE0000001u
 
 // IGMPv2 packet
 typedef struct __attribute__((packed)) {
@@ -22,6 +31,10 @@ typedef struct __attribute__((packed)) {
 #define IGMP_TYPE_V2_REPORT 0x16
 #define IGMP_TYPE_LEAVE 0x17
 
+// Lock order: igmp_lock -> the device's multicast list lock (dev->mc.lock)
+// and the net timer wheel lock.  Nothing else is taken under igmp_lock;
+// reports and the driver's filter update happen after it is dropped.
+//
 // Per-device joined-group table.
 //
 // Membership is REFCOUNTED: this table is per (device, group), but any number
@@ -36,17 +49,52 @@ typedef struct {
 	unsigned refs; // joiners holding this membership; 0 == free
 	net_device_t *dev;
 	uint32_t group; // host byte order
+	net_timer_t report; // a delayed report is due
 } igmp_membership_t;
 
 static igmp_membership_t igmp_table[IGMP_MAX_GROUPS];
 static spinlock_t igmp_lock = SPINLOCK_INIT("igmp");
+
+static void igmp_report_timer(net_timer_t *t);
 
 void igmp_init(void)
 {
 	for (int i = 0; i < IGMP_MAX_GROUPS; i++) {
 		igmp_table[i].active = 0;
 		igmp_table[i].refs = 0;
+		net_timer_setup(&igmp_table[i].report, igmp_report_timer);
 	}
+}
+
+int igmp_is_member(net_device_t *dev, uint32_t group)
+{
+	uint64_t flags;
+	int found = 0;
+
+	spin_lock_irqsave(&igmp_lock, &flags);
+	for (int i = 0; i < IGMP_MAX_GROUPS; i++) {
+		if (igmp_table[i].active && igmp_table[i].dev == dev &&
+		    igmp_table[i].group == group) {
+			found = 1;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&igmp_lock, flags);
+	return found;
+}
+
+/* Arm entry e's report for a random moment within `max_ms' -- unless one
+ * is already due sooner (igmp_lock held). */
+static void igmp_schedule_report(igmp_membership_t *e, uint64_t max_ms,
+				 uint32_t rnd)
+{
+	uint64_t delay = max_ms ? (uint64_t)rnd % max_ms : 0;
+	uint64_t when = timer_ticks() + net_ms_to_ticks(delay);
+
+	if (net_timer_pending(&e->report) &&
+	    (int64_t)(e->report.expires - when) <= 0)
+		return;
+	net_timer_mod(&e->report, when);
 }
 
 static int igmp_send(net_device_t *dev, uint32_t dst_group, uint8_t type)
@@ -68,6 +116,17 @@ static int igmp_send(net_device_t *dev, uint32_t dst_group, uint8_t type)
 			      sizeof(pkt), 1, 0);
 }
 
+// RFC 1112: the Ethernet group address of an IPv4 group (host order).
+static void igmp_group_mac(uint32_t group, uint8_t mac[ETH_ALEN])
+{
+	mac[0] = 0x01;
+	mac[1] = 0x00;
+	mac[2] = 0x5E;
+	mac[3] = (uint8_t)((group >> 16) & 0x7F);
+	mac[4] = (uint8_t)(group >> 8);
+	mac[5] = (uint8_t)group;
+}
+
 int igmp_join(net_device_t *dev, uint32_t group)
 {
 	BUG_ON(dev == NULL);
@@ -76,6 +135,8 @@ int igmp_join(net_device_t *dev, uint32_t group)
 	if (!dev || (group >> 28) != 0xE)
 		return -EINVAL;
 
+	uint32_t rnd = random_u32(); // not under igmp_lock
+	int lo = dev == net_get_loopback(), sync = 0;
 	uint64_t flags;
 	spin_lock_irqsave(&igmp_lock, &flags);
 
@@ -100,16 +161,32 @@ int igmp_join(net_device_t *dev, uint32_t group)
 	igmp_table[slot].refs = 1;
 	igmp_table[slot].dev = dev;
 	igmp_table[slot].group = group;
+	// the unsolicited report goes out twice (RFC 2236 3)
+	if (!lo && group != IGMP_ALL_HOSTS)
+		igmp_schedule_report(&igmp_table[slot],
+				     IGMP_UNSOLICITED_REPORT_MS, rnd);
+	if (!lo) {
+		uint8_t mac[ETH_ALEN];
+
+		/* The device receives the group's frames (its multicast
+		 * list), changed with the membership under igmp_lock: a
+		 * racing last leave of the group cannot reorder the two. */
+		igmp_group_mac(group, mac);
+		sync = __dev_mc_add(dev, mac) > 0;
+	}
 	spin_unlock_irqrestore(&igmp_lock, flags);
 
+	if (sync)
+		dev_set_rx_mode(dev);
 	// Send unsolicited Membership Report (RFC 2236 sec 3).
-	if (dev != net_get_loopback())
+	if (!lo)
 		igmp_send(dev, group, IGMP_TYPE_V2_REPORT);
 	return 0;
 }
 
 int igmp_leave(net_device_t *dev, uint32_t group)
 {
+	int lo = dev == net_get_loopback(), sync = 0;
 	uint64_t flags;
 	spin_lock_irqsave(&igmp_lock, &flags);
 	int found = 0, last = 0;
@@ -123,13 +200,23 @@ int igmp_leave(net_device_t *dev, uint32_t group)
 				igmp_table[i].refs--;
 			if (igmp_table[i].refs == 0) {
 				igmp_table[i].active = 0;
+				net_timer_del(&igmp_table[i].report);
 				last = 1;
 			}
 			break;
 		}
 	}
+	if (last && !lo) {
+		uint8_t mac[ETH_ALEN];
+
+		// off the device's list together with the membership
+		igmp_group_mac(group, mac);
+		sync = __dev_mc_del(dev, mac) > 0;
+	}
 	spin_unlock_irqrestore(&igmp_lock, flags);
-	if (last && dev != net_get_loopback())
+	if (sync)
+		dev_set_rx_mode(dev);
+	if (last && !lo)
 		igmp_send(dev, group, IGMP_TYPE_LEAVE);
 	/* Not a member is a caller error, not a permission problem: return a
 	 * real errno.  The old bare -1 was read by the socket layer as a
@@ -153,20 +240,40 @@ void igmp_rx(net_device_t *dev, uint32_t src_ip, const uint8_t *data,
 		return;
 
 	uint32_t qgroup = net_ntohl(pkt->group_addr);
+	/* Max Response Time in tenths of a second; 0 is an IGMPv1 query,
+	 * which allows 10 s. */
+	uint64_t max_ms = pkt->max_resp ? (uint64_t)pkt->max_resp * 100 : 10000;
+	uint32_t rnd = random_u32();
 
-	// Reply with a Membership Report for each joined group on this device.
 	uint64_t flags;
 	spin_lock_irqsave(&igmp_lock, &flags);
-	uint32_t reports[IGMP_MAX_GROUPS];
-	int nrep = 0;
-	for (int i = 0; i < IGMP_MAX_GROUPS && nrep < IGMP_MAX_GROUPS; i++) {
+	for (int i = 0; i < IGMP_MAX_GROUPS; i++) {
 		if (!igmp_table[i].active || igmp_table[i].dev != dev)
 			continue;
+		if (igmp_table[i].group == IGMP_ALL_HOSTS)
+			continue; // never reported
 		if (qgroup == 0 || qgroup == igmp_table[i].group)
-			reports[nrep++] = igmp_table[i].group;
+			igmp_schedule_report(&igmp_table[i], max_ms,
+					     rnd * (uint32_t)(i + 1));
 	}
 	spin_unlock_irqrestore(&igmp_lock, flags);
+}
 
-	for (int i = 0; i < nrep; i++)
-		igmp_send(dev, reports[i], IGMP_TYPE_V2_REPORT);
+/* A delayed report is due (softirq). */
+static void igmp_report_timer(net_timer_t *t)
+{
+	igmp_membership_t *e = (igmp_membership_t *)((uint8_t *)t -
+		__builtin_offsetof(igmp_membership_t, report));
+	net_device_t *dev = NULL;
+	uint32_t group = 0;
+	uint64_t flags;
+
+	spin_lock_irqsave(&igmp_lock, &flags);
+	if (e->active) {
+		dev = e->dev;
+		group = e->group;
+	}
+	spin_unlock_irqrestore(&igmp_lock, flags);
+	if (dev)
+		igmp_send(dev, group, IGMP_TYPE_V2_REPORT);
 }

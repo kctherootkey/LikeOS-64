@@ -380,6 +380,10 @@ static int dns_parse_response(const uint8_t *pkt, int pktlen,
 	uint16_t ancount = net_ntohs(hdr->ancount);
 	WARN_RATELIMIT(ancount > 64,
 		       "dns_parse_response: suspicious ancount=%u", ancount);
+	/* dns_rx() delivered it to the slot of this query id; a reply for
+	 * another query is never parsed as this one's. */
+	if (id != expected_id)
+		return -1;
 	if (!(flags & DNS_FLAG_QR))
 		return -1; // Not a response
 	if ((flags & DNS_FLAG_RCODE) != 0)

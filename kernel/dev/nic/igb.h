@@ -18,6 +18,7 @@
 #include <kernel/uapi/types.h>
 #include <kernel/hal/pci.h>
 #include <kernel/net/net.h>
+#include <kernel/net/netdevice.h>
 #include <kernel/ke/sched.h>
 
 // ============================================================================
@@ -78,9 +79,9 @@
 
 // SRRCTL fields
 #define IGB_SRRCTL_BSIZEPACKET_SHIFT 0 // packet buffer size, 1 KB units
-#define IGB_SRRCTL_DESCTYPE_SHIFT                 \
-	25 // 0 = legacy (NOT supported on 82576) \
-		// 1 = advanced one-buffer
+// descriptor type: 0 = legacy (NOT supported on 82576), 1 = advanced
+// one-buffer
+#define IGB_SRRCTL_DESCTYPE_SHIFT 25
 #define IGB_SRRCTL_DESCTYPE_ADV1BUF (1u << IGB_SRRCTL_DESCTYPE_SHIFT)
 #define IGB_SRRCTL_DROP_EN (1u << 31)
 
@@ -101,6 +102,22 @@
 
 #define IGB_WUC 0x05800 // Wake Up Control
 #define IGB_WUFC 0x05808 // Wake Up Filter Control
+#define IGB_RXCSUM 0x05000 // RX Checksum Control
+#define IGB_RXCSUM_IPOFL (1u << 8)
+#define IGB_RXCSUM_TUOFL (1u << 9)
+#define IGB_EITR0 0x01680 // Interrupt throttle of vector 0 (non-MSI-X)
+#define IGB_EITR_CNT_IGNR (1u << 31) // 82576+: write interval only
+#define IGB_EITR_INTERVAL_MASK 0x7FFCu
+#define IGB_EIMC 0x0152C // Extended interrupt mask clear
+#define IGB_RCTL_UPE (1u << 3)
+#define IGB_RCTL_MPE (1u << 4)
+#define IGB_STATUS_TXOFF (1u << 4)
+#define IGB_MDIC_READY (1u << 28)
+#define IGB_MDIC_ERROR (1u << 30)
+#define IGB_MDIC_OP_WRITE (1u << 26)
+#define IGB_MDIC_OP_READ (2u << 26)
+#define IGB_PHY_ADDR 1
+#define IGB_MII_BMCR_PDOWN 0x0800 // MII control: power down
 
 // CTRL bits
 #define IGB_CTRL_FD (1u << 0)
@@ -183,6 +200,21 @@ typedef struct __attribute__((packed)) {
 #define IGB_TXD_CMD_RS (1u << 3)
 #define IGB_TXD_STAT_DD (1u << 0)
 
+// Advanced TX data descriptor (read format); on write-back the status
+// (DD, bit 0) lands in the olinfo_status word.
+typedef struct __attribute__((packed)) {
+	uint64_t buffer_addr;
+	uint32_t cmd_type_len; // DTYP | DCMD | data length
+	uint32_t olinfo_status; // PAYLEN << 14 | ... ; write-back: status
+} igb_adv_tx_desc_t;
+#define IGB_ADVTXD_DTYP_DATA 0x00300000u // advanced data descriptor
+#define IGB_ADVTXD_DCMD_EOP 0x01000000u
+#define IGB_ADVTXD_DCMD_IFCS 0x02000000u
+#define IGB_ADVTXD_DCMD_RS 0x08000000u
+#define IGB_ADVTXD_DCMD_DEXT 0x20000000u
+#define IGB_ADVTXD_PAYLEN_SHIFT 14
+#define IGB_ADVTXD_STAT_DD 0x1u
+
 /* Same reasoning as e1000: 256 is too tight when softirq falls behind
  * by one timer tick during a peer-cwnd burst — overruns trigger the
  * peer's fast-retransmit and cwnd-halve, capping sustained throughput.
@@ -195,29 +227,47 @@ typedef struct {
 	volatile uint8_t *mmio_base;
 	uint64_t mmio_phys;
 	uint32_t mmio_size;
-
+	// RX ring (advanced descriptors): rx_tail = last given to the
+	// hardware (RDT); only the NAPI poll touches it
 	igb_rx_desc_t *rx_descs;
 	uint64_t rx_descs_phys;
 	uint8_t *rx_bufs[IGB_NUM_RX_DESC];
 	uint64_t rx_bufs_phys[IGB_NUM_RX_DESC];
 	uint16_t rx_tail;
-
-	igb_tx_desc_t *tx_descs;
+	int rx_discarding;
+	// TX ring (advanced data descriptors): tx_tail filled, tx_clean
+	// reclaimed, both under tx_lock; tx_stamp: tick queued (0 = free)
+	igb_adv_tx_desc_t *tx_descs;
 	uint64_t tx_descs_phys;
 	uint8_t *tx_bufs[IGB_NUM_TX_DESC];
 	uint64_t tx_bufs_phys[IGB_NUM_TX_DESC];
+	uint64_t tx_stamp[IGB_NUM_TX_DESC];
+	uint16_t tx_len[IGB_NUM_TX_DESC];
 	uint16_t tx_tail;
-	spinlock_t tx_lock; // Serializes igb_send() across CPUs
-
+	uint16_t tx_clean;
+	spinlock_t tx_lock; // the TX ring and TDT0
 	uint8_t mac_addr[ETH_ALEN];
 	const pci_device_t *pci_dev;
 	int link_up;
+	uint32_t link_speed;
 	uint16_t device_id;
-
+	int msi_vector; // 0: legacy INTx
+	volatile int link_change_pending;
+	volatile int rx_mode_pending;
+	struct napi_struct napi;
+	int itr_rx_class, itr_tx_class;
+	uint32_t itr_rate;
+	uint32_t itr_rx_packets, itr_rx_bytes;
+	uint32_t itr_tx_packets, itr_tx_bytes; // under tx_lock
+	uint32_t itr_tx_acc_packets, itr_tx_acc_bytes;
+	uint64_t stats_tick;
+	uint64_t st_crc, st_align, st_rxerr, st_missed, st_colls;
+	uint64_t st_latecol, st_ecol, st_tncrs, st_rlen, st_nobuf;
+	uint64_t st_csum_err, st_tx_hangs, st_rx_frag;
 	net_device_t net_dev;
 } igb_dev_t;
 
 void igb_init(void);
-void igb_irq_handler(void);
+int igb_irq_handler(void);
 
 #endif // _KERNEL_IGB_H_

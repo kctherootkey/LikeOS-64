@@ -1,0 +1,23 @@
+# Old data (entirely below what we acknowledged) is answered with a
+# duplicate ACK and a D-SACK every time: the out-of-window ACK limit is for
+# segments without data (ACK loops), not for retransmitted data.
+# Copyright (C) 2026 The LikeOS Project
+0.000 socket s stream
+0.000 bind s 8080
+0.000 listen s 16
+0.100 < S 0:0(0) win 65535 <mss 1460,sackOK,TS val 100 ecr 0,nop,wscale 7>
+0.100 > S. 0:0(0) ack 1 win * <mss 1460,sackOK,TS val * ecr 100,nop,wscale *>
+0.200 < . 1:1(0) ack 1 win 512 <nop,nop,TS val 200 ecr echo>
+0.200 accept s c
+0.300 < P. 1:11(10) ack 1 win 512 <nop,nop,TS val 300 ecr echo>
+0.300 > . 1:1(0) ack 11 win *
+0.400 < P. 1:6(5) ack 1 win 512 <nop,nop,TS val 400 ecr echo>
+0.400 > . 1:1(0) ack 11 win * <nop,nop,TS val * ecr 300,sack 1:6>
+0.450 < P. 1:6(5) ack 1 win 512 <nop,nop,TS val 450 ecr echo>
+0.450 > . 1:1(0) ack 11 win * <nop,nop,TS val * ecr 300,sack 1:6>
+# bare old ACKs (no data): the first is answered, the next within 500 ms
+# are not
+0.460 < . 0:0(0) ack 1 win 512 <nop,nop,TS val 460 ecr echo>
+0.460 > . 1:1(0) ack 11 win *
+0.470 < . 0:0(0) ack 1 win 512 <nop,nop,TS val 470 ecr echo>
+0.700 recv c 10 = 10

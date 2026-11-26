@@ -11,6 +11,7 @@
 #include <kernel/uapi/types.h>
 #include <kernel/hal/pci.h>
 #include <kernel/net/net.h>
+#include <kernel/net/netdevice.h>
 #include <kernel/ke/sched.h>
 
 // ============================================================================
@@ -107,6 +108,22 @@
 #define RTL_TSD_TUN (1 << 14) // TX FIFO Underrun
 #define RTL_TSD_TOK (1 << 15) // Transmit OK
 #define RTL_TSD_SIZE_MASK 0x1FFF // Bits 0-12 hold size
+#define RTL_TSD_ERTXTH_SHIFT 16 // early TX threshold, 32-byte units
+#define RTL_TSD_ERTXTH_MASK 0x003F0000u
+#define RTL_TSD_NCC_SHIFT 24 // collisions of this frame
+#define RTL_TSD_OWC (1u << 29) // out-of-window collision
+#define RTL_TSD_TABT (1u << 30) // transmit aborted
+#define RTL_TSD_CRS (1u << 31) // carrier lost
+#define RTL_TCR_CLRABT (1u << 0) // retransmit an aborted frame / clear
+
+// RX packet header status bits (the first 16 bits of each ring entry)
+#define RTL_RXS_ROK (1u << 0)
+#define RTL_RXS_FAE (1u << 1) // frame alignment
+#define RTL_RXS_CRC (1u << 2)
+#define RTL_RXS_LONG (1u << 3)
+#define RTL_RXS_RUNT (1u << 4)
+#define RTL_RXS_ISE (1u << 5) // invalid symbol
+#define RTL_MAX_RX_SIZE 1536u // frame + CRC beyond this: lost in the ring
 
 // ============================================================================
 // MSR (Media Status) bits (offset 0x58, 8-bit)
@@ -120,10 +137,19 @@
 /* RTL8139 supports 8K, 16K, 32K, or 64K RX ring via RCR_RBLEN.  8K was
  * sized for low-volume traffic; under sustained downloads a peer-cwnd
  * burst can fill the ring faster than softirq drains, causing the NIC
- * to drop and the peer's TCP to fast-retransmit / cwnd-halve.  Use
- * the max (64K) — 65 KB pinned is negligible. */
-#define RTL8139_RX_BUF_SIZE (65536 + 16)
-#define RTL8139_RX_BUF_PAD 1500 // Extra slack for WRAP-mode reads
+ * to drop and the peer's TCP to fast-retransmit / cwnd-halve.
+ *
+ * 32K, not 64K: the ring is used with RCR.WRAP, which makes the chip write
+ * a frame that runs past the end of the ring on into the memory after it
+ * instead of wrapping it to the start -- so the driver can always read a
+ * frame as one piece.  The chip IGNORES WRAP at 64K and always wraps; at
+ * 64K every frame straddling the end was read half from the ring and half
+ * from stale padding.  RTL8139_RX_RING_LEN is the wrap modulus; the 16
+ * bytes the datasheet asks for and room for one maximal frame (header,
+ * 1518 bytes, alignment) follow it. */
+#define RTL8139_RX_RING_LEN 32768
+#define RTL8139_RX_BUF_SIZE (RTL8139_RX_RING_LEN + 16)
+#define RTL8139_RX_BUF_PAD 2048 // a whole frame written past the end (WRAP)
 #define RTL8139_RX_BUF_TOTAL (RTL8139_RX_BUF_SIZE + RTL8139_RX_BUF_PAD)
 #define RTL8139_NUM_TX_DESC 4
 #define RTL8139_TX_BUF_SIZE 2048 // One page per TX buffer
@@ -135,21 +161,31 @@ typedef struct {
 	const pci_device_t *pci_dev;
 	uint16_t io_base; // I/O port base from BAR0
 	uint8_t mac_addr[6];
-
-	// RX ring (single contiguous DMA buffer)
+	// RX ring (single contiguous DMA buffer); only the NAPI poll and the
+	// watchdog (both CPU 0) touch it
 	uint8_t *rx_buf;
 	uint64_t rx_buf_phys;
 	uint16_t rx_offset; // Software read pointer (matches CAPR + 16)
-
-	// TX descriptors
+	uint32_t rx_config; // RCR as programmed
+	uint64_t rx_early_tick; // a header still being written seen at
+	// TX: four descriptors used in turn; tx_cur fills, tx_dirty
+	// completes, tx_cur - tx_dirty in flight (at most 4), under tx_lock
 	uint8_t *tx_bufs[RTL8139_NUM_TX_DESC];
 	uint64_t tx_bufs_phys[RTL8139_NUM_TX_DESC];
-	uint8_t tx_cur; // Next descriptor to use (0..3)
-	spinlock_t tx_lock; // Serializes rtl8139_send() across CPUs
-
+	uint64_t tx_stamp[RTL8139_NUM_TX_DESC];
+	uint32_t tx_cur;
+	uint32_t tx_dirty;
+	uint32_t tx_flag; // early TX threshold, raised on each underrun
+	spinlock_t tx_lock; // the TX descriptors and their counters
 	int link_up;
+	int link_seen; // MSR has reported a link once
 	uint8_t msi_vector; // 0 if MSI not in use (RTL8139 has no MSI)
-
+	struct napi_struct napi;
+	volatile int rx_mode_pending;
+	volatile int reset_pending; // TX timeout: restart the chip
+	uint64_t st_tx_aborted, st_tx_carrier, st_tx_window, st_tx_fifo;
+	uint64_t st_colls, st_rx_crc, st_rx_frame, st_rx_length, st_rx_fifo;
+	uint64_t st_rx_resets, st_missed;
 	net_device_t net_dev;
 } rtl8139_dev_t;
 
@@ -157,6 +193,6 @@ typedef struct {
 // Public API
 // ============================================================================
 void rtl8139_init(void);
-void rtl8139_irq_handler(void);
+int rtl8139_irq_handler(void);
 
 #endif // _KERNEL_RTL8139_H_

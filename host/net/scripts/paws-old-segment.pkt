@@ -1,0 +1,15 @@
+# PAWS (RFC 7323 5): a segment whose timestamp is older than the last
+# one seen is an old duplicate -- dropped, answered with an ACK.
+# Copyright (C) 2026 The LikeOS Project
+0.000 socket s stream
+0.000 bind s 8080
+0.000 listen s 16
+0.100 < S 0:0(0) win 65535 <mss 1460,sackOK,TS val 100 ecr 0,nop,wscale 7>
+0.100 > S. 0:0(0) ack 1 win * <mss 1460,sackOK,TS val * ecr 100,nop,wscale *>
+0.200 < . 1:1(0) ack 1 win 512 <nop,nop,TS val 200 ecr echo>
+0.200 accept s c
+0.300 < P. 1:101(100) ack 1 win 512 <nop,nop,TS val 300 ecr echo>
+0.300 > . 1:1(0) ack 101 win * <nop,nop,TS val * ecr 300>
+0.400 < P. 101:201(100) ack 1 win 512 <nop,nop,TS val 250 ecr echo>
+0.400 > . 1:1(0) ack 101 win * <nop,nop,TS val * ecr 300>
+0.410 recv c 1000 = 100

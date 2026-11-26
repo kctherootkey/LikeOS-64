@@ -22,6 +22,10 @@ extern "C" {
 #define POLLRDBAND  0x0080
 #define POLLWRNORM  0x0100
 #define POLLWRBAND  0x0200
+#define POLLMSG     0x0400
+/* The peer closed its sending side, or this end shut down reading: a read
+ * returns end of file at once. */
+#define POLLRDHUP   0x2000
 
 typedef unsigned int nfds_t;
 

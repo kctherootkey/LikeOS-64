@@ -1,0 +1,10 @@
+# A RST|ACK in SYN_RECEIVED resets the embryonic connection: the RST is
+# checked before the ACK, so nothing reaches the accept queue.
+# Copyright (C) 2026 The LikeOS Project
+0.000 socket s stream
+0.000 bind s 8080
+0.000 listen s 16
+0.100 < S 0:0(0) win 65535 <mss 1460,sackOK,TS val 100 ecr 0,nop,wscale 7>
+0.100 > S. 0:0(0) ack 1 win * <mss 1460,sackOK,TS val * ecr 100,nop,wscale *>
+0.200 < R. 1:1(0) ack 1 win 512
+0.300 accept s c = -EAGAIN

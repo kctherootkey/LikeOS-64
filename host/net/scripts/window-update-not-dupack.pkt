@@ -1,0 +1,19 @@
+# ACKs that only change the window are window updates, not duplicate
+# ACKs: three of them must not trigger a fast retransmission.
+# Copyright (C) 2026 The LikeOS Project
+0.000 socket s stream
+0.000 bind s 8080
+0.000 listen s 16
+0.100 < S 0:0(0) win 65535 <mss 1460,sackOK,TS val 100 ecr 0>
+0.100 > S. 0:0(0) ack 1 win * <mss 1460,sackOK,TS val * ecr 100>
+0.200 < . 1:1(0) ack 1 win 65535 <nop,nop,TS val 200 ecr echo>
+0.200 accept s c
+0.300 send c 3000 = 3000
+# (PSH only on the last segment of the write)
+0.300 > . 1:1449(1448) ack 1 win * <nop,nop,TS val * ecr *>
+0.300 > . 1449:2897(1448) ack 1 win * <nop,nop,TS val * ecr *>
+0.300 > P. 2897:3001(104) ack 1 win * <nop,nop,TS val * ecr *>
+0.310 < . 1:1(0) ack 1 win 60000 <nop,nop,TS val 310 ecr echo>
+0.320 < . 1:1(0) ack 1 win 61000 <nop,nop,TS val 320 ecr echo>
+0.330 < . 1:1(0) ack 1 win 62000 <nop,nop,TS val 330 ecr echo>
+0.340 < . 1:1(0) ack 3001 win 62000 <nop,nop,TS val 340 ecr echo>

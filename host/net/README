@@ -1,0 +1,347 @@
+LikeOS network stack host harness
+=================================
+
+Copyright (C) 2026 The LikeOS Project
+
+host/test-net.sh compiles the REAL kernel/net sources on the host, twice,
+as two independent stack instances, connects them with a simulated wire and
+runs tests and benchmarks against them in simulated time.  Everything is
+deterministic: the same sources and seed give the same packets, the same
+results and the same numbers.
+
+Running
+-------
+
+    host/test-net.sh                  # = all: unit + interop + script, epoll
+    host/test-net.sh epoll            # kernel/net/eventpoll.c (host/net/epoll)
+    host/test-net.sh unit|interop|script [FILTER]
+    host/test-net.sh fuzz [N]         # N mutated frames (default 200000)
+    host/test-net.sh fuzz --secs 600  # ... or for 10 minutes
+    host/test-net.sh bench            # benchmarks, compared to baseline.txt
+    host/test-net.sh bench --record   # rewrite host/net/baseline.txt
+    host/test-net.sh --build          # build only
+
+Runner options (after the group): --seed N, --hz N (kernel tick rate,
+default 200), --pcap DIR (one pcap per test; TESTNET_PCAP_RX=1 records
+delivered instead of transmitted frames), -v (kernel log and test trace to
+stderr; also TESTNET_VERBOSE=1), --list, --timeout S (per test),
+--script FILE (script group: run one script file).
+
+Environment: TESTNET_DIR (build dir, default $TMPDIR/likeos-test-net),
+TESTNET_MEM (memory cap of a run, default 1500M), TESTNET_TIMEOUT (wall
+clock cap of a run), TESTNET_EXCLUDE (more kernel/net sources to leave out),
+TESTNET_REV (build the kernel sources of a git revision instead of the
+working tree, e.g. TESTNET_REV=HEAD; the harness itself is always the
+working tree's -- this is how baseline.txt was recorded),
+TESTNET_RX_BATCH_US=A[,B] (interrupt moderation: instance 0's NIC hands
+received frames over in batches of up to A us, instance 1's of B us,
+default 0 = one by one; GRO merges only within a batch),
+TESTNET_CPU_NS (receive processing costs this much simulated time per
+frame, default 0), TESTNET_GRO_OFF=1 (GRO switched off; it is on by
+default, as in the kernel).
+
+On this machine, run it boxed: tmp/boxed.sh -m 2000M -- host/test-net.sh ...
+
+Output: one line per test, PASS / FAIL / XFAIL (a known bug, failing as
+expected) / XPASS (a known bug's test passes: the bug is fixed, turn the
+test into a normal one), and the summary "test-net: N passed, M failed".
+Exit status is 0 when nothing FAILed.  Every test runs in its own forked
+child with fresh instances, so a crash (ASan/UBSan report, BUG, deadlock)
+fails that test only.  A test also fails when the kernel printed a WARNING
+or BUG line it did not expect.
+
+How it is built
+---------------
+
+* Sources: every .c file under kernel/net (subdirectories included), minus
+  dhcp.c dns.c poll.c eventpoll.c syscalls.c unix_socket.c softirq.c
+  (EXCLUDE in test-net.sh).  epoll has a test of its own: host/net/epoll
+  compiles kernel/net/eventpoll.c with the kernel's wait-queue walker
+  against objects with wait queues (ep_kside.c) and checks readiness,
+  edge/level/one-shot/exclusive wakeups, nesting limits, removal on the
+  last close, thousands of items, fairness and the blocking wait.  A new file the stack grows is picked up automatically.
+* Each is compiled freestanding with the kernel's own headers, -O1 and
+  ASan + UBSan (the "san" build; the benchmarks use an -O2 build without
+  sanitizers, "fast" -- simulated results are identical).  prelude.h is
+  force-included: it renames the privileged inlines (spinlocks, interrupt
+  flag, rdmsr, %gs reads) and replaces them with host versions that turn
+  misuse into a test failure (a spinlock taken twice, a trylock spin that
+  never succeeds, sleeping with a lock held or interrupts off, softirq
+  re-entry).  BUG()/BUG_ON() abort with a host stack trace.
+* kstubs.c is the layer under the stack, per instance: a checked heap
+  (kalloc/slab_alloc with double-free detection and fault injection;
+  slab calls with interrupts off are counted, NSC_SLAB_IRQOFF), a seeded
+  random generator and SipHash, the timer API on the simulated clock at the
+  configured frequency, the softirq table with a deterministic pump in place
+  of ksoftirqd, one task per instance whose sleeps run the simulation until
+  it is woken (blocking socket calls work), poll notifications, user-copy
+  and NIC/DHCP/DNS stubs.
+* glue.c gives each instance one simulated NIC and exports the instance as
+  `struct ns_ops` (api-host.h).
+* The objects are linked into one relocatable (ld -r, with --wrap on
+  skb_alloc/skb_put so the unused part of every packet buffer is
+  ASan-poisoned: the skb pools are static arrays, and without this a read
+  past the end of a packet would go unnoticed).  Kernel functions nobody
+  provides get generated stubs that abort when called (the build prints a
+  NOTE listing them).  Every defined global symbol is then renamed per
+  instance with objcopy --redefine-syms: n0_*, n1_*.  So instance 0 and 1
+  have separate globals, and the host links both plus the simulator.
+
+When kernel/net changes its internals (new files, split tcp.c, new
+softirq vectors) nothing needs doing.  When an entry point glue.c calls
+changes (sock_*, net_rx_packet, net_timer_tick, net_init, route_add,
+arp_add_entry, icmp_send_echo/icmp_recv_reply, tcp_send_oob,
+net_get_stats, net_get_tcp_connections) glue.c follows it.  When the stack
+needs a new kernel service, add it to kstubs.c (the NOTE says which).
+
+The simulator (sim.c, sim.h)
+----------------------------
+
+One clock in nanoseconds, moved only by the event loop.  Events: frame
+deliveries, the timer tick of each instance (net_timer_tick + softirqs at
+the kernel's frequency, default 200 Hz), application callbacks.  The stacks
+boot at 1 s uptime.
+
+Instance i has 10.0.0.(i+1)/24 and MAC 02:00:00:00:00:0(i+1).  Link 0 carries
+instance 0 -> 1, link 1 carries 1 -> 0.  A frame goes: tap -> pcap ->
+rewrite hook (NAT & co) -> classify into one of 64 paths -> path loss
+(Bernoulli, Gilbert-Elliott, periodic total-loss windows) -> corruption
+(one flipped bit) -> path rate/queue -> the link's shared bottleneck (rate,
+drop-tail queue, MTU) -> propagation delay, jitter, reordering,
+duplication -> delivery (net_rx_packet + softirqs; with rx_batch_us the
+receiving NIC collects frames and hands a batch over before the softirqs
+run, which is where GRO merges; with TESTNET_CPU_NS an instance busy with
+earlier frames takes the next ones later).  A batch is processed at one
+instant: the ACKs of one batch, and what the stack sends in reply to
+them, share a timestamp, so RACK sees ties (equal send times, decided by
+sequence) that a real CPU, which spends time on every frame, rarely
+produces -- batch the data receiver only (A), not the sender (B), when
+loss recovery is measured.  struct link_cfg /
+path_cfg in sim.h; link_stats() counts what happened.
+
+Readiness: the stacks' poll notifications (poll_notify_wq on a socket's
+queue) are delivered to an application callback (sim_set_app) after the
+event that raised them, never in the middle of kernel code.
+
+Test API (sim.h; stable across waves)
+-------------------------------------
+
+  NS[i]->...               the instance (struct ns_ops in api-host.h):
+                           socket, set_nonblock, bind, listen, accept,
+                           connect, send, recv, sendto, recvfrom, close,
+                           shutdown, setsockopt, getsockopt, poll, ioctl,
+                           sockname, tcpinfo, tcp_state, send_oob, ping,
+                           ping_reply, arp_add, route_add, counter (the
+                           stack's MIB counters + harness counters, enum
+                           ns_counter), alloc_fail / skb_fail (fault
+                           injection), quiet, isn_fix (place the ISN),
+                           slab_strict.  Socket calls take the socket index
+                           and return a count or -errno (errno values as on
+                           the host).
+  sim_run_for(dt), sim_run_until_time(t), sim_run_cond(fn, arg, dt),
+  sim_step(), sim_at/sim_after(t, fn, arg, a), now_ns()
+  link_cfg(dir), link_set_both(&path), link_stats(dir)
+  wire_set_tap(fn, ctx), wire_detach(inst), pcap_open/pcap_close
+  cap_start(inst, consume), cap_next, cap_next_proto, cap_stop
+  tcp_pair(cli, srv, port, &c, &s, &listener, timeout)
+  tcp_connect_nb, wait_established, so_error
+  struct flow + flow_init + flows_run: any number of one-way pattern
+                           streams driven by readiness notifications, with
+                           integrity checks; a 10 ms safety scan counts
+                           progress nobody was notified about
+                           (g_missed_wakeups)
+  transfer(a, sa, b, sb, id, n, timeout): one flow
+  pat_fill / pat_check:    the data pattern
+  frame_csum_bad, frame_fix_csums, inet_csum
+  pkt.h:                   build/parse TCP, UDP, ICMP, ARP, IPv4 frames
+  CHECK(cond, fmt, ...):   fail the test with a message
+
+A test is a function returning 0 for pass, registered in a table
+(t_unit.c, t_interop.c, t_core.c, t_ip.c, t_tcp.c, t_tcp2.c, t_bench.c,
+t_fuzz.c) with
+optional fields: xfail
+(reason: a known bug), hz, ninst (1 = only instance 0 is up), mtu, limit
+(simulated time limit), allow_warn, arg.
+
+IPv4, ICMP and UDP (t_ip.c, kt_ip.c)
+------------------------------------
+
+t_ip.c drives instance 0 with crafted frames from made-up neighbours
+10.0.0.9 and 10.0.0.10: header checks, martians, options (valid and
+malformed, with the parameter-problem pointer), source routing,
+reassembly (order, duplicates, overlaps, timeout with ICMP time
+exceeded, memory pressure, limits), output (DF and identification per
+IP_MTU_DISCOVER mode, fragments, EMSGSIZE, path-MTU reports, TTL/TOS),
+ICMP (broadcast echo, timestamp, the never-answer rules, rate limits)
+and UDP (lookup precedence, bind rules, SO_REUSEPORT, broadcast and
+multicast fan-out, receive buffer, MSG_PEEK/TRUNC/DONTWAIT, cmsgs,
+checksums, UDP_CORK/MSG_MORE, ICMP errors and IP_RECVERR, raw sockets).
+kt_ip.c runs inside the instances (n0_kt_*, n1_kt_*): protocol counters
+by name (kt_mib), reassembly state and thresholds, the ICMP rate-limit
+reset, path-MTU exceptions, sendmsg/recvmsg with decoded control
+messages, raw sockets, AF_UNSPEC connect and group membership.
+
+Regression tests for the fixes of review A (tmp/net-review-a.md):
+  udp-cork-memory       pending (corked) datagrams: buffers sized to what
+                        was appended, a global cap on what they pin, twice
+                        SO_SNDBUF per datagram, a failed append discards it
+  pmtu-report-rules     a "fragmentation needed" report changes the path
+                        MTU only for a datagram a socket may have sent and
+                        that takes reports (UDP lookup, raw bound/connected
+                        addresses, IP_PMTUDISC_OMIT/INTERFACE ignore them)
+  eth-group-source      a group source address: dropped, counted, no WARN
+  out-clone-unshared    IP output never writes into a clone's shared headroom
+  ip-unconfigured       an address-less interface takes DHCP replies only
+  igmp-mc-list          the device multicast list follows the memberships
+  core-xmit-bounded     one send runs the device queue for one quota only
+  core-if-events        SIOCSIFADDR/NETMASK/MTU/FLAGS and carrier loss raise
+                        their events (neighbours flushed, routes looked up
+                        again, a down device sends and reports nothing)
+  core-route-oif        output routing restricted to the requested device
+  core-pmtu-exception-scope  an exception invalidates only its destination's
+                        cached routes, not the FIB generation
+  core-recvmmsg-timeout-math the recvmmsg deadline never wraps
+  drivers (test_irq_claim)  the shared-line claim of e1000/igb/rtl8139
+
+TCP (t_tcp.c, kt_tcp.c)
+-----------------------
+
+t_tcp.c covers the TCP of wave 5: request socks (no full socket before
+the handshake completes, their size, SYN-ACK backoff), SYN cookies (a full
+SYN queue, the options carried in the timestamp, a SYN flood whose clients
+all complete), the accept queue limit, closing a listener with pending
+request socks and unaccepted children, TCP_DEFER_ACCEPT, TIME_WAIT socks
+(their cost, reuse by connect(), recycling by a newer SYN), the orphan
+FIN_WAIT2 timeout, resets on close with unread data and on data after
+close, ACK every second segment, delayed-ACK timing, TCP_QUICKACK, PSH on
+the last segment of a write only, window updates on read and receiver SWS
+avoidance, Nagle and TCP_CORK, buffer auto-tuning at a high
+bandwidth-delay product, SO_RCVBUF locking, SYN defaults, TCP_MAXSEG,
+TCP_NOTSENT_LOWAT, TCP_USER_TIMEOUT, keepalive probes, out-of-order data
+with overlaps and D-SACK, PAWS, RFC 5961 challenge ACKs, pruning under
+memory pressure and a thousand concurrent connections (it prints the
+memory an idle established connection costs).  Many use a "raw peer": a
+made-up host 10.0.0.(20+k) whose segments are built in the test and fed
+to instance 0, with everything instance 0 sends captured.  kt_tcp.c runs
+inside the instances: one socket's connection state (struct
+kt_tcp_sockinfo, kt_tcp.h), the extended TCP counters by name, the
+socket, TIME_WAIT and orphan counts, and a red-black tree check.
+
+t_tcp2.c covers the TCP of wave 6: the SACK scoreboard (whole and partial
+blocks on a hand-built retransmit queue, the block cache, invalid blocks,
+D-SACK below the ACK and inside the second block, reordering, MSS-aligned
+splits), SACK reneging, RACK's tolerance of reordering, the tail loss
+probe repairing a lost tail without an RTO, PRR's send counts, F-RTO and
+Eifel undo of spurious timeouts, the integer cube root, CUBIC's window
+over time (K, W_max, concave/convex growth, fast convergence),
+HyStart++ ending slow start before the first loss, the pacing rate and
+the burst size it allows, ECN (negotiation, CE echo until CWR, ECT on new
+data only, one reduction per window), a path-MTU reduction mid-transfer
+(re-segmented and resent without an RTO; an out-of-window report
+ignored), a GRO-merged segment counted as its segments, the TCP_INFO
+layout and values, TCP_CONGESTION, and connect() over a TIME_WAIT tuple
+without timestamps (EADDRNOTAVAIL).  Loss recovery and GRO memory:
+1 % random loss repaired without a timeout or a spurious resend
+(tcp-loss1-no-rto), four losses of one window repaired by one recovery
+with one window reduction (tcp-multi-loss-one-recovery), GRO merges of a
+batching NIC charged about their size in the receive queue
+(tcp-gro-truesize; core-skb-fit checks the fitted buffer classes).
+kt_tcp2.c holds the kernel-side probes (n0_kt2_*).
+
+Script mode (t_script.c, scripts/*.pkt)
+---------------------------------------
+
+Instance 0 is the stack under test; the script plays the peer 10.0.0.2
+(its MAC is pre-entered in the ARP table).  Every TCP segment instance 0
+sends is captured and must be matched by a ">" line; anything else it
+sends (ARP) is ignored.  Lines:
+
+    # comment
+    xfail REASON              header: a known bug
+    hz N                      header: tick rate
+    tolerance MS              time tolerance of ">" lines (default 10)
+    remote_isn N              the peer's ISN (default 1000000)
+    remote_port N             the peer's port (default 40000)
+
+    TIME < FLAGS SEQ:END(LEN) [ack N] [win N] [urg N] [csum bad] [<OPTS>]
+    TIME > FLAGS SEQ:END(LEN) [ack N] [win N] [<OPTS>]
+    TIME CALL ARGS... [= RET]
+
+TIME is seconds from the script start, or +SECONDS after the previous
+line.  FLAGS: S F R P U and "." for ACK ("S.", "P.", "F.", "R.").  "<"
+injects a segment; its sequence numbers are relative to the peer's ISN,
+its ack relative to the stack's ISN (learned from the stack's SYN or
+SYN-ACK); payload is generated.  ">" expects the next segment at TIME +-
+tolerance; seq relative to the stack's ISN, ack to the peer's; "*" matches
+anything (seq, ack, win, option values).  Without <OPTS> the options are
+not checked; with them the set must match exactly (nop/eol ignored):
+mss N, wscale N, sackOK, TS val V ecr E, sack A:B C:D ... (outbound SACK
+blocks in the peer's sequence space, in order).  In "<" lines "ecr echo"
+echoes the stack's last TSval; in ">" lines "TS val ~" requires the TSval
+to continue the stack's previous one (not backwards, not faster than
+1 ms/unit + 50).  An outbound segment that no ">" line expects fails the
+script, also within the tolerance after the last line.
+
+Calls: socket NAME stream|dgram, bind NAME PORT, listen NAME [BACKLOG],
+accept NAME NEWNAME, connect NAME PORT, send NAME N [oob], recv NAME N
+[oob] [peek], atmark NAME (SIOCATMARK), poll NAME (revents of POLLIN,
+POLLPRI and POLLOUT),
+close NAME, shutdown NAME rd|wr|rdwr, setsockopt NAME nodelay|cork|
+keepalive V, setsockopt NAME linger0 0, state NAME TCP_STATE, so_error NAME.
+Sockets are nonblocking.  "= RET" compares the return value (number or
+-ERRNO name); without it a negative return fails.
+
+Fuzzer
+------
+
+t_fuzz.c records a corpus from real traffic towards instance 0, then
+injects mutated frames (bit flips, random bytes, interesting header values,
+IP header fields, truncation, extension, splicing; checksums repaired half
+of the time) while normal traffic and the timers run, and finally checks
+the instance still connects, moves data and answers a ping.  A crash
+leaves the frame in $TESTNET_DIR/fuzz-crash-SEED-ITER.bin (+ .pcap);
+--seed S --iters N reproduces it.
+
+Benchmarks and the baseline
+---------------------------
+
+t_bench.c (instance 0 = the client, instance 1 = every server):
+
+  amazon.sN.*  a page load, three seeds (--seed S > 1 loads other pages,
+               for averages over many): a 100 KB HTML object, then ~500
+               objects of 2 KB .. 500 KB (bounded Pareto, alpha 1.1) from
+               33 hosts, at most 6 keep-alive connections per host, each
+               host with its own RTT 20-120 ms, loss 0.1-1 %, rate 50-200
+               Mbit/s behind a shared 200 Mbit/s access link.  The wire
+               NATs every client connection to its own source address,
+               as a browser's connections reach many different servers
+               (it once kept a per-source SYN rate limit, now removed,
+               from shaping the load; kept for comparable numbers).  total_ms (300000 = did not finish in 300 s),
+               objects_failed, obj_p50/p95/max_ms (request to last byte),
+               retrans, stalls (gaps >= 500 ms in a response),
+               max_stall_ms, missed_wakeups.
+  live.*       6 Mbit/s for 120 s over 60 ms RTT, 20 Mbit/s, 0.1 % loss and
+               a 300 ms total-loss burst every 10 s; a player with a 2 s
+               buffer: startup_ms, rebuffers, rebuffer_ms,
+               max_rebuffer_ms, max_stall_ms (largest gap between data
+               arrivals), delivered_pct, retrans.
+  bulk.rttR.lossL.*  100 MB at RTT 10/50/150 ms and loss 0/0.1/1 % over
+               1 Gbit/s (cut off after 300 s): goodput_mbps, retrans.
+
+The neighbours' ARP entries are pre-entered (a warm machine).
+bench compares every key with host/net/baseline.txt and marks changes of
+2 % or more as better/WORSE (higher is better for *_mbps and *_pct, lower
+for everything else).  Record a new baseline only deliberately.
+
+Limitations
+-----------
+
+* Both ends are this stack: sender-side bugs shape the numbers as much as
+  receiver-side ones, while on the target the server is usually another
+  system.
+* One CPU, no preemption, zero processing time: races between CPUs and
+  interrupt/softirq interleavings inside a code path are not exercised;
+  lock misuse is caught only as recursion or sleeping in atomic context.
+* The descriptor layer (syscalls.c, poll.c, epoll) and AF_UNIX are not
+  compiled; sockets are used by index.  DHCP and DNS are stubbed.
+* The NIC drivers are not compiled (one simulated NIC per instance).

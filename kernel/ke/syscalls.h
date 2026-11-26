@@ -17,6 +17,8 @@ int64_t sys_accept4(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4);
 int64_t sys_access(uint64_t pathname, uint64_t mode);
 int64_t sys_alarm(uint64_t seconds);
 int64_t sys_arch_prctl(uint64_t code, uint64_t addr);
+int64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
+		  uint64_t arg4, uint64_t arg5);
 int64_t sys_bind(uint64_t a1, uint64_t a2, uint64_t a3);
 int64_t sys_brk(uint64_t new_brk);
 int64_t sys_chdir(uint64_t pathname);
@@ -37,11 +39,15 @@ int64_t sys_dns_resolve_reverse(uint64_t a1, uint64_t a2, uint64_t a3);
 int64_t sys_dup(uint64_t oldfd);
 int64_t sys_dup2(uint64_t oldfd, uint64_t newfd);
 int64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags);
-int64_t sys_epoll_create(void);
+int64_t sys_epoll_create(uint64_t a1);
 int64_t sys_epoll_create1(uint64_t a1);
 int64_t sys_epoll_ctl(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4);
 __attribute__((noinline)) int64_t
 sys_epoll_wait(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4);
+int64_t sys_epoll_pwait(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+			uint64_t a5);
+int64_t sys_epoll_pwait2(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+			 uint64_t a5, uint64_t a6);
 int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 		   uint64_t envp_ptr);
 __attribute__((noreturn)) void sys_exit(uint64_t status);
@@ -165,6 +171,8 @@ int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 int64_t sys_recv(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4);
 int64_t sys_recvfrom(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
 int64_t sys_recvmsg(uint64_t a1, uint64_t a2, uint64_t a3);
+int64_t sys_recvmmsg(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+		     uint64_t a5);
 int64_t sys_removexattr(uint64_t u_path, uint64_t u_name,
 			uint64_t nofollow);
 int64_t sys_rename(uint64_t oldpath, uint64_t newpath);
@@ -198,6 +206,7 @@ sys_select(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 int64_t sys_send(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4);
 int64_t sys_sendfile(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4);
 int64_t sys_sendmsg(uint64_t a1, uint64_t a2, uint64_t a3);
+int64_t sys_sendmmsg(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4);
 int64_t sys_sendto(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
 int64_t sys_set_dns_server(uint64_t a1, uint64_t a2);
 int64_t sys_set_robust_list(uint64_t head, uint64_t len);

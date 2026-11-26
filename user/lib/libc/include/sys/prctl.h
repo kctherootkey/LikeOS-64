@@ -1,9 +1,11 @@
 /* <sys/prctl.h> -- process control knobs.
  *
  * The subset that has meaning here: the thread name (PR_SET_NAME /
- * PR_GET_NAME).  The other well-known options are accepted and answered
- * with their conventional defaults so that portable start-up code
- * (hardening, dumpable state, child-subreaper) runs unchanged.
+ * PR_GET_NAME) and the dumpable state (PR_GET_DUMPABLE / PR_SET_DUMPABLE,
+ * kept by the kernel: it decides who may trace the process).  The other
+ * well-known options are accepted and answered with their conventional
+ * defaults so that portable start-up code (hardening, child-subreaper) runs
+ * unchanged.
  *
  * Copyright (C) 2026 The LikeOS Project
  */

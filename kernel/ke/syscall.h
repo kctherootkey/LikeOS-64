@@ -224,6 +224,9 @@ typedef struct procmapinfo {
 #define SYS_RAW_RECV 374 // Receive raw IP/ICMP/ARP packet
 #define SYS_DNS_RESOLVE_REVERSE 375 // Reverse DNS lookup (PTR)
 #define SYS_SET_DNS_SERVER 376 // Install resolver server (RFC 3493 stub)
+#define SYS_SENDMMSG 377 // (fd, mmsghdr *vec, vlen, flags)
+#define SYS_RECVMMSG 378 // (fd, mmsghdr *vec, vlen, flags, timespec *timeout)
+#define SYS_EPOLL_PWAIT2 379 // (epfd, events, maxevents, timespec *, sigmask, sigsetsize)
 
 // Process / session management (POSIX)
 #define SYS_SETSID 380 // Create a new session
@@ -303,6 +306,7 @@ typedef struct procmapinfo {
 #define SYS_FCHMODAT 438 /* (dirfd, path, mode, flags) */
 #define SYS_SYNCFS 439 /* (fd) */
 #define SYS_READLINKAT 440 /* (dirfd, path, buf, bufsiz) */
+#define SYS_PRCTL 441 /* (option, arg2, arg3, arg4, arg5) */
 #define MS_ASYNC 1
 #define MS_INVALIDATE 2
 #define MS_SYNC 4

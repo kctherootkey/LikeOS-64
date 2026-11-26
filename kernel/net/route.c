@@ -1,187 +1,218 @@
-// LikeOS - IP Routing Table
+// LikeOS - IPv4 routing: the route interfaces on top of the FIB
 //
-// Static routing table with longest-prefix-match lookup.
-// Populated by DHCP and ioctl (SIOCADDRT/SIOCDELRT).
+// route_add/route_del (DHCP, SIOCADDRT/SIOCDELRT), route_lookup (device
+// and next hop for an address), ip_route_output (a held dst_entry for a
+// destination, with the local and broadcast cases), the path-MTU cache
+// interface (pmtu_set/pmtu_get) and the routing table view for netstat.
 //
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/net/net.h>
+#include <kernel/net/fib.h>
+#include <kernel/net/dst.h>
+#include <kernel/net/netdevice.h>
+#include <kernel/net/net_timer.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
+#include <kernel/ke/timer.h>
 #include <kernel/uapi/bug.h>
 
-// Route flags
-#define RTF_UP 0x0001 // Route is usable
-#define RTF_GATEWAY 0x0002 // Destination is a gateway
-#define RTF_HOST 0x0004 // Host route (not network)
-#define RTF_REJECT 0x0200 // Reject route
+#define ROUTE_EXC_GC_MS 60000
 
-#define MAX_ROUTES 32
+/* The local and broadcast entries of each device: [slot][0] RTN_LOCAL
+ * (through loopback), [slot][1] RTN_BROADCAST.  Slot NET_MAX_DEVICES is
+ * the loopback device itself. */
+static struct dst_entry *special_dst[NET_MAX_DEVICES + 1][2];
+static spinlock_t special_lock = SPINLOCK_INIT("route_special");
+static net_timer_t exc_gc_timer;
 
-typedef struct {
-	uint32_t dst_net; // Destination network (host byte order)
-	uint32_t netmask; // Netmask (host byte order)
-	uint32_t gateway; // Gateway IP (host byte order), 0 if connected
-	net_device_t *dev; // Output device
-	uint32_t metric; // Route metric (lower = preferred)
-	uint16_t flags; // RTF_* flags
-	int active; // Entry in use
-} rt_entry_t;
-
-static rt_entry_t route_table[MAX_ROUTES];
-static spinlock_t route_lock = SPINLOCK_INIT("route");
-
-// Count set bits in netmask (prefix length)
-static int mask_len(uint32_t mask)
+static void route_exc_gc(net_timer_t *t)
 {
-	int bits = 0;
-	while (mask & 0x80000000) {
-		bits++;
-		mask <<= 1;
-	}
-	return bits;
+	fib_exceptions_gc();
+	net_timer_mod(t, timer_ticks() + net_ms_to_ticks(ROUTE_EXC_GC_MS));
 }
+
+static void route_netdev_event(struct netdev_notifier *nb, unsigned long ev,
+			       net_device_t *dev)
+{
+	(void)nb;
+	(void)dev;
+	switch (ev) {
+	case NETDEV_UP:
+	case NETDEV_DOWN:
+	case NETDEV_CHANGE:
+	case NETDEV_CHANGEADDR:
+	case NETDEV_CHANGEMTU:
+		// every route handed out is looked up again
+		fib_genid_bump();
+		break;
+	default:
+		break;
+	}
+}
+
+static struct netdev_notifier route_notifier = {
+	.fn = route_netdev_event,
+};
 
 void route_init(void)
 {
-	for (int i = 0; i < MAX_ROUTES; i++)
-		route_table[i].active = 0;
+	dst_init();
+	fib_init();
+	register_netdevice_notifier(&route_notifier);
+	net_timer_setup(&exc_gc_timer, route_exc_gc);
+	net_timer_mod(&exc_gc_timer,
+		      timer_ticks() + net_ms_to_ticks(ROUTE_EXC_GC_MS));
 }
 
 int route_add(uint32_t dst_net, uint32_t netmask, uint32_t gateway,
 	      net_device_t *dev, uint32_t metric, uint16_t flags)
 {
-	BUG_ON(dev == NULL && !(flags & RTF_REJECT));
-	/* A gateway route with gateway==0 is meaningless (would route to 0.0.0.0) */
-	WARN_ON((flags & RTF_GATEWAY) && gateway == 0);
-	/* dst_net must be on the network boundary — bits outside netmask must be 0,
-     * otherwise the LPM lookup mask-and-compare can never match. */
-	WARN_ON((dst_net & ~netmask) != 0);
-	uint64_t fl;
-	spin_lock_irqsave(&route_lock, &fl);
+	struct fib_config cfg = { 0 };
 
-	// Check for duplicate
-	for (int i = 0; i < MAX_ROUTES; i++) {
-		if (route_table[i].active &&
-		    route_table[i].dst_net == dst_net &&
-		    route_table[i].netmask == netmask) {
-			// Update existing route
-			route_table[i].gateway = gateway;
-			route_table[i].dev = dev;
-			route_table[i].metric = metric;
-			route_table[i].flags = flags;
-			spin_unlock_irqrestore(&route_lock, fl);
-			return 0;
-		}
+	if (flags & RTF_HOST)
+		netmask = 0xFFFFFFFFu;
+	/* A gateway route needs a gateway, and bits outside the mask make a
+	 * prefix that can never match: refused (both come from user space
+	 * through SIOCADDRT). */
+	if ((flags & RTF_GATEWAY) && gateway == 0)
+		return -EINVAL;
+	if (!dev && !(flags & RTF_REJECT)) {
+		// the device the gateway is reached through
+		uint32_t nh;
+
+		if (gateway)
+			dev = route_lookup(gateway, &nh);
+		if (!dev)
+			return -ENETUNREACH;
 	}
-
-	// Find free slot
-	for (int i = 0; i < MAX_ROUTES; i++) {
-		if (!route_table[i].active) {
-			route_table[i].dst_net = dst_net;
-			route_table[i].netmask = netmask;
-			route_table[i].gateway = gateway;
-			route_table[i].dev = dev;
-			route_table[i].metric = metric;
-			route_table[i].flags = flags;
-			route_table[i].active = 1;
-			spin_unlock_irqrestore(&route_lock, fl);
-			return 0;
-		}
-	}
-
-	spin_unlock_irqrestore(&route_lock, fl);
-	return -ENOSPC;
+	cfg.dst = dst_net;
+	cfg.mask = netmask;
+	cfg.gw = gateway;
+	cfg.dev = dev;
+	cfg.metric = metric;
+	cfg.flags = flags;
+	cfg.type = (flags & RTF_REJECT) ? RTN_UNREACHABLE : RTN_UNICAST;
+	return fib_table_insert(&cfg);
 }
 
 int route_del(uint32_t dst_net, uint32_t netmask, uint32_t gateway)
 {
-	uint64_t fl;
-	spin_lock_irqsave(&route_lock, &fl);
-
-	for (int i = 0; i < MAX_ROUTES; i++) {
-		if (route_table[i].active &&
-		    route_table[i].dst_net == dst_net &&
-		    route_table[i].netmask == netmask &&
-		    (gateway == 0 || route_table[i].gateway == gateway)) {
-			route_table[i].active = 0;
-			spin_unlock_irqrestore(&route_lock, fl);
-			return 0;
-		}
-	}
-
-	spin_unlock_irqrestore(&route_lock, fl);
-	return -ESRCH;
+	return fib_table_delete(dst_net, netmask, gateway);
 }
 
-// Longest-prefix-match route lookup
+// Longest-prefix-match route lookup.
 // Returns: device to use, and sets *next_hop_out to the next-hop IP
 net_device_t *route_lookup(uint32_t dst_ip, uint32_t *next_hop_out)
 {
-	uint64_t fl;
-	spin_lock_irqsave(&route_lock, &fl);
+	struct fib_result res;
 
-	int best = -1;
-	int best_prefix = -1;
-	uint32_t best_metric = 0xFFFFFFFF;
-
-	for (int i = 0; i < MAX_ROUTES; i++) {
-		if (!route_table[i].active)
-			continue;
-		if (!(route_table[i].flags & RTF_UP))
-			continue;
-		if (route_table[i].flags & RTF_REJECT)
-			continue;
-
-		if ((dst_ip & route_table[i].netmask) ==
-		    route_table[i].dst_net) {
-			int prefix = mask_len(route_table[i].netmask);
-			if (prefix > best_prefix ||
-			    (prefix == best_prefix &&
-			     route_table[i].metric < best_metric)) {
-				best = i;
-				best_prefix = prefix;
-				best_metric = route_table[i].metric;
-			}
-		}
-	}
-
-	if (best < 0) {
-		spin_unlock_irqrestore(&route_lock, fl);
+	if (fib_lookup(dst_ip, &res) == 0 && res.dev &&
+	    (res.type == RTN_UNICAST || res.type == RTN_LOCAL)) {
 		if (next_hop_out)
-			*next_hop_out = dst_ip;
-		return NULL;
+			*next_hop_out = res.gw ? res.gw : dst_ip;
+		return res.dev;
 	}
-
-	net_device_t *dev = route_table[best].dev;
-	if (next_hop_out) {
-		if (route_table[best].flags & RTF_GATEWAY)
-			*next_hop_out = route_table[best].gateway;
-		else
-			*next_hop_out = dst_ip;
-	}
-
-	spin_unlock_irqrestore(&route_lock, fl);
-	return dev;
+	if (next_hop_out)
+		*next_hop_out = dst_ip;
+	return NULL;
 }
 
-// Get route table entries (for /proc/net/route style display or ioctl)
-int route_get_table(rt_entry_t *entries, int max_entries)
+/* The held local (kind 0) or broadcast (kind 1) entry of `dev'. */
+static struct dst_entry *special_get(net_device_t *dev, int slot, int kind)
 {
-	BUG_ON(entries == NULL);
-	BUG_ON(max_entries < 0);
-	uint64_t fl;
-	spin_lock_irqsave(&route_lock, &fl);
+	struct dst_entry *d, *old = NULL;
+	net_device_t *lo = net_get_loopback();
+	uint64_t f;
 
-	int count = 0;
-	for (int i = 0; i < MAX_ROUTES && count < max_entries; i++) {
-		if (route_table[i].active) {
-			entries[count++] = route_table[i];
+	spin_lock_irqsave(&special_lock, &f);
+	d = special_dst[slot][kind];
+	if (!d || !dst_valid(d) || d->prefsrc != dev->ip_addr) {
+		old = d;
+		special_dst[slot][kind] = NULL;
+		d = dst_alloc(kind == 0 && lo ? lo : dev,
+			      kind == 0 ? RTN_LOCAL : RTN_BROADCAST);
+		if (d) {
+			d->prefsrc = dev->ip_addr;
+			special_dst[slot][kind] = d;
 		}
 	}
+	dst_hold(d);
+	spin_unlock_irqrestore(&special_lock, f);
+	dst_release(old);
+	return d;
+}
 
-	spin_unlock_irqrestore(&route_lock, fl);
-	return count;
+int ip_route_output(uint32_t daddr, uint32_t saddr, net_device_t *oif,
+		    struct dst_entry **out)
+{
+	net_device_t *lo = net_get_loopback();
+	int n = net_device_count();
+	int rc;
+
+	(void)saddr;
+	*out = NULL;
+	if (daddr == 0xFFFFFFFFu) {
+		net_device_t *dev = oif ? oif : net_get_default_device();
+		int slot = NET_MAX_DEVICES;
+
+		if (!dev)
+			return -ENETUNREACH;
+		for (int i = 0; i < n; i++)
+			if (net_get_device(i) == dev)
+				slot = i;
+		if (slot == NET_MAX_DEVICES && dev != lo)
+			return -ENETUNREACH;
+		*out = special_get(dev, slot, 1);
+		return *out ? 0 : -ENOBUFS;
+	}
+	for (int i = 0; i < n; i++) {
+		net_device_t *dev = net_get_device(i);
+
+		if (!dev || !dev->ip_addr)
+			continue;
+		if (daddr == dev->ip_addr) {
+			*out = special_get(dev, i, 0);
+			return *out ? 0 : -ENOBUFS;
+		}
+		if (dev->netmask && dev->netmask != 0xFFFFFFFFu &&
+		    daddr == (dev->ip_addr | ~dev->netmask) &&
+		    (!oif || oif == dev)) {
+			*out = special_get(dev, i, 1);
+			return *out ? 0 : -ENOBUFS;
+		}
+	}
+	/* Anything else through the table -- only its routes out of the
+	 * requested device, when the sender named one (SO_BINDTODEVICE, the
+	 * DHCP client's renewal); 127.0.0.0/8 is a route to the loopback
+	 * device there. */
+	rc = fib_route_output(daddr, oif, out);
+	return rc;
+}
+
+/* An upper layer saw `daddr' make progress (a TCP ACK that advanced the
+ * window): the next hop towards it is reachable. */
+void ip_confirm_daddr(uint32_t daddr)
+{
+	struct fib_result res;
+
+	if (fib_lookup(daddr, &res) != 0 || !res.dev ||
+	    res.dev == net_get_loopback())
+		return;
+	ip_neigh_confirm(res.dev, res.gw ? res.gw : daddr);
+}
+
+// RFC 1191 path MTU: a "fragmentation needed" report for `dst_ip'.
+void pmtu_set(uint32_t dst_ip, uint16_t mtu)
+{
+	if (mtu < 68)
+		mtu = 68; // RFC 791 minimum
+	(void)fib_exception_set_pmtu(dst_ip, mtu);
+}
+
+uint16_t pmtu_get(uint32_t dst_ip)
+{
+	return (uint16_t)fib_exception_get_pmtu(dst_ip);
 }
 
 // Get route table for userspace
@@ -189,33 +220,5 @@ int net_get_route_table(net_route_info_t *entries, int max_entries)
 {
 	BUG_ON(entries == NULL);
 	BUG_ON(max_entries < 0);
-	uint64_t fl;
-	spin_lock_irqsave(&route_lock, &fl);
-
-	int count = 0;
-	for (int i = 0; i < MAX_ROUTES && count < max_entries; i++) {
-		if (!route_table[i].active)
-			continue;
-		entries[count].dst_net = route_table[i].dst_net;
-		entries[count].netmask = route_table[i].netmask;
-		entries[count].gateway = route_table[i].gateway;
-		entries[count].flags = route_table[i].flags;
-		entries[count].metric = (uint16_t)route_table[i].metric;
-		if (route_table[i].dev && route_table[i].dev->name) {
-			const char *n = route_table[i].dev->name;
-			int j = 0;
-			while (n[j] && j < 15) {
-				entries[count].dev_name[j] = n[j];
-				j++;
-			}
-			entries[count].dev_name[j] = '\0';
-		} else {
-			entries[count].dev_name[0] = '*';
-			entries[count].dev_name[1] = '\0';
-		}
-		count++;
-	}
-
-	spin_unlock_irqrestore(&route_lock, fl);
-	return count;
+	return fib_dump(entries, max_entries);
 }

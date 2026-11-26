@@ -21,6 +21,9 @@
 #include <kernel/ke/sched.h>
 #include <kernel/fs/fsnotify.h>
 
+/* kernel/net/eventpoll.c: epoll items watching a file go before it does. */
+extern void eventpoll_release(void *entry);
+
 /* Is this a pointer the kernel could plausibly have stored?
  *
  * Kernel pointers live in the upper canonical half.  A free poison, a
@@ -2861,6 +2864,10 @@ int vfs_close(vfs_file_t *f)
 		return ST_INVALID;
 	}
 
+	/* epoll sets watching this file let go of it first, while it is
+	 * still whole (an item is on one of its wait queues). */
+	eventpoll_release(f);
+
 	/* Actually close when refcount reaches 0 (old was 1, now 0).
 	 *
 	 * at_path is released FIRST: ->close frees the vfs_file itself, so
@@ -2905,6 +2912,22 @@ void vfs_incref(vfs_file_t *f)
 {
 	if (f)
 		__sync_fetch_and_add(&f->refcount, 1);
+}
+
+int vfs_tryget(vfs_file_t *f)
+{
+	int old;
+
+	if (!f)
+		return 0;
+	old = __atomic_load_n(&f->refcount, __ATOMIC_RELAXED);
+	while (old > 0) {
+		if (__atomic_compare_exchange_n(&f->refcount, &old, old + 1,
+						false, __ATOMIC_ACQ_REL,
+						__ATOMIC_RELAXED))
+			return 1;
+	}
+	return 0;
 }
 
 size_t vfs_size(vfs_file_t *f)

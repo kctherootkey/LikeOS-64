@@ -52,6 +52,9 @@ pipe_end_t *pipe_dup_end(pipe_end_t *end);
  * out of a descriptor table under that table's lock).  Returns false if it is
  * not a pipe end at all. */
 bool pipe_end_hold(pipe_end_t *end);
+/* Hold an end whose last reference is not yet gone; never revives one that
+ * is being closed.  The end's memory must be known to exist. */
+bool pipe_end_tryhold(pipe_end_t *end);
 /* Drop one hold.  The end is freed, and the pipe's reader/writer tally
  * updated, when the last one goes. */
 void pipe_close_end(pipe_end_t *end);

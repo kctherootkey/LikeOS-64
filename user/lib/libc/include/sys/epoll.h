@@ -21,8 +21,12 @@ extern "C" {
 #define EPOLLRDBAND     0x080
 #define EPOLLWRNORM     0x100
 #define EPOLLWRBAND     0x200
-#define EPOLLONESHOT    (1 << 30)
-#define EPOLLET         (1 << 31)
+#define EPOLLMSG        0x400
+#define EPOLLRDHUP      0x2000  /* peer closed its sending side */
+#define EPOLLEXCLUSIVE  (1U << 28) /* wake one of the sets sharing a file */
+#define EPOLLWAKEUP     (1U << 29)
+#define EPOLLONESHOT    (1U << 30)
+#define EPOLLET         (1U << 31)
 
 // epoll_create1 flags
 #define EPOLL_CLOEXEC   0x80000
@@ -51,6 +55,10 @@ int epoll_wait(int epfd, struct epoll_event *events,
                int maxevents, int timeout);
 int epoll_pwait(int epfd, struct epoll_event *events,
                 int maxevents, int timeout, const void *sigmask);
+struct timespec;
+/* epoll_pwait with a nanosecond timeout (NULL: wait for ever). */
+int epoll_pwait2(int epfd, struct epoll_event *events, int maxevents,
+                 const struct timespec *timeout, const void *sigmask);
 
 #ifdef __cplusplus
 }

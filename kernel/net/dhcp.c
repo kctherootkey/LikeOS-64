@@ -303,11 +303,18 @@ void dhcp_rx(net_device_t *dev, const uint8_t *data, uint16_t len)
 	case DHCP_STATE_RENEWING:
 	case DHCP_STATE_REBINDING:
 		if (msg_type == DHCP_ACK && offered != 0) {
+			uint32_t old_ip = dev->ip_addr, old_mask = dev->netmask;
+
 			// Configure the network device
 			dev->ip_addr = offered;
 			dev->netmask = subnet;
 			dev->gateway = router;
 			dev->dns_server = dns;
+			/* Another address (not a renewal of the same one):
+			 * neighbours and routes of the old one are stale. */
+			if (old_ip != offered || old_mask != subnet)
+				call_netdevice_notifiers(NETDEV_CHANGEADDR,
+							 dev);
 			dhcp_state = DHCP_STATE_BOUND;
 			WARN_ON_ONCE(lease ==
 				     0); /* DHCP ACK with zero lease time */
@@ -441,6 +448,7 @@ int dhcp_release(net_device_t *dev)
 	dev->dns_server = 0;
 	dhcp_state = DHCP_STATE_IDLE;
 	dhcp_offered_ip = 0;
+	call_netdevice_notifiers(NETDEV_CHANGEADDR, dev);
 
 	kprintf("[DHCP] Released IP lease\n");
 	return 0;
@@ -494,10 +502,14 @@ void dhcp_invalidate(net_device_t *dev)
 		(void)route_del(0, 0, dev->gateway);
 	}
 
+	int had_addr = dev->ip_addr != 0 || dev->netmask != 0;
+
 	dev->ip_addr = 0;
 	dev->netmask = 0;
 	dev->gateway = 0;
 	dev->dns_server = 0;
+	if (had_addr)
+		call_netdevice_notifiers(NETDEV_CHANGEADDR, dev);
 
 	dhcp_state = DHCP_STATE_IDLE;
 	dhcp_offered_ip = 0;
@@ -531,6 +543,7 @@ void dhcp_tick(void)
 		// Lease expired — fall back to DISCOVER
 		kprintf("[DHCP] Lease expired, restarting\n");
 		dhcp_bound_dev->ip_addr = 0;
+		call_netdevice_notifiers(NETDEV_CHANGEADDR, dhcp_bound_dev);
 		dhcp_state = DHCP_STATE_IDLE;
 		dhcp_discover(dhcp_bound_dev);
 		return;

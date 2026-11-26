@@ -1,0 +1,59 @@
+# LikeOS network stack benchmark baseline (host/test-net.sh bench --record)
+# Copyright (C) 2026 The LikeOS Project
+# kernel sources: git 3938e5a0 (HEAD), recorded 2026-11-25T17:09Z
+# seed 1, tick rate 200 Hz; both ends are this stack (instance 0 client, 1 servers)
+# simulated time, deterministic: same sources + seed = same numbers
+# key value  (lower is better: *_ms, *_s, retrans, stalls, rebuffers; higher is better: *_mbps, *_pct)
+amazon.s1.total_ms 300000
+amazon.s1.objects_failed 1
+amazon.s1.obj_p50_ms 65.630
+amazon.s1.obj_p95_ms 169.366
+amazon.s1.obj_max_ms 1063.190
+amazon.s1.retrans 23
+amazon.s1.stalls 10
+amazon.s1.max_stall_ms 60065
+amazon.s1.missed_wakeups 0
+amazon.s2.total_ms 300000
+amazon.s2.objects_failed 1
+amazon.s2.obj_p50_ms 77.267
+amazon.s2.obj_p95_ms 177.736
+amazon.s2.obj_max_ms 1111.273
+amazon.s2.retrans 34
+amazon.s2.stalls 12
+amazon.s2.max_stall_ms 60105
+amazon.s2.missed_wakeups 0
+amazon.s3.total_ms 4147.643
+amazon.s3.objects_failed 0
+amazon.s3.obj_p50_ms 102.886
+amazon.s3.obj_p95_ms 235.549
+amazon.s3.obj_max_ms 1462.437
+amazon.s3.retrans 34
+amazon.s3.stalls 5
+amazon.s3.max_stall_ms 1106.147
+amazon.s3.missed_wakeups 0
+live.startup_ms 2040
+live.rebuffers 1
+live.rebuffer_ms 142960
+live.max_rebuffer_ms 142960
+live.max_stall_ms 53525.475
+live.delivered_pct 4.168
+live.retrans 9
+live.missed_wakeups 0
+bulk.rtt10.loss0.goodput_mbps 103.159
+bulk.rtt10.loss0.retrans 0
+bulk.rtt10.loss0.1.goodput_mbps 0.043
+bulk.rtt10.loss0.1.retrans 12
+bulk.rtt10.loss1.goodput_mbps 0.008
+bulk.rtt10.loss1.retrans 13
+bulk.rtt50.loss0.goodput_mbps 20.653
+bulk.rtt50.loss0.retrans 0
+bulk.rtt50.loss0.1.goodput_mbps 0.043
+bulk.rtt50.loss0.1.retrans 11
+bulk.rtt50.loss1.goodput_mbps 0.008
+bulk.rtt50.loss1.retrans 12
+bulk.rtt150.loss0.goodput_mbps 6.886
+bulk.rtt150.loss0.retrans 0
+bulk.rtt150.loss0.1.goodput_mbps 0.043
+bulk.rtt150.loss0.1.retrans 10
+bulk.rtt150.loss1.goodput_mbps 0.008
+bulk.rtt150.loss1.retrans 11

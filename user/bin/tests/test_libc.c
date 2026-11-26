@@ -58,6 +58,8 @@
 #include <search.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <linux/errqueue.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <poll.h>
@@ -5155,7 +5157,9 @@ static void test_shebang(void)
 			    exec_expect_errno(p2, av2, ev) == ENOENT);
 	}
 
-	/* E2BIG: rewritten argv + strings exceed the exec stack budget */
+	/* The argument budget is ARG_MAX bytes of strings (argv and envp
+	 * together): 4 KB of arguments to a script is well inside it, 4/3 of
+	 * ARG_MAX is E2BIG. */
 	snprintf(p1, sizeof(p1), "%s/big", base);
 	write_script(p1, 0755, "#!/bin/sh\n");
 	{
@@ -5169,7 +5173,21 @@ static void test_shebang(void)
 		}
 		av[101] = NULL;
 		char *ev[] = { NULL };
-		test_result("oversized argv -> E2BIG",
+		test_result("4 KB of script arguments is accepted",
+			    exec_expect_errno(p1, av, ev) == 0);
+	}
+	{
+		static char bigstore[4][ARG_MAX / 3 + 1];
+		static char *av[6];
+		av[0] = p1;
+		for (int i = 0; i < 4; i++) {
+			memset(bigstore[i], 'b', ARG_MAX / 3);
+			bigstore[i][ARG_MAX / 3] = '\0';
+			av[i + 1] = bigstore[i];
+		}
+		av[5] = NULL;
+		char *ev[] = { NULL };
+		test_result("argv beyond ARG_MAX -> E2BIG",
 			    exec_expect_errno(p1, av, ev) == E2BIG);
 	}
 
@@ -6360,6 +6378,15 @@ static void test_ptrace_permission_denied(void)
 		    errno == EPERM)
 			flags |= 0x01;
 
+		/* Changing identity left this process non-dumpable (it may
+		 * hold what root could read); it says it holds nothing, so its
+		 * new owner may trace it -- and the children it forks -- again. */
+		if (prctl(PR_GET_DUMPABLE) == 0)
+			flags |= 0x04;
+		if (prctl(PR_SET_DUMPABLE, 1) == 0 &&
+		    prctl(PR_GET_DUMPABLE) == 1)
+			flags |= 0x08;
+
 		/* Its own child is still fair game -- the rule denies other
 		 * users, not tracing as such. */
 		pid_t own = fork();
@@ -6385,8 +6412,15 @@ static void test_ptrace_permission_denied(void)
 	test_result("unprivileged process cannot attach to root's process "
 		    "(EPERM)",
 		    (flags & 0x01) != 0);
+	test_result("setuid() away from root leaves the process non-dumpable",
+		    (flags & 0x04) != 0);
+	test_result("PR_SET_DUMPABLE 1 makes it dumpable again",
+		    (flags & 0x08) != 0);
 	test_result("unprivileged process can still trace its own child",
 		    (flags & 0x02) != 0);
+	errno = 0;
+	test_result("PR_SET_DUMPABLE 2 -> EINVAL",
+		    prctl(PR_SET_DUMPABLE, 2) == -1 && errno == EINVAL);
 }
 
 /* Lives in the suite's own data, so after a fork the parent and the child each
@@ -9143,14 +9177,44 @@ static void test_bash_libc_additions(void)
 	if (md)
 		rmdir(t2);
 
-	/* mkfifo: honestly unsupported -> ENOSYS (not a silent success) */
-	errno = 0;
-	test_result("mkfifo -> ENOSYS",
-		    mkfifo(tmpp("nofifo"), 0644) == -1 && errno == ENOSYS);
-	test_result("mkfifoat -> ENOSYS (no FIFO nodes on a filesystem)",
-		    mkfifoat(AT_FDCWD, tmpp("nofifo2"), 0644) == -1 && errno == ENOSYS);
-	test_result("mknodat -> ENOSYS",
-		    mknodat(AT_FDCWD, tmpp("nonode"), S_IFCHR | 0644, 0) == -1 && errno == ENOSYS);
+	/* mkfifo/mkfifoat/mknodat make real nodes on the filesystem */
+	{
+		struct stat nst;
+		const char *f1 = tmpp("fifo1"), *f2 = tmpp("fifo2");
+		const char *cn = tmpp("chrnode");
+
+		unlink(f1);
+		unlink(f2);
+		unlink(cn);
+		test_result("mkfifo creates a FIFO node",
+			    mkfifo(f1, 0644) == 0 && lstat(f1, &nst) == 0 &&
+				    S_ISFIFO(nst.st_mode));
+		test_result("mkfifo on an existing name -> EEXIST",
+			    mkfifo(f1, 0644) == -1 && errno == EEXIST);
+		test_result("mkfifoat(AT_FDCWD) creates a FIFO node",
+			    mkfifoat(AT_FDCWD, f2, 0644) == 0 &&
+				    lstat(f2, &nst) == 0 && S_ISFIFO(nst.st_mode));
+		if (geteuid() == 0) {
+			test_result("mknodat(S_IFCHR) as root makes a device node",
+				    mknodat(AT_FDCWD, cn, S_IFCHR | 0644,
+					    makedev(1, 3)) == 0 &&
+					    lstat(cn, &nst) == 0 &&
+					    S_ISCHR(nst.st_mode) &&
+					    major(nst.st_rdev) == 1 &&
+					    minor(nst.st_rdev) == 3);
+		} else {
+			test_result("mknodat(S_IFCHR) unprivileged -> EPERM",
+				    mknodat(AT_FDCWD, cn, S_IFCHR | 0644,
+					    makedev(1, 3)) == -1 &&
+					    errno == EPERM);
+		}
+		test_result("mknodat(S_IFDIR) -> EINVAL",
+			    mknodat(AT_FDCWD, tmpp("dirnode"), S_IFDIR | 0755,
+				    0) == -1 && errno == EINVAL);
+		unlink(f1);
+		unlink(f2);
+		unlink(cn);
+	}
 
 	/* wide-char helpers used by ported code */
 	wchar_t wbuf[8];
@@ -13059,6 +13123,1838 @@ static void test_timegm(void)
 	struct tm back;
 	gmtime_r(&t, &back);
 	test_result("timegm(gmtime_r(t)) == t", timegm(&back) == t);
+}
+
+// ========================================
+// INET stack fixes (network overhaul, critical fixes)
+// ========================================
+#ifndef TCP_CORK
+#define TCP_CORK 3 // as kernel/net/net.h
+#endif
+
+/* A listening TCP socket on 127.0.0.1, ephemeral port; -1 on failure. */
+static int inetfix_listen(uint16_t *port)
+{
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	struct sockaddr_in a;
+	socklen_t alen = sizeof(a);
+
+	if (fd < 0)
+		return -1;
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0 ||
+	    listen(fd, 8) < 0 ||
+	    getsockname(fd, (struct sockaddr *)&a, &alen) < 0) {
+		close(fd);
+		return -1;
+	}
+	*port = ntohs(a.sin_port);
+	return fd;
+}
+
+static void inetfix_timeouts(int fd, int secs)
+{
+	struct timeval tv = { .tv_sec = secs, .tv_usec = 0 };
+
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static int inetfix_connect(uint16_t port)
+{
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	struct sockaddr_in a;
+
+	if (fd < 0)
+		return -1;
+	inetfix_timeouts(fd, 5);
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_port = htons(port);
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static int inetfix_accept(int lfd)
+{
+	struct pollfd p = { .fd = lfd, .events = POLLIN };
+
+	if (poll(&p, 1, 5000) != 1)
+		return -1;
+	int fd = accept(lfd, NULL, NULL);
+	if (fd >= 0)
+		inetfix_timeouts(fd, 5);
+	return fd;
+}
+
+/* Read exactly n bytes (or fewer at EOF/error); returns the count. */
+static size_t inetfix_read_all(int fd, unsigned char *buf, size_t n)
+{
+	size_t got = 0;
+
+	while (got < n) {
+		ssize_t r = recv(fd, buf + got, n - got, 0);
+		if (r <= 0)
+			break;
+		got += (size_t)r;
+	}
+	return got;
+}
+
+static uint16_t inetfix_csum(const void *data, size_t len)
+{
+	const unsigned char *p = data;
+	uint32_t sum = 0;
+
+	for (size_t i = 0; i + 1 < len; i += 2)
+		sum += (uint32_t)(p[i] << 8 | p[i + 1]);
+	if (len & 1)
+		sum += (uint32_t)p[len - 1] << 8;
+	while (sum >> 16)
+		sum = (sum & 0xFFFF) + (sum >> 16);
+	return (uint16_t)~sum;
+}
+
+/* An IPv4 + TCP SYN to 127.0.0.1:dport with IP total length `tot' and a
+ * deliberately wrong TCP checksum when bad_csum is set; 40 bytes. */
+static void inetfix_build_syn(unsigned char *pkt, uint16_t tot, uint16_t dport,
+			      int bad_csum)
+{
+	memset(pkt, 0, 40);
+	pkt[0] = 0x45;
+	pkt[2] = (unsigned char)(tot >> 8);
+	pkt[3] = (unsigned char)tot;
+	pkt[8] = 64; // ttl
+	pkt[9] = 6; // tcp
+	uint32_t lo = htonl(INADDR_LOOPBACK);
+	memcpy(pkt + 12, &lo, 4);
+	memcpy(pkt + 16, &lo, 4);
+	uint16_t ic = inetfix_csum(pkt, 20);
+	pkt[10] = (unsigned char)(ic >> 8);
+	pkt[11] = (unsigned char)ic;
+	unsigned char *t = pkt + 20;
+	t[0] = 0x9C; // source port 40000
+	t[1] = 0x40;
+	t[2] = (unsigned char)(dport >> 8);
+	t[3] = (unsigned char)dport;
+	t[7] = 1; // seq
+	t[12] = 5 << 4;
+	t[13] = 0x02; // SYN
+	t[14] = 0xFF;
+	t[15] = 0xFF;
+	/* checksum over the pseudo header + segment */
+	unsigned char ph[12 + 20];
+	memcpy(ph, pkt + 12, 8);
+	ph[8] = 0;
+	ph[9] = 6;
+	ph[10] = 0;
+	ph[11] = 20;
+	memcpy(ph + 12, t, 20);
+	uint16_t tc = inetfix_csum(ph, sizeof(ph));
+	if (bad_csum)
+		tc ^= 0x5A5A;
+	t[16] = (unsigned char)(tc >> 8);
+	t[17] = (unsigned char)tc;
+}
+
+struct inetfix_half_close {
+	int lfd;
+	int ok;
+};
+
+/* Server side of the half-close case: read the request to EOF, answer
+ * with 3000 bytes, close. */
+static void *inetfix_half_close_server(void *arg)
+{
+	struct inetfix_half_close *hc = arg;
+	unsigned char buf[256];
+	int fd = inetfix_accept(hc->lfd);
+
+	if (fd < 0)
+		return NULL;
+	while (recv(fd, buf, sizeof(buf), 0) > 0)
+		;
+	unsigned char resp[3000];
+	for (int i = 0; i < (int)sizeof(resp); i++)
+		resp[i] = (unsigned char)(i * 7);
+	hc->ok = send(fd, resp, sizeof(resp), 0) == (ssize_t)sizeof(resp);
+	close(fd);
+	return NULL;
+}
+
+struct inetfix_recv_hold {
+	int fd;
+	ssize_t got;
+	char c;
+};
+
+static void *inetfix_recv_hold_reader(void *arg)
+{
+	struct inetfix_recv_hold *rh = arg;
+
+	rh->got = recv(rh->fd, &rh->c, 1, 0);
+	return NULL;
+}
+
+static void test_inet_stack_fixes(void)
+{
+	printf("\n--- INET stack fixes ---\n");
+
+	/* 1. A TCP segment with a wrong checksum is dropped and counted,
+	 *    and an IP header whose total length is shorter than its header
+	 *    is rejected as a header error (it used to wrap the payload
+	 *    length to ~64 KB).  Needs a raw socket, i.e. root. */
+	if (geteuid() == 0) {
+		uint16_t port = 0;
+		int lfd = inetfix_listen(&port);
+		int raw = socket(AF_INET, SOCK_RAW, 255 /*IPPROTO_RAW*/);
+		int one = 1;
+		net_stats_info_t before, after;
+		unsigned char pkt[40];
+		struct sockaddr_in dst;
+
+		memset(&dst, 0, sizeof(dst));
+		dst.sin_family = AF_INET;
+		dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		if (lfd >= 0 && raw >= 0 &&
+		    setsockopt(raw, IPPROTO_IP, IP_HDRINCL, &one,
+			       sizeof(one)) == 0 &&
+		    net_getinfo(NET_GET_STATS, &before, 1) == 1) {
+			inetfix_build_syn(pkt, 40, port, 1);
+			sendto(raw, pkt, sizeof(pkt), 0,
+			       (struct sockaddr *)&dst, sizeof(dst));
+			inetfix_build_syn(pkt, 8, port, 0);
+			sendto(raw, pkt, sizeof(pkt), 0,
+			       (struct sockaddr *)&dst, sizeof(dst));
+			usleep(100000);
+			int got = net_getinfo(NET_GET_STATS, &after, 1) == 1;
+			test_result("inet fix: bad TCP checksum is counted as an input error",
+				    got && after.tcp_in_errs > before.tcp_in_errs);
+			test_result("inet fix: IP total length < header length is a header error",
+				    got && after.ip_in_hdr_errors >
+						   before.ip_in_hdr_errors);
+			/* ...and neither left a half-open connection on the
+			 * listener nor broke the stack. */
+			int c = inetfix_connect(port);
+			int a = c >= 0 ? inetfix_accept(lfd) : -1;
+			char x = 'q', y = 0;
+			test_result("inet fix: stack works after malformed segments",
+				    a >= 0 && send(c, &x, 1, 0) == 1 &&
+					    recv(a, &y, 1, 0) == 1 && y == 'q');
+			if (c >= 0)
+				close(c);
+			if (a >= 0)
+				close(a);
+		} else {
+			test_pass("inet fix: raw-socket cases skipped (no raw socket)");
+		}
+		if (raw >= 0)
+			close(raw);
+		if (lfd >= 0)
+			close(lfd);
+	}
+
+	/* 2. Half-close: the client shuts its sending side, the server
+	 *    answers and closes.  The client's connection is then in
+	 *    TIME_WAIT with the whole answer unread; it must still be there
+	 *    (it used to be freed after a tick, and FIONREAD then divided by
+	 *    zero). */
+	{
+		uint16_t port = 0;
+		struct inetfix_half_close hc = { .lfd = inetfix_listen(&port) };
+		pthread_t th;
+		int c = hc.lfd >= 0 ? inetfix_connect(port) : -1;
+
+		if (c >= 0 &&
+		    pthread_create(&th, NULL, inetfix_half_close_server, &hc) ==
+			    0) {
+			send(c, "req", 3, 0);
+			shutdown(c, SHUT_WR);
+			pthread_join(th, NULL);
+			usleep(300000); // several timer ticks in TIME_WAIT
+			int avail = -1;
+			test_result("inet fix: FIONREAD in TIME_WAIT reports the unread answer",
+				    hc.ok && ioctl(c, FIONREAD, &avail) == 0 &&
+					    avail == 3000);
+			unsigned char resp[3000];
+			size_t got = inetfix_read_all(c, resp, sizeof(resp));
+			int same = got == sizeof(resp);
+			for (size_t i = 0; same && i < got; i++)
+				same = resp[i] == (unsigned char)(i * 7);
+			test_result("inet fix: half-closed client reads the whole answer",
+				    same);
+			char e;
+			test_result("inet fix: then EOF", recv(c, &e, 1, 0) == 0);
+		} else {
+			test_fail("inet fix: half-close setup");
+		}
+		if (c >= 0)
+			close(c);
+		if (hc.lfd >= 0)
+			close(hc.lfd);
+	}
+
+	/* 3. A recv() in progress keeps its socket alive when another thread
+	 *    closes the descriptor and new sockets are created meanwhile: the
+	 *    socket table slot used to be recycled under the reader. */
+	{
+		uint16_t port = 0;
+		int lfd = inetfix_listen(&port);
+		int c = lfd >= 0 ? inetfix_connect(port) : -1;
+		int a = c >= 0 ? inetfix_accept(lfd) : -1;
+		struct inetfix_recv_hold rh = { .fd = c, .got = -2 };
+		pthread_t th;
+
+		if (a >= 0 &&
+		    pthread_create(&th, NULL, inetfix_recv_hold_reader, &rh) ==
+			    0) {
+			usleep(100000);
+			close(c);
+			int extra[8];
+			for (int i = 0; i < 8; i++)
+				extra[i] = socket(AF_INET, SOCK_DGRAM, 0);
+			send(a, "z", 1, 0);
+			pthread_join(th, NULL);
+			test_result("inet fix: recv survives a concurrent close of its descriptor",
+				    rh.got == 1 && rh.c == 'z');
+			for (int i = 0; i < 8; i++)
+				if (extra[i] >= 0)
+					close(extra[i]);
+		} else {
+			test_fail("inet fix: concurrent-close setup");
+			if (c >= 0)
+				close(c);
+		}
+		if (a >= 0)
+			close(a);
+		if (lfd >= 0)
+			close(lfd);
+	}
+
+	/* 4. Simultaneous open, the simplest way: a socket connecting to its
+	 *    own address.  The final ACK used to reset the connection it had
+	 *    just established. */
+	{
+		int s = socket(AF_INET, SOCK_STREAM, 0);
+		struct sockaddr_in a;
+		socklen_t alen = sizeof(a);
+
+		memset(&a, 0, sizeof(a));
+		a.sin_family = AF_INET;
+		a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		if (s >= 0) {
+			inetfix_timeouts(s, 5);
+			int rc = bind(s, (struct sockaddr *)&a, sizeof(a)) == 0 &&
+				 getsockname(s, (struct sockaddr *)&a,
+					     &alen) == 0 &&
+				 connect(s, (struct sockaddr *)&a,
+					 sizeof(a)) == 0;
+			test_result("inet fix: self-connect (simultaneous open) succeeds",
+				    rc);
+			char buf[8] = { 0 };
+			test_result("inet fix: self-connected socket echoes its data",
+				    rc && send(s, "self", 4, 0) == 4 &&
+					    inetfix_read_all(s, (unsigned char *)buf,
+							     4) == 4 &&
+					    memcmp(buf, "self", 4) == 0);
+			close(s);
+		}
+	}
+
+	/* 5. connect() again on a connecting/connected socket, and
+	 *    getpeername() after a non-blocking connect without SO_ERROR. */
+	{
+		uint16_t port = 0;
+		int lfd = inetfix_listen(&port);
+		int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+		struct sockaddr_in a;
+
+		memset(&a, 0, sizeof(a));
+		a.sin_family = AF_INET;
+		a.sin_port = htons(port);
+		a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		if (lfd >= 0 && c >= 0) {
+			int rc1 = connect(c, (struct sockaddr *)&a, sizeof(a));
+			int e1 = errno;
+			int rc2 = connect(c, (struct sockaddr *)&a, sizeof(a));
+			int e2 = errno;
+			test_result("inet fix: second connect() is EALREADY, EISCONN or done",
+				    (rc1 == 0 && rc2 < 0 && e2 == EISCONN) ||
+					    (rc1 < 0 && e1 == EINPROGRESS &&
+					     (rc2 == 0 ||
+					      (rc2 < 0 && (e2 == EALREADY ||
+							   e2 == EISCONN)))));
+			struct pollfd p = { .fd = c, .events = POLLOUT };
+			poll(&p, 1, 5000);
+			struct sockaddr_in peer;
+			socklen_t plen = sizeof(peer);
+			test_result("inet fix: getpeername() after non-blocking connect",
+				    getpeername(c, (struct sockaddr *)&peer,
+						&plen) == 0 &&
+					    ntohs(peer.sin_port) == port);
+			int rc3 = connect(c, (struct sockaddr *)&a, sizeof(a));
+			int e3 = errno;
+			int rc4 = connect(c, (struct sockaddr *)&a, sizeof(a));
+			int e4 = errno;
+			test_result("inet fix: connect() once connected is EISCONN",
+				    (rc3 == 0 || (rc3 < 0 && e3 == EISCONN)) &&
+					    rc4 < 0 && e4 == EISCONN);
+			int s2 = inetfix_accept(lfd);
+			if (s2 >= 0)
+				close(s2);
+		}
+		if (c >= 0)
+			close(c);
+		if (lfd >= 0)
+			close(lfd);
+	}
+
+	/* 6. TCP options set before listen()/connect() take effect, and an
+	 *    accepted socket inherits its listener's. */
+	{
+		uint16_t port = 0;
+		int lfd = socket(AF_INET, SOCK_STREAM, 0);
+		int one = 1, zero = 0, idle = 30, intvl = 7;
+		struct sockaddr_in a;
+		socklen_t alen = sizeof(a);
+
+		memset(&a, 0, sizeof(a));
+		a.sin_family = AF_INET;
+		a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		if (lfd >= 0 &&
+		    setsockopt(lfd, SOL_SOCKET, SO_KEEPALIVE, &one,
+			       sizeof(one)) == 0 &&
+		    setsockopt(lfd, IPPROTO_TCP, TCP_KEEPIDLE, &idle,
+			       sizeof(idle)) == 0 &&
+		    setsockopt(lfd, IPPROTO_TCP, TCP_NODELAY, &zero,
+			       sizeof(zero)) == 0 &&
+		    bind(lfd, (struct sockaddr *)&a, sizeof(a)) == 0 &&
+		    listen(lfd, 4) == 0 &&
+		    getsockname(lfd, (struct sockaddr *)&a, &alen) == 0) {
+			port = ntohs(a.sin_port);
+			int c = socket(AF_INET, SOCK_STREAM, 0);
+			if (c >= 0) {
+				inetfix_timeouts(c, 5);
+				setsockopt(c, SOL_SOCKET, SO_KEEPALIVE, &one,
+					   sizeof(one));
+				setsockopt(c, IPPROTO_TCP, TCP_KEEPINTVL,
+					   &intvl, sizeof(intvl));
+				a.sin_port = htons(port);
+				int crc = connect(c, (struct sockaddr *)&a,
+						  sizeof(a));
+				int s = crc == 0 ? inetfix_accept(lfd) : -1;
+				int v = -1, k = -1, n = -1, cv = -1, ci = -1;
+				socklen_t l = sizeof(int);
+				if (s >= 0) {
+					getsockopt(s, SOL_SOCKET, SO_KEEPALIVE,
+						   &v, &l);
+					l = sizeof(int);
+					getsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE,
+						   &k, &l);
+					l = sizeof(int);
+					getsockopt(s, IPPROTO_TCP, TCP_NODELAY,
+						   &n, &l);
+				}
+				l = sizeof(int);
+				getsockopt(c, SOL_SOCKET, SO_KEEPALIVE, &cv, &l);
+				l = sizeof(int);
+				getsockopt(c, IPPROTO_TCP, TCP_KEEPINTVL, &ci,
+					   &l);
+				test_result("inet fix: accepted socket inherits SO_KEEPALIVE/TCP_KEEPIDLE/TCP_NODELAY",
+					    s >= 0 && v == 1 && k == 30 &&
+						    n == 0);
+				test_result("inet fix: options set before connect() apply",
+					    crc == 0 && cv == 1 && ci == 7);
+				test_result("inet fix: out-of-range TCP_KEEPIDLE is EINVAL",
+					    setsockopt(c, IPPROTO_TCP,
+						       TCP_KEEPIDLE, &zero,
+						       sizeof(zero)) < 0 &&
+						    errno == EINVAL);
+
+				/* 7. TCP_CORK can be set, read back and
+				 *    released, and data still flows. */
+				int ck = -1;
+				l = sizeof(int);
+				int cset = setsockopt(c, IPPROTO_TCP, TCP_CORK,
+						      &one, sizeof(one)) == 0 &&
+					   getsockopt(c, IPPROTO_TCP, TCP_CORK,
+						      &ck, &l) == 0 &&
+					   ck == 1;
+				int cclr = setsockopt(c, IPPROTO_TCP, TCP_CORK,
+						      &zero, sizeof(zero)) == 0;
+				char x = 0;
+				test_result("inet fix: TCP_CORK set, read back, released",
+					    cset && cclr && s >= 0 &&
+						    send(c, "k", 1, 0) == 1 &&
+						    recv(s, &x, 1, 0) == 1 &&
+						    x == 'k');
+				if (s >= 0)
+					close(s);
+				close(c);
+			}
+		} else {
+			test_fail("inet fix: option inheritance setup");
+		}
+		if (lfd >= 0)
+			close(lfd);
+	}
+
+	/* 8. SO_SNDTIMEO bounds a blocked send() (it was accepted and
+	 *    ignored). */
+	{
+		uint16_t port = 0;
+		int lfd = inetfix_listen(&port);
+		int c = lfd >= 0 ? inetfix_connect(port) : -1;
+		int s = c >= 0 ? inetfix_accept(lfd) : -1;
+		struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 }, rb;
+		socklen_t l = sizeof(rb);
+
+		if (s >= 0 &&
+		    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) ==
+			    0) {
+			test_result("inet fix: SO_SNDTIMEO reads back",
+				    getsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &rb,
+					       &l) == 0 &&
+					    rb.tv_sec == 0 &&
+					    rb.tv_usec >= 100000 &&
+					    rb.tv_usec <= 300000);
+			static unsigned char big[65536];
+			struct timeval t0, t1;
+			int eagain = 0;
+			gettimeofday(&t0, NULL);
+			for (;;) {
+				ssize_t n = send(c, big, sizeof(big), 0);
+				if (n < 0) {
+					eagain = errno == EAGAIN ||
+						 errno == EWOULDBLOCK;
+					break;
+				}
+				gettimeofday(&t1, NULL);
+				if (t1.tv_sec - t0.tv_sec > 15)
+					break;
+			}
+			test_result("inet fix: send() to a reader that never reads times out (EAGAIN)",
+				    eagain);
+		} else {
+			test_fail("inet fix: SO_SNDTIMEO setup");
+		}
+		if (s >= 0)
+			close(s);
+		if (c >= 0)
+			close(c);
+		if (lfd >= 0)
+			close(lfd);
+	}
+
+	/* 9. sendmsg()/recvmsg() move a whole message across several iovecs
+	 *    (both used to bounce through 2 KB and cut everything to it). */
+	{
+		uint16_t port = 0;
+		int lfd = inetfix_listen(&port);
+		int c = lfd >= 0 ? inetfix_connect(port) : -1;
+		int s = c >= 0 ? inetfix_accept(lfd) : -1;
+
+		if (s >= 0) {
+			static unsigned char out[10000], in[10000];
+			for (int i = 0; i < (int)sizeof(out); i++)
+				out[i] = (unsigned char)(i * 13 + 1);
+			struct iovec iov[3] = {
+				{ out, 3000 },
+				{ out + 3000, 4000 },
+				{ out + 7000, 3000 },
+			};
+			struct msghdr m;
+			memset(&m, 0, sizeof(m));
+			m.msg_iov = iov;
+			m.msg_iovlen = 3;
+			ssize_t sent = sendmsg(c, &m, 0);
+			test_result("inet fix: TCP sendmsg() sends all 10000 bytes",
+				    sent == 10000);
+			size_t got = 0;
+			while (got < sizeof(in)) {
+				struct iovec riov[2] = {
+					{ in + got, (sizeof(in) - got) / 2 },
+					{ in + got + (sizeof(in) - got) / 2,
+					  sizeof(in) - got -
+						  (sizeof(in) - got) / 2 },
+				};
+				struct msghdr rm;
+				memset(&rm, 0, sizeof(rm));
+				rm.msg_iov = riov;
+				rm.msg_iovlen = 2;
+				ssize_t r = recvmsg(s, &rm, 0);
+				if (r <= 0)
+					break;
+				got += (size_t)r;
+			}
+			test_result("inet fix: TCP recvmsg() delivers the same bytes",
+				    got == sizeof(in) &&
+					    memcmp(in, out, sizeof(in)) == 0);
+		} else {
+			test_fail("inet fix: sendmsg setup");
+		}
+		if (s >= 0)
+			close(s);
+		if (c >= 0)
+			close(c);
+		if (lfd >= 0)
+			close(lfd);
+	}
+
+	/* 11. A burst of local connects is not throttled: 40 non-blocking
+	 *     connects to a local listener all complete well inside the first
+	 *     SYN retransmission (1 s).  The per-source SYN limiter used to
+	 *     drop most of such a burst on loopback too.  The backlog holds
+	 *     the whole burst: SYNs that find the accept queue full are
+	 *     dropped and resent after 1 s, whatever the source. */
+	{
+		enum { NB = 40 };
+		uint16_t port = 0;
+		int lfd = inetfix_listen(&port);
+
+		if (lfd >= 0 && listen(lfd, 2 * NB) < 0) {
+			close(lfd);
+			lfd = -1;
+		}
+		int cs[NB], as[NB], na = 0, done = 0;
+		struct sockaddr_in a;
+		struct timeval t0, t1;
+
+		memset(&a, 0, sizeof(a));
+		a.sin_family = AF_INET;
+		a.sin_port = htons(port);
+		a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		for (int i = 0; i < NB; i++) {
+			cs[i] = -1;
+			as[i] = -1;
+		}
+		if (lfd >= 0) {
+			fcntl(lfd, F_SETFL, fcntl(lfd, F_GETFL) | O_NONBLOCK);
+			gettimeofday(&t0, NULL);
+			for (int i = 0; i < NB; i++) {
+				cs[i] = socket(AF_INET,
+					       SOCK_STREAM | SOCK_NONBLOCK, 0);
+				if (cs[i] >= 0)
+					connect(cs[i], (struct sockaddr *)&a,
+						sizeof(a));
+			}
+			for (;;) {
+				int fd;
+				while (na < NB &&
+				       (fd = accept(lfd, NULL, NULL)) >= 0)
+					as[na++] = fd;
+				done = 0;
+				for (int i = 0; i < NB; i++) {
+					struct pollfd p = { .fd = cs[i],
+							    .events = POLLOUT };
+					if (cs[i] >= 0 && poll(&p, 1, 0) == 1 &&
+					    !(p.revents & (POLLERR | POLLHUP)))
+						done++;
+				}
+				gettimeofday(&t1, NULL);
+				long ms = (t1.tv_sec - t0.tv_sec) * 1000 +
+					  (t1.tv_usec - t0.tv_usec) / 1000;
+				if ((done == NB && na == NB) || ms > 1000)
+					break;
+				usleep(2000);
+			}
+			test_result("inet fix: 40 local connects complete within 1 s",
+				    done == NB && na == NB);
+		} else {
+			test_fail("inet fix: connect burst setup");
+		}
+		for (int i = 0; i < NB; i++) {
+			if (cs[i] >= 0)
+				close(cs[i]);
+			if (as[i] >= 0)
+				close(as[i]);
+		}
+		if (lfd >= 0)
+			close(lfd);
+	}
+
+	/* 10. A UDP datagram is never silently shortened: MSG_TRUNC in
+	 *     msg_flags when the buffer is short, the real length with
+	 *     recv(MSG_TRUNC), FIONREAD = the next datagram. */
+	{
+		int rx = socket(AF_INET, SOCK_DGRAM, 0);
+		int tx = socket(AF_INET, SOCK_DGRAM, 0);
+		struct sockaddr_in a;
+		socklen_t alen = sizeof(a);
+
+		memset(&a, 0, sizeof(a));
+		a.sin_family = AF_INET;
+		a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		if (rx >= 0 && tx >= 0 &&
+		    bind(rx, (struct sockaddr *)&a, sizeof(a)) == 0 &&
+		    getsockname(rx, (struct sockaddr *)&a, &alen) == 0) {
+			struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+			setsockopt(rx, SOL_SOCKET, SO_RCVTIMEO, &tv,
+				   sizeof(tv));
+			static unsigned char d[6000], r[8192];
+			for (int i = 0; i < (int)sizeof(d); i++)
+				d[i] = (unsigned char)(i ^ 0x55);
+			struct iovec siov[2] = { { d, 1000 },
+						 { d + 1000, 2000 } };
+			struct msghdr sm;
+			memset(&sm, 0, sizeof(sm));
+			sm.msg_name = &a;
+			sm.msg_namelen = sizeof(a);
+			sm.msg_iov = siov;
+			sm.msg_iovlen = 2;
+			test_result("inet fix: UDP sendmsg() sends one 3000-byte datagram",
+				    sendmsg(tx, &sm, 0) == 3000);
+			struct iovec riov = { r, 1000 };
+			struct msghdr rm;
+			memset(&rm, 0, sizeof(rm));
+			rm.msg_iov = &riov;
+			rm.msg_iovlen = 1;
+			ssize_t n = recvmsg(rx, &rm, 0);
+			test_result("inet fix: short recvmsg() buffer sets MSG_TRUNC",
+				    n == 1000 && (rm.msg_flags & MSG_TRUNC) &&
+					    memcmp(r, d, 1000) == 0);
+			sendmsg(tx, &sm, 0);
+			usleep(20000);
+			int avail = -1;
+			test_result("inet fix: FIONREAD on UDP is the next datagram's size",
+				    ioctl(rx, FIONREAD, &avail) == 0 &&
+					    avail == 3000);
+			test_result("inet fix: recv(MSG_TRUNC) returns the real length",
+				    recv(rx, r, 100, MSG_TRUNC) == 3000);
+			sendto(tx, d, sizeof(d), 0, (struct sockaddr *)&a,
+			       sizeof(a));
+			riov.iov_len = sizeof(r);
+			memset(&rm, 0, sizeof(rm));
+			rm.msg_iov = &riov;
+			rm.msg_iovlen = 1;
+			n = recvmsg(rx, &rm, 0);
+			test_result("inet fix: a 6000-byte datagram arrives whole or flagged truncated",
+				    (n == 6000 && !(rm.msg_flags & MSG_TRUNC) &&
+				     memcmp(r, d, 6000) == 0) ||
+					    (n > 0 && n < 6000 &&
+					     (rm.msg_flags & MSG_TRUNC)));
+		} else {
+			test_fail("inet fix: UDP setup");
+		}
+		if (rx >= 0)
+			close(rx);
+		if (tx >= 0)
+			close(tx);
+	}
+}
+
+// ========================================
+// IPv4 / UDP: error queue, ancillary data, cork, socket options
+// ========================================
+/* A UDP socket bound to 127.0.0.1 and an ephemeral port (*port). */
+static int ipudp_bound(uint16_t *port)
+{
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in a;
+	socklen_t l = sizeof(a);
+
+	if (s < 0)
+		return -1;
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (bind(s, (struct sockaddr *)&a, sizeof(a)) < 0 ||
+	    getsockname(s, (struct sockaddr *)&a, &l) < 0) {
+		close(s);
+		return -1;
+	}
+	*port = ntohs(a.sin_port);
+	inetfix_timeouts(s, 3);
+	return s;
+}
+
+static struct sockaddr_in ipudp_lo(uint16_t port)
+{
+	struct sockaddr_in a;
+
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_port = htons(port);
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	return a;
+}
+
+static void test_inet_ip_udp(void)
+{
+	printf("\n--- IPv4 / UDP: error queue, cmsgs, cork, options ---\n");
+
+	/* 1. IP_RECVERR: a datagram to a closed port comes back as an
+	 *    extended error on the error queue (ICMP port unreachable from
+	 *    127.0.0.1), with the original destination as msg_name. */
+	{
+		uint16_t port = 0, dead = 0;
+		int s = ipudp_bound(&port);
+		int d = ipudp_bound(&dead);
+		int on = 1;
+
+		if (d >= 0)
+			close(d); // a port nobody listens on now
+		if (s >= 0 && dead &&
+		    setsockopt(s, IPPROTO_IP, IP_RECVERR, &on, sizeof(on)) == 0) {
+			struct sockaddr_in to = ipudp_lo(dead), from;
+			unsigned char buf[64], ctl[256];
+			struct iovec iov = { buf, sizeof(buf) };
+			struct msghdr m;
+			struct pollfd p = { .fd = s, .events = POLLIN };
+
+			sendto(s, "ping", 4, 0, (struct sockaddr *)&to,
+			       sizeof(to));
+			poll(&p, 1, 2000);
+			test_result("udp: error queue raises POLLERR",
+				    (p.revents & POLLERR) != 0);
+			memset(&m, 0, sizeof(m));
+			m.msg_name = &from;
+			m.msg_namelen = sizeof(from);
+			m.msg_iov = &iov;
+			m.msg_iovlen = 1;
+			m.msg_control = ctl;
+			m.msg_controllen = sizeof(ctl);
+			ssize_t n = recvmsg(s, &m, MSG_ERRQUEUE);
+			struct sock_extended_err ee;
+			int found = 0;
+
+			memset(&ee, 0, sizeof(ee));
+			for (struct cmsghdr *c = n >= 0 ? CMSG_FIRSTHDR(&m) : NULL;
+			     c; c = CMSG_NXTHDR(&m, c))
+				if (c->cmsg_level == IPPROTO_IP &&
+				    c->cmsg_type == IP_RECVERR) {
+					memcpy(&ee, CMSG_DATA(c), sizeof(ee));
+					found = 1;
+				}
+			test_result("udp: MSG_ERRQUEUE returns the error",
+				    n >= 0 && found && (m.msg_flags & MSG_ERRQUEUE));
+			test_result("udp: extended error is ICMP port unreachable",
+				    found && ee.ee_errno == ECONNREFUSED &&
+					    ee.ee_origin == SO_EE_ORIGIN_ICMP &&
+					    ee.ee_type == 3 && ee.ee_code == 3);
+			test_result("udp: msg_name is the original destination",
+				    n >= 0 && ntohs(from.sin_port) == dead);
+			test_result("udp: empty error queue is EAGAIN",
+				    recvmsg(s, &m, MSG_ERRQUEUE) < 0 &&
+					    errno == EAGAIN);
+		} else {
+			test_fail("udp: IP_RECVERR setup");
+		}
+		if (s >= 0)
+			close(s);
+	}
+
+	/* 2. A connected socket hears about the refusal: ECONNREFUSED on
+	 *    its next receive. */
+	{
+		uint16_t port = 0, dead = 0;
+		int s = ipudp_bound(&port), d = ipudp_bound(&dead);
+
+		if (d >= 0)
+			close(d);
+		struct sockaddr_in to = ipudp_lo(dead);
+		if (s >= 0 &&
+		    connect(s, (struct sockaddr *)&to, sizeof(to)) == 0) {
+			char b[8];
+
+			send(s, "x", 1, 0);
+			ssize_t r = recv(s, b, sizeof(b), 0);
+			test_result("udp: connected socket gets ECONNREFUSED",
+				    r < 0 && errno == ECONNREFUSED);
+		} else {
+			test_fail("udp: connected setup");
+		}
+		if (s >= 0)
+			close(s);
+	}
+
+	/* 3. IP_PKTINFO, IP_RECVTTL, IP_RECVTOS as control messages. */
+	{
+		uint16_t port = 0, tport = 0;
+		int r = ipudp_bound(&port), t = ipudp_bound(&tport);
+		int on = 1, ttl = 33, tos = 0x10;
+
+		if (r >= 0 && t >= 0) {
+			setsockopt(r, IPPROTO_IP, IP_PKTINFO, &on, sizeof(on));
+			setsockopt(r, IPPROTO_IP, IP_RECVTTL, &on, sizeof(on));
+			setsockopt(r, IPPROTO_IP, IP_RECVTOS, &on, sizeof(on));
+			setsockopt(t, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
+			setsockopt(t, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+			struct sockaddr_in to = ipudp_lo(port);
+			sendto(t, "cmsg", 4, 0, (struct sockaddr *)&to,
+			       sizeof(to));
+			unsigned char buf[16], ctl[256];
+			struct iovec iov = { buf, sizeof(buf) };
+			struct msghdr m;
+			memset(&m, 0, sizeof(m));
+			m.msg_iov = &iov;
+			m.msg_iovlen = 1;
+			m.msg_control = ctl;
+			m.msg_controllen = sizeof(ctl);
+			ssize_t n = recvmsg(r, &m, 0);
+			int gttl = -1, gtos = -1, gpi = 0;
+			struct in_pktinfo pi;
+			for (struct cmsghdr *c = n >= 0 ? CMSG_FIRSTHDR(&m) : NULL;
+			     c; c = CMSG_NXTHDR(&m, c)) {
+				if (c->cmsg_level != IPPROTO_IP)
+					continue;
+				if (c->cmsg_type == IP_RECVTTL)
+					memcpy(&gttl, CMSG_DATA(c), sizeof(int));
+				if (c->cmsg_type == IP_RECVTOS)
+					memcpy(&gtos, CMSG_DATA(c), sizeof(int));
+				if (c->cmsg_type == IP_PKTINFO) {
+					memcpy(&pi, CMSG_DATA(c), sizeof(pi));
+					gpi = 1;
+				}
+			}
+			test_result("udp: IP_RECVTTL cmsg carries the TTL",
+				    n == 4 && gttl == 33);
+			test_result("udp: IP_RECVTOS cmsg carries the TOS",
+				    n == 4 && (gtos & 0xFC) == 0x10);
+			test_result("udp: IP_PKTINFO cmsg names 127.0.0.1",
+				    n == 4 && gpi &&
+					    ntohl(pi.ipi_addr.s_addr) ==
+						    INADDR_LOOPBACK);
+		} else {
+			test_fail("udp: cmsg setup");
+		}
+		if (r >= 0)
+			close(r);
+		if (t >= 0)
+			close(t);
+	}
+
+	/* 4. UDP_CORK and MSG_MORE: several sends, one datagram. */
+	{
+		uint16_t port = 0, tport = 0;
+		int r = ipudp_bound(&port), t = ipudp_bound(&tport);
+		int on = 1, off = 0;
+
+		if (r >= 0 && t >= 0) {
+			struct sockaddr_in to = ipudp_lo(port);
+			char buf[64];
+
+			setsockopt(t, IPPROTO_UDP, UDP_CORK, &on, sizeof(on));
+			sendto(t, "abc", 3, 0, (struct sockaddr *)&to, sizeof(to));
+			sendto(t, "def", 3, 0, (struct sockaddr *)&to, sizeof(to));
+			setsockopt(t, IPPROTO_UDP, UDP_CORK, &off, sizeof(off));
+			ssize_t n = recv(r, buf, sizeof(buf), 0);
+			test_result("udp: UDP_CORK joins two sends",
+				    n == 6 && memcmp(buf, "abcdef", 6) == 0);
+			sendto(t, "12", 2, MSG_MORE, (struct sockaddr *)&to,
+			       sizeof(to));
+			sendto(t, "345", 3, 0, (struct sockaddr *)&to,
+			       sizeof(to));
+			n = recv(r, buf, sizeof(buf), 0);
+			test_result("udp: MSG_MORE joins two sends",
+				    n == 5 && memcmp(buf, "12345", 5) == 0);
+		} else {
+			test_fail("udp: cork setup");
+		}
+		if (r >= 0)
+			close(r);
+		if (t >= 0)
+			close(t);
+	}
+
+	/* 5. Socket options: IP_MTU_DISCOVER, SO_RCVBUF, SO_REUSEPORT. */
+	{
+		int s = socket(AF_INET, SOCK_DGRAM, 0);
+		int v = -1, w = IP_PMTUDISC_DO;
+		socklen_t l = sizeof(v);
+
+		test_result("udp: IP_MTU_DISCOVER defaults to WANT",
+			    s >= 0 &&
+				    getsockopt(s, IPPROTO_IP, IP_MTU_DISCOVER,
+					       &v, &l) == 0 &&
+				    v == IP_PMTUDISC_WANT);
+		setsockopt(s, IPPROTO_IP, IP_MTU_DISCOVER, &w, sizeof(w));
+		l = sizeof(v);
+		getsockopt(s, IPPROTO_IP, IP_MTU_DISCOVER, &v, &l);
+		test_result("udp: IP_MTU_DISCOVER set to DO", v == IP_PMTUDISC_DO);
+		w = 9;
+		test_result("udp: IP_MTU_DISCOVER rejects an unknown mode",
+			    setsockopt(s, IPPROTO_IP, IP_MTU_DISCOVER, &w,
+				       sizeof(w)) < 0 &&
+				    errno == EINVAL);
+		w = 4096;
+		setsockopt(s, SOL_SOCKET, SO_RCVBUF, &w, sizeof(w));
+		l = sizeof(v);
+		getsockopt(s, SOL_SOCKET, SO_RCVBUF, &v, &l);
+		test_result("udp: SO_RCVBUF reads back doubled", v == 8192);
+		if (s >= 0)
+			close(s);
+
+		uint16_t port = 0;
+		int a = socket(AF_INET, SOCK_DGRAM, 0);
+		int b = socket(AF_INET, SOCK_DGRAM, 0);
+		int one = 1;
+		if (a >= 0 && b >= 0) {
+			setsockopt(a, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+			setsockopt(b, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+			struct sockaddr_in la = ipudp_lo(0);
+			socklen_t ll = sizeof(la);
+			int ok = bind(a, (struct sockaddr *)&la, sizeof(la)) == 0 &&
+				 getsockname(a, (struct sockaddr *)&la, &ll) == 0;
+			port = ntohs(la.sin_port);
+			test_result("udp: two SO_REUSEPORT sockets share a port",
+				    ok && bind(b, (struct sockaddr *)&la,
+					       sizeof(la)) == 0);
+			int c = socket(AF_INET, SOCK_DGRAM, 0);
+			test_result("udp: a third without the option is refused",
+				    c >= 0 &&
+					    bind(c, (struct sockaddr *)&la,
+						 sizeof(la)) < 0 &&
+					    errno == EADDRINUSE);
+			if (c >= 0)
+				close(c);
+		}
+		(void)port;
+		if (a >= 0)
+			close(a);
+		if (b >= 0)
+			close(b);
+	}
+
+	/* 6. The largest datagram arrives whole over loopback; one byte
+	 *    more is EMSGSIZE. */
+	{
+		uint16_t port = 0, tport = 0;
+		int r = ipudp_bound(&port), t = ipudp_bound(&tport);
+		unsigned char *big = malloc(65508), *rb = malloc(65536);
+
+		if (r >= 0 && t >= 0 && big && rb) {
+			struct sockaddr_in to = ipudp_lo(port);
+			int bufsz = 1 << 20;
+
+			setsockopt(r, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
+			for (int i = 0; i < 65508; i++)
+				big[i] = (unsigned char)(i * 13);
+			test_result("udp: 65508 bytes is EMSGSIZE",
+				    sendto(t, big, 65508, 0,
+					   (struct sockaddr *)&to,
+					   sizeof(to)) < 0 &&
+					    errno == EMSGSIZE);
+			ssize_t s1 = sendto(t, big, 65507, 0,
+					    (struct sockaddr *)&to, sizeof(to));
+			ssize_t n = recv(r, rb, 65536, 0);
+			test_result("udp: a 65507-byte datagram arrives whole",
+				    s1 == 65507 && n == 65507 &&
+					    memcmp(big, rb, 65507) == 0);
+		} else {
+			test_fail("udp: 64 KB setup");
+		}
+		free(big);
+		free(rb);
+		if (r >= 0)
+			close(r);
+		if (t >= 0)
+			close(t);
+	}
+}
+
+// ========================================
+// Socket layer and poll/epoll (network overhaul, socket layer)
+// ========================================
+static volatile sig_atomic_t g_sockapi_sigpipes;
+
+static void sockapi_on_sigpipe(int sig)
+{
+	(void)sig;
+	g_sockapi_sigpipes++;
+}
+
+/* A connected loopback TCP pair: *c the client, *s the accepted end. */
+static int sockapi_pair(int *c, int *s)
+{
+	uint16_t port = 0;
+	int lfd = inetfix_listen(&port);
+
+	*c = *s = -1;
+	if (lfd < 0)
+		return -1;
+	*c = inetfix_connect(port);
+	if (*c >= 0)
+		*s = inetfix_accept(lfd);
+	close(lfd);
+	if (*c < 0 || *s < 0) {
+		if (*c >= 0)
+			close(*c);
+		if (*s >= 0)
+			close(*s);
+		return -1;
+	}
+	return 0;
+}
+
+static long sockapi_ms_since(const struct timespec *t0)
+{
+	struct timespec t1;
+
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	return (t1.tv_sec - t0->tv_sec) * 1000 +
+	       (t1.tv_nsec - t0->tv_nsec) / 1000000;
+}
+
+/* 500 connections on loopback, one thread, one epoll set: every client
+ * connects without blocking, writes a byte when connected, the server
+ * accepts from the set and echoes it, the client reads it back. */
+#define SOCKAPI_NCONN 500
+static void sockapi_many_connections(void)
+{
+	static int cl[SOCKAPI_NCONN], cl_state[SOCKAPI_NCONN];
+	static char sv_open[4096]; /* accepted descriptors still open */
+	uint16_t port = 0;
+	int lfd = inetfix_listen(&port);
+	int ep = epoll_create1(EPOLL_CLOEXEC);
+	int made = 0, done = 0, accepted = 0, failed = 0;
+	struct epoll_event ev, evs[128];
+	struct sockaddr_in a;
+	struct timespec t0;
+
+	memset(sv_open, 0, sizeof(sv_open));
+	if (lfd < 0 || ep < 0) {
+		test_fail("500 connections: setup");
+		goto out;
+	}
+	listen(lfd, 512);
+	fcntl(lfd, F_SETFL, fcntl(lfd, F_GETFL) | O_NONBLOCK);
+	ev.events = EPOLLIN;
+	ev.data.u64 = 0xffffffffULL; /* the listener */
+	epoll_ctl(ep, EPOLL_CTL_ADD, lfd, &ev);
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_port = htons(port);
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	for (int i = 0; i < SOCKAPI_NCONN; i++) {
+		cl[i] = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+		cl_state[i] = 0;
+		if (cl[i] < 0)
+			break;
+		if (connect(cl[i], (struct sockaddr *)&a, sizeof(a)) < 0 &&
+		    errno != EINPROGRESS) {
+			close(cl[i]);
+			cl[i] = -1;
+			break;
+		}
+		ev.events = EPOLLOUT | EPOLLET;
+		ev.data.u64 = (uint64_t)i;
+		epoll_ctl(ep, EPOLL_CTL_ADD, cl[i], &ev);
+		made++;
+	}
+	test_result("500 connections: all sockets created and connecting",
+		    made == SOCKAPI_NCONN);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (done + failed < made && sockapi_ms_since(&t0) < 60000) {
+		int n = epoll_wait(ep, evs, 128, 1000);
+
+		for (int k = 0; k < n; k++) {
+			uint64_t tag = evs[k].data.u64;
+
+			if (tag == 0xffffffffULL) {
+				int fd;
+
+				while ((fd = accept4(lfd, NULL, NULL,
+						     SOCK_NONBLOCK)) >= 0) {
+					ev.events = EPOLLIN | EPOLLRDHUP;
+					ev.data.u64 = 0x100000000ULL |
+						      (uint64_t)fd;
+					epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev);
+					if (fd < (int)sizeof(sv_open))
+						sv_open[fd] = 1;
+					accepted++;
+				}
+			} else if (tag & 0x100000000ULL) {
+				int fd = (int)(tag & 0xffffffffu);
+				char b[8];
+				ssize_t r = read(fd, b, sizeof(b));
+
+				if (r > 0)
+					send(fd, b, (size_t)r, MSG_NOSIGNAL);
+				if (r == 0 || (evs[k].events &
+					       (EPOLLRDHUP | EPOLLHUP |
+						EPOLLERR))) {
+					epoll_ctl(ep, EPOLL_CTL_DEL, fd, NULL);
+					close(fd);
+					if (fd < (int)sizeof(sv_open))
+						sv_open[fd] = 0;
+				}
+			} else if (tag < SOCKAPI_NCONN) {
+				int i = (int)tag;
+
+				if (evs[k].events & (EPOLLERR | EPOLLHUP)) {
+					epoll_ctl(ep, EPOLL_CTL_DEL, cl[i],
+						  NULL);
+					close(cl[i]);
+					cl[i] = -1;
+					failed++;
+				} else if (cl_state[i] == 0 &&
+					   (evs[k].events & EPOLLOUT)) {
+					send(cl[i], "x", 1, MSG_NOSIGNAL);
+					cl_state[i] = 1;
+					ev.events = EPOLLIN;
+					ev.data.u64 = (uint64_t)i;
+					epoll_ctl(ep, EPOLL_CTL_MOD, cl[i],
+						  &ev);
+				} else if (cl_state[i] == 1 &&
+					   (evs[k].events & EPOLLIN)) {
+					char b;
+
+					if (read(cl[i], &b, 1) == 1 &&
+					    b == 'x') {
+						done++;
+						cl_state[i] = 2;
+						epoll_ctl(ep, EPOLL_CTL_DEL,
+							  cl[i], NULL);
+						close(cl[i]);
+						cl[i] = -1;
+					}
+				}
+			}
+		}
+	}
+	printf("  (500 connections: %d echoed, %d failed, %d accepted, %ld ms)\n",
+	       done, failed, accepted, sockapi_ms_since(&t0));
+	test_result("500 connections: every client got its echo through epoll",
+		    done == SOCKAPI_NCONN && failed == 0);
+	for (int i = 0; i < made; i++)
+		if (cl[i] >= 0)
+			close(cl[i]);
+	for (int fd = 0; fd < (int)sizeof(sv_open); fd++)
+		if (sv_open[fd])
+			close(fd);
+out:
+	if (ep >= 0)
+		close(ep);
+	if (lfd >= 0)
+		close(lfd);
+}
+
+static void test_inet_socket_layer(void)
+{
+	printf("\n--- Socket layer: poll/epoll readiness, mmsg, SIGPIPE, ioctls ---\n");
+
+	/* 1. epoll + TCP: edge-triggered input, then the peer's FIN as
+	 *    EPOLLRDHUP. */
+	{
+		int c, s;
+
+		if (sockapi_pair(&c, &s) == 0) {
+			int ep = epoll_create1(0);
+			struct epoll_event ev = { .events = EPOLLIN | EPOLLET |
+							    EPOLLRDHUP },
+					   out[4];
+			char buf[64];
+
+			ev.data.u64 = 42;
+			test_result("epoll+tcp: ADD with EPOLLET|EPOLLRDHUP",
+				    epoll_ctl(ep, EPOLL_CTL_ADD, s, &ev) == 0);
+			test_result("epoll+tcp: nothing ready yet",
+				    epoll_wait(ep, out, 4, 0) == 0);
+			send(c, "abc", 3, 0);
+			int n = epoll_wait(ep, out, 4, 2000);
+			test_result("epoll+tcp: data arrives as EPOLLIN",
+				    n == 1 && out[0].data.u64 == 42 &&
+					    (out[0].events & EPOLLIN) &&
+					    !(out[0].events & EPOLLRDHUP));
+			test_result("epoll+tcp: edge-triggered, not again",
+				    epoll_wait(ep, out, 4, 0) == 0);
+			send(c, "def", 3, 0);
+			n = epoll_wait(ep, out, 4, 2000);
+			test_result("epoll+tcp: new data, a new edge",
+				    n == 1 && (out[0].events & EPOLLIN));
+			test_result("epoll+tcp: both writes readable",
+				    recv(s, buf, sizeof(buf), 0) == 6);
+			shutdown(c, SHUT_WR);
+			n = epoll_wait(ep, out, 4, 2000);
+			test_result("epoll+tcp: the peer's FIN is EPOLLIN|EPOLLRDHUP",
+				    n == 1 &&
+					    (out[0].events &
+					     (EPOLLIN | EPOLLRDHUP)) ==
+						    (EPOLLIN | EPOLLRDHUP) &&
+					    !(out[0].events & EPOLLHUP));
+			test_result("epoll+tcp: and reads as end of file",
+				    recv(s, buf, sizeof(buf), 0) == 0);
+			/* level-triggered and closed: removed by close() */
+			ev.events = EPOLLIN;
+			epoll_ctl(ep, EPOLL_CTL_MOD, s, &ev);
+			test_result("epoll+tcp: level-triggered EOF stays ready",
+				    epoll_wait(ep, out, 4, 0) == 1 &&
+					    epoll_wait(ep, out, 4, 0) == 1);
+			close(s);
+			test_result("epoll+tcp: closing the socket removes it",
+				    epoll_wait(ep, out, 4, 0) == 0);
+			close(c);
+			close(ep);
+		} else {
+			test_fail("epoll+tcp: loopback pair");
+		}
+	}
+
+	/* 2. A non-blocking connect completes as EPOLLOUT; a refused one is
+	 *    EPOLLERR|EPOLLHUP with SO_ERROR = ECONNREFUSED. */
+	{
+		uint16_t port = 0;
+		int lfd = inetfix_listen(&port);
+		int ep = epoll_create1(0);
+		int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+		struct sockaddr_in a;
+		struct epoll_event ev = { .events = EPOLLOUT }, out[2];
+		int err = -1;
+		socklen_t el = sizeof(err);
+
+		memset(&a, 0, sizeof(a));
+		a.sin_family = AF_INET;
+		a.sin_port = htons(port);
+		a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		int r = connect(c, (struct sockaddr *)&a, sizeof(a));
+		test_result("nonblocking connect: 0 or EINPROGRESS",
+			    r == 0 || errno == EINPROGRESS);
+		epoll_ctl(ep, EPOLL_CTL_ADD, c, &ev);
+		int n = epoll_wait(ep, out, 2, 3000);
+		test_result("nonblocking connect: EPOLLOUT, no error",
+			    n == 1 && (out[0].events & EPOLLOUT) &&
+				    !(out[0].events & (EPOLLERR | EPOLLHUP)));
+		test_result("nonblocking connect: SO_ERROR 0",
+			    getsockopt(c, SOL_SOCKET, SO_ERROR, &err, &el) ==
+					    0 &&
+				    err == 0);
+		close(c);
+		/* refused: the listener is gone */
+		close(lfd);
+		c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+		r = connect(c, (struct sockaddr *)&a, sizeof(a));
+		/* The refusal may already be known when connect() returns
+		 * (ECONNREFUSED) or come later (EINPROGRESS, then SO_ERROR). */
+		int cerr = r < 0 ? errno : 0;
+		ev.events = EPOLLOUT;
+		epoll_ctl(ep, EPOLL_CTL_ADD, c, &ev);
+		n = epoll_wait(ep, out, 2, 3000);
+		test_result("refused connect: EPOLLERR|EPOLLHUP",
+			    (r < 0 && cerr == ECONNREFUSED) ||
+				    (n == 1 && (out[0].events & EPOLLERR) &&
+				     (out[0].events & EPOLLHUP)));
+		err = -1;
+		el = sizeof(err);
+		test_result("refused connect: SO_ERROR ECONNREFUSED",
+			    cerr == ECONNREFUSED ||
+				    (getsockopt(c, SOL_SOCKET, SO_ERROR, &err,
+						&el) == 0 &&
+				     err == ECONNREFUSED));
+		close(c);
+		close(ep);
+	}
+
+	/* 2b. listen() again only changes the backlog: one listener, and
+	 *     after close() the port refuses connections. */
+	{
+		uint16_t port = 0;
+		int lfd = inetfix_listen(&port);
+		int c = socket(AF_INET, SOCK_STREAM, 0), as = -1;
+		struct sockaddr_in a;
+
+		memset(&a, 0, sizeof(a));
+		a.sin_family = AF_INET;
+		a.sin_port = htons(port);
+		a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		test_result("listen() on a listening socket succeeds",
+			    lfd >= 0 && listen(lfd, 32) == 0);
+		if (lfd >= 0 && c >= 0) {
+			inetfix_timeouts(c, 3);
+			int ok = connect(c, (struct sockaddr *)&a,
+					 sizeof(a)) == 0;
+			if (ok) {
+				fcntl(lfd, F_SETFL,
+				      fcntl(lfd, F_GETFL) | O_NONBLOCK);
+				for (int i = 0; i < 300 && as < 0; i++) {
+					as = accept(lfd, NULL, NULL);
+					if (as < 0)
+						usleep(10000);
+				}
+			}
+			test_result("...connections reach the socket's accept()",
+				    ok && as >= 0);
+		}
+		if (as >= 0)
+			close(as);
+		if (c >= 0)
+			close(c);
+		if (lfd >= 0)
+			close(lfd);
+		c = socket(AF_INET, SOCK_STREAM, 0);
+		if (c >= 0) {
+			inetfix_timeouts(c, 3);
+			errno = 0;
+			test_result("...and after close() the port refuses",
+				    connect(c, (struct sockaddr *)&a,
+					    sizeof(a)) < 0 &&
+					    errno == ECONNREFUSED);
+			close(c);
+		}
+	}
+
+	/* 3. Half-close readiness, and an unconnected socket. */
+	{
+		int c, s;
+
+		if (sockapi_pair(&c, &s) == 0) {
+			struct pollfd p = { .fd = s,
+					    .events = POLLIN | POLLOUT |
+						      POLLRDHUP };
+
+			shutdown(c, SHUT_WR);
+			poll(&p, 1, 2000);
+			for (int i = 0; i < 50 && !(p.revents & POLLRDHUP);
+			     i++) {
+				usleep(10000);
+				poll(&p, 1, 0);
+			}
+			test_result("half-close: POLLIN|POLLRDHUP, still writable",
+				    (p.revents &
+				     (POLLIN | POLLRDHUP | POLLOUT)) ==
+					    (POLLIN | POLLRDHUP | POLLOUT));
+			test_result("half-close: no POLLHUP yet",
+				    !(p.revents & (POLLHUP | POLLERR)));
+			test_result("half-close: the other way still works",
+				    send(s, "x", 1, 0) == 1);
+			shutdown(s, SHUT_WR);
+			p.revents = 0;
+			for (int i = 0; i < 100 && !(p.revents & POLLHUP);
+			     i++) {
+				poll(&p, 1, 10);
+			}
+			test_result("half-close: both sides done is POLLHUP",
+				    (p.revents & POLLHUP) != 0);
+			close(c);
+			close(s);
+		} else {
+			test_fail("half-close: loopback pair");
+		}
+		int u = socket(AF_INET, SOCK_STREAM, 0);
+		struct pollfd p = { .fd = u, .events = POLLIN | POLLOUT };
+		test_result("unconnected TCP socket polls POLLOUT|POLLHUP",
+			    poll(&p, 1, 0) == 1 &&
+				    p.revents == (POLLOUT | POLLHUP));
+		errno = 0;
+		test_result("shutdown() on an unconnected TCP socket: ENOTCONN",
+			    shutdown(u, SHUT_RDWR) == -1 && errno == ENOTCONN);
+		close(u);
+		u = socket(AF_INET, SOCK_DGRAM, 0);
+		errno = 0;
+		test_result("shutdown() on an unconnected UDP socket: ENOTCONN",
+			    shutdown(u, SHUT_RD) == -1 && errno == ENOTCONN);
+		close(u);
+		/* SHUT_WR on a listener changes nothing: it still accepts */
+		uint16_t port = 0;
+		int lfd = inetfix_listen(&port);
+		test_result("shutdown(SHUT_WR) on a listener succeeds",
+			    lfd >= 0 && shutdown(lfd, SHUT_WR) == 0);
+		int c2 = lfd >= 0 ? inetfix_connect(port) : -1;
+		int s2 = c2 >= 0 ? inetfix_accept(lfd) : -1;
+		test_result("...and the listener still accepts", s2 >= 0);
+		if (c2 >= 0)
+			close(c2);
+		if (s2 >= 0)
+			close(s2);
+		if (lfd >= 0)
+			close(lfd);
+	}
+
+	/* 4. sendmmsg / recvmmsg on UDP, MSG_WAITFORONE, the timeout. */
+	{
+		uint16_t pa = 0, pb = 0;
+		int sa = ipudp_bound(&pa), sb = ipudp_bound(&pb);
+		struct sockaddr_in to = ipudp_lo(pb);
+		char m[3][16] = { "one", "two two", "three!" };
+		struct iovec iov[3], riov[4];
+		struct mmsghdr v[3], rv[4];
+		char rb[4][32];
+
+		for (int i = 0; i < 3; i++) {
+			iov[i].iov_base = m[i];
+			iov[i].iov_len = strlen(m[i]);
+			memset(&v[i], 0, sizeof(v[i]));
+			v[i].msg_hdr.msg_name = &to;
+			v[i].msg_hdr.msg_namelen = sizeof(to);
+			v[i].msg_hdr.msg_iov = &iov[i];
+			v[i].msg_hdr.msg_iovlen = 1;
+		}
+		int n = sendmmsg(sa, v, 3, 0);
+		test_result("sendmmsg: three datagrams", n == 3);
+		test_result("sendmmsg: msg_len of each",
+			    v[0].msg_len == 3 && v[1].msg_len == 7 &&
+				    v[2].msg_len == 6);
+		for (int i = 0; i < 4; i++) {
+			riov[i].iov_base = rb[i];
+			riov[i].iov_len = sizeof(rb[i]);
+			memset(&rv[i], 0, sizeof(rv[i]));
+			rv[i].msg_hdr.msg_iov = &riov[i];
+			rv[i].msg_hdr.msg_iovlen = 1;
+		}
+		struct timespec tmo = { .tv_sec = 2, .tv_nsec = 0 };
+		n = recvmmsg(sb, rv, 4, MSG_WAITFORONE, &tmo);
+		test_result("recvmmsg(MSG_WAITFORONE): the three, then stops",
+			    n == 3);
+		test_result("recvmmsg: lengths and data",
+			    n == 3 && rv[0].msg_len == 3 &&
+				    rv[1].msg_len == 7 && rv[2].msg_len == 6 &&
+				    memcmp(rb[1], "two two", 7) == 0);
+		errno = 0;
+		test_result("recvmmsg on an empty socket with MSG_DONTWAIT: EAGAIN",
+			    recvmmsg(sb, rv, 4, MSG_DONTWAIT, NULL) == -1 &&
+				    errno == EAGAIN);
+		test_result("sendmmsg with vlen 0 sends nothing",
+			    sendmmsg(sa, v, 0, 0) == 0);
+		/* SO_TIMESTAMP: the receive time as ancillary data */
+		int on = 1;
+		setsockopt(sb, SOL_SOCKET, SO_TIMESTAMP, &on, sizeof(on));
+		sendto(sa, "t", 1, 0, (struct sockaddr *)&to, sizeof(to));
+		char cbuf[64], d[4];
+		struct iovec di = { d, sizeof(d) };
+		struct msghdr mh;
+		memset(&mh, 0, sizeof(mh));
+		mh.msg_iov = &di;
+		mh.msg_iovlen = 1;
+		mh.msg_control = cbuf;
+		mh.msg_controllen = sizeof(cbuf);
+		int got_ts = 0;
+		if (recvmsg(sb, &mh, 0) == 1) {
+			for (struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm;
+			     cm = CMSG_NXTHDR(&mh, cm)) {
+				if (cm->cmsg_level == SOL_SOCKET &&
+				    cm->cmsg_type == SCM_TIMESTAMP) {
+					struct timeval tv, now;
+
+					memcpy(&tv, CMSG_DATA(cm), sizeof(tv));
+					gettimeofday(&now, NULL);
+					got_ts = tv.tv_sec > 1600000000 &&
+						 tv.tv_sec <= now.tv_sec + 1;
+				}
+			}
+		}
+		test_result("SO_TIMESTAMP: a plausible receive time", got_ts);
+		int v1 = 0;
+		socklen_t vl = sizeof(v1);
+		test_result("SO_PROTOCOL of a UDP socket is IPPROTO_UDP",
+			    getsockopt(sb, SOL_SOCKET, SO_PROTOCOL, &v1, &vl) ==
+					    0 &&
+				    v1 == IPPROTO_UDP);
+		vl = sizeof(v1);
+		test_result("SO_DOMAIN is AF_INET",
+			    getsockopt(sb, SOL_SOCKET, SO_DOMAIN, &v1, &vl) ==
+					    0 &&
+				    v1 == AF_INET);
+		vl = sizeof(v1);
+		test_result("SO_SNDLOWAT reads 1",
+			    getsockopt(sb, SOL_SOCKET, SO_SNDLOWAT, &v1, &vl) ==
+					    0 &&
+				    v1 == 1);
+		close(sa);
+		close(sb);
+	}
+
+	/* 5. SIGPIPE on a TCP socket whose sending side is shut, unless
+	 *    MSG_NOSIGNAL. */
+	{
+		int c, s;
+
+		if (sockapi_pair(&c, &s) == 0) {
+			struct sigaction sa, old;
+
+			memset(&sa, 0, sizeof(sa));
+			sa.sa_handler = sockapi_on_sigpipe;
+			sigaction(SIGPIPE, &sa, &old);
+			g_sockapi_sigpipes = 0;
+			shutdown(c, SHUT_WR);
+			errno = 0;
+			test_result("MSG_NOSIGNAL: EPIPE without a signal",
+				    send(c, "x", 1, MSG_NOSIGNAL) == -1 &&
+					    errno == EPIPE &&
+					    g_sockapi_sigpipes == 0);
+			errno = 0;
+			test_result("send(): EPIPE and SIGPIPE",
+				    send(c, "x", 1, 0) == -1 &&
+					    errno == EPIPE &&
+					    g_sockapi_sigpipes == 1);
+			errno = 0;
+			test_result("write(): EPIPE and SIGPIPE",
+				    write(c, "x", 1) == -1 && errno == EPIPE &&
+					    g_sockapi_sigpipes == 2);
+			sigaction(SIGPIPE, &old, NULL);
+			close(c);
+			close(s);
+		} else {
+			test_fail("sigpipe: loopback pair");
+		}
+	}
+
+	/* 6. The queue ioctls and SO_RCVLOWAT. */
+	{
+		int c, s;
+
+		if (sockapi_pair(&c, &s) == 0) {
+			static char big[1000];
+			int v = -1;
+			struct timespec t0;
+
+			memset(big, 'q', sizeof(big));
+			send(c, big, sizeof(big), 0);
+			clock_gettime(CLOCK_MONOTONIC, &t0);
+			while (ioctl(s, SIOCINQ, &v) == 0 && v < 1000 &&
+			       sockapi_ms_since(&t0) < 2000)
+				usleep(5000);
+			test_result("SIOCINQ: the bytes queued", v == 1000);
+			v = -1;
+			clock_gettime(CLOCK_MONOTONIC, &t0);
+			while (ioctl(c, SIOCOUTQ, &v) == 0 && v != 0 &&
+			       sockapi_ms_since(&t0) < 2000)
+				usleep(5000);
+			test_result("SIOCOUTQ: 0 once acknowledged", v == 0);
+			v = -1;
+			test_result("SIOCOUTQNSD: nothing unsent",
+				    ioctl(c, SIOCOUTQNSD, &v) == 0 && v == 0);
+			v = -1;
+			test_result("SIOCATMARK: not at an urgent mark",
+				    ioctl(s, SIOCATMARK, &v) == 0 && v == 0);
+			/* SO_RCVLOWAT: 1000 queued, readable at 1000, not 1001 */
+			int lw = 1001;
+			struct pollfd p = { .fd = s, .events = POLLIN };
+			setsockopt(s, SOL_SOCKET, SO_RCVLOWAT, &lw, sizeof(lw));
+			test_result("SO_RCVLOWAT above the queue: not readable",
+				    poll(&p, 1, 0) == 0);
+			lw = 1000;
+			setsockopt(s, SOL_SOCKET, SO_RCVLOWAT, &lw, sizeof(lw));
+			test_result("SO_RCVLOWAT reached: readable",
+				    poll(&p, 1, 0) == 1);
+			socklen_t ll = sizeof(lw);
+			lw = 0;
+			test_result("SO_RCVLOWAT reads back",
+				    getsockopt(s, SOL_SOCKET, SO_RCVLOWAT, &lw,
+					       &ll) == 0 &&
+					    lw == 1000);
+			close(c);
+			close(s);
+		} else {
+			test_fail("queue ioctls: loopback pair");
+		}
+		uint16_t port = 0;
+		int lfd = inetfix_listen(&port), v = 0;
+		errno = 0;
+		test_result("SIOCINQ on a listener: EINVAL",
+			    lfd >= 0 && ioctl(lfd, SIOCINQ, &v) == -1 &&
+				    errno == EINVAL);
+		if (lfd >= 0)
+			close(lfd);
+	}
+
+	/* 6b. Urgent data, accept() after SHUT_RD, a reset after data,
+	 *     SO_MAX_PACING_RATE. */
+	{
+		int c, s;
+
+		if (sockapi_pair(&c, &s) == 0) {
+			char b[16];
+			int v = -1;
+			struct timespec t0;
+			struct pollfd p = { .fd = s, .events = POLLPRI };
+
+			send(c, "abc", 3, 0);
+			send(c, "!", 1, MSG_OOB);
+			clock_gettime(CLOCK_MONOTONIC, &t0);
+			while (poll(&p, 1, 0) == 0 && sockapi_ms_since(&t0) < 2000)
+				usleep(5000);
+			test_result("MSG_OOB: POLLPRI for the urgent byte",
+				    (p.revents & POLLPRI) != 0);
+			test_result("MSG_OOB: a read stops at the mark",
+				    recv(s, b, sizeof(b), 0) == 3 &&
+					    !memcmp(b, "abc", 3));
+			test_result("MSG_OOB: SIOCATMARK at the mark",
+				    ioctl(s, SIOCATMARK, &v) == 0 && v == 1);
+			b[0] = 0;
+			test_result("MSG_OOB: recv(MSG_OOB) returns the byte",
+				    recv(s, b, 1, MSG_OOB) == 1 && b[0] == '!');
+			errno = 0;
+			test_result("MSG_OOB: read once, then EINVAL",
+				    recv(s, b, 1, MSG_OOB) == -1 &&
+					    errno == EINVAL);
+			send(c, "de", 2, 0);
+			clock_gettime(CLOCK_MONOTONIC, &t0);
+			int n = 0;
+			while (n <= 0 && sockapi_ms_since(&t0) < 2000) {
+				n = (int)recv(s, b, sizeof(b), MSG_DONTWAIT);
+				if (n <= 0)
+					usleep(5000);
+			}
+			test_result("MSG_OOB: the urgent byte is not in the stream",
+				    n == 2 && !memcmp(b, "de", 2));
+
+			unsigned long long rate = 0;
+			socklen_t rl = sizeof(rate);
+			test_result("SO_MAX_PACING_RATE: none by default",
+				    getsockopt(c, SOL_SOCKET, SO_MAX_PACING_RATE,
+					       &rate, &rl) == 0 &&
+					    rate == ~0ULL);
+			rate = 125000000ULL;
+			test_result("SO_MAX_PACING_RATE: set and read back",
+				    setsockopt(c, SOL_SOCKET, SO_MAX_PACING_RATE,
+					       &rate, sizeof(rate)) == 0 &&
+					    (rate = 0,
+					     getsockopt(c, SOL_SOCKET,
+							SO_MAX_PACING_RATE, &rate,
+							&rl) == 0) &&
+					    rate == 125000000ULL);
+
+			/* data, then an abortive close: the data first, the
+			 * reset once, then end of file */
+			struct linger lg = { 1, 0 };
+			send(c, "xyz", 3, 0);
+			usleep(50000);
+			setsockopt(c, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+			close(c);
+			usleep(50000);
+			errno = 0;
+			test_result("reset after data: the data is read first",
+				    recv(s, b, sizeof(b), MSG_DONTWAIT) == 3);
+			errno = 0;
+			test_result("reset after data: then ECONNRESET, once",
+				    recv(s, b, sizeof(b), MSG_DONTWAIT) == -1 &&
+					    errno == ECONNRESET);
+			test_result("reset after data: then end of file",
+				    recv(s, b, sizeof(b), MSG_DONTWAIT) == 0);
+			close(s);
+		} else {
+			test_fail("urgent data: loopback pair");
+		}
+
+		uint16_t port = 0;
+		int lfd = inetfix_listen(&port);
+		errno = 0;
+		test_result("accept() after shutdown(SHUT_RD): EINVAL",
+			    lfd >= 0 && shutdown(lfd, SHUT_RD) == 0 &&
+				    accept(lfd, NULL, NULL) == -1 &&
+				    errno == EINVAL);
+		if (lfd >= 0)
+			close(lfd);
+	}
+
+	/* 7. epoll: more than 256 events at once, a huge maxevents, an
+	 *    epoll set inside poll() and inside another set. */
+	{
+		enum { NP = 300 };
+		static int pp[NP][2];
+		static struct epoll_event out[NP + 8];
+		int ep = epoll_create1(0), made = 0;
+
+		for (int i = 0; i < NP; i++) {
+			if (pipe(pp[i]) != 0)
+				break;
+			struct epoll_event ev = { .events = EPOLLIN };
+			ev.data.u32 = (uint32_t)i;
+			epoll_ctl(ep, EPOLL_CTL_ADD, pp[i][0], &ev);
+			write(pp[i][1], "z", 1);
+			made++;
+		}
+		test_result("epoll: 300 pipes watched", made == NP);
+		test_result("epoll: 300 events in one call (maxevents > 256)",
+			    epoll_wait(ep, out, NP + 8, 1000) == NP);
+		test_result("epoll: maxevents INT_MAX/12 accepted",
+			    epoll_wait(ep, out, (int)(INT_MAX / sizeof(out[0])),
+				       0) == NP);
+		errno = 0;
+		test_result("epoll: maxevents above INT_MAX/12 is EINVAL",
+			    epoll_wait(ep, out,
+				       (int)(INT_MAX / sizeof(out[0])) + 1,
+				       0) == -1 &&
+				    errno == EINVAL);
+		/* fairness: 100 at a time sees every pipe once in 3 calls */
+		static int seen[NP];
+		int fair = 1;
+		memset(seen, 0, sizeof(seen));
+		for (int r = 0; r < 3; r++) {
+			int n = epoll_wait(ep, out, 100, 0);
+			fair &= n == 100;
+			for (int k = 0; k < n; k++)
+				if (out[k].data.u32 < NP)
+					seen[out[k].data.u32]++;
+		}
+		for (int i = 0; i < NP; i++)
+			fair &= seen[i] == 1;
+		test_result("epoll: ready items reported round-robin", fair);
+		/* a set in poll() and in another set */
+		int outer = epoll_create1(0);
+		struct epoll_event ev = { .events = EPOLLIN };
+		ev.data.u32 = 7;
+		struct pollfd p = { .fd = ep, .events = POLLIN };
+		test_result("epoll: a set is readable in poll()",
+			    poll(&p, 1, 0) == 1 && (p.revents & POLLIN));
+		test_result("epoll: a set inside a set",
+			    epoll_ctl(outer, EPOLL_CTL_ADD, ep, &ev) == 0 &&
+				    epoll_wait(outer, out, 4, 0) == 1 &&
+				    out[0].data.u32 == 7);
+		errno = 0;
+		test_result("epoll: a loop of sets is ELOOP",
+			    epoll_ctl(ep, EPOLL_CTL_ADD, outer, &ev) == -1 &&
+				    errno == ELOOP);
+		/* drain: nothing ready, in either */
+		char z;
+		for (int i = 0; i < made; i++)
+			read(pp[i][0], &z, 1);
+		test_result("epoll: drained set is not readable in poll()",
+			    poll(&p, 1, 0) == 0);
+		test_result("epoll: ...nor in the outer set",
+			    epoll_wait(outer, out, 4, 0) == 0);
+		/* EPOLLEXCLUSIVE is accepted on ADD and refused on MOD */
+		ev.events = EPOLLIN | EPOLLEXCLUSIVE;
+		int ex = epoll_create1(0);
+		test_result("epoll: EPOLLEXCLUSIVE accepted",
+			    epoll_ctl(ex, EPOLL_CTL_ADD, pp[0][0], &ev) == 0);
+		errno = 0;
+		test_result("epoll: MOD of an exclusive item is EINVAL",
+			    epoll_ctl(ex, EPOLL_CTL_MOD, pp[0][0], &ev) ==
+					    -1 &&
+				    errno == EINVAL);
+		/* a regular file is EPERM, as everywhere */
+		int rf = open("/tmp/.sockapi_regular", O_CREAT | O_RDWR, 0600);
+		errno = 0;
+		test_result("epoll: a regular file is EPERM",
+			    rf >= 0 && epoll_ctl(ex, EPOLL_CTL_ADD, rf, &ev) ==
+						       -1 &&
+				    errno == EPERM);
+		if (rf >= 0) {
+			close(rf);
+			unlink("/tmp/.sockapi_regular");
+		}
+		close(ex);
+		close(outer);
+		for (int i = 0; i < made; i++) {
+			close(pp[i][0]);
+			close(pp[i][1]);
+		}
+		close(ep);
+	}
+
+	/* 8. epoll_pwait2 with a nanosecond timeout. */
+	{
+		int ep = epoll_create1(0);
+		struct epoll_event out[1];
+		struct timespec t = { .tv_sec = 0, .tv_nsec = 20000000 }, t0;
+
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		test_result("epoll_pwait2: times out with 0",
+			    epoll_pwait2(ep, out, 1, &t, NULL) == 0);
+		test_result("epoll_pwait2: waited about 20 ms",
+			    sockapi_ms_since(&t0) >= 19);
+		close(ep);
+	}
+
+	/* 9. Many connections through one set. */
+	sockapi_many_connections();
 }
 
 // ========================================
@@ -39127,6 +41023,9 @@ network_skip:;
 	test_getentropy();
 	test_timegm();
 	test_so_acceptconn();
+	test_inet_stack_fixes();
+	test_inet_ip_udp();
+	test_inet_socket_layer();
 	test_memstream_ftw_cpuclock();
 	test_stdint_limits();
 	test_dirent64_and_stat_mkdir();

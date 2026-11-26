@@ -1,0 +1,8 @@
+# shutdown(SHUT_RD) stops a listener: accept() then fails with EINVAL (it
+# used to wait for ever).
+# Copyright (C) 2026 The LikeOS Project
+0.000 socket s stream
+0.000 bind s 8080
+0.000 listen s 16
+0.100 shutdown s rd
+0.100 accept s c = -EINVAL

@@ -996,9 +996,17 @@ static int devfs_open_impl(const char *path, int flags, unsigned int cmode,
 		}
 	}
 
+	/* /dev/tty is the caller's controlling terminal.  A process without
+	 * one -- root's included, e.g. right after setsid() -- has none to
+	 * open (ENXIO).  It used to get the console instead: getpass() in a
+	 * setsid()'d child then printed its prompt on the console, switched
+	 * the console's echo off and read the keystrokes meant for whatever
+	 * owned the console (a tmux client), and blocked there. */
 	if (is_path(path, "/dev/tty") && cur) {
-		tty_t *tty = cur->ctty ? cur->ctty : tty_get_console();
-		if (tty && tty->fg_pgid == 0) {
+		tty_t *tty = cur->ctty;
+		if (!tty)
+			return ST_NXIO;
+		if (tty->fg_pgid == 0) {
 			tty->fg_pgid = cur->pgid;
 		}
 		return devfs_open_tty(tty, out);

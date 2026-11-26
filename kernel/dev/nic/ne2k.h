@@ -11,6 +11,7 @@
 #include <kernel/uapi/types.h>
 #include <kernel/hal/pci.h>
 #include <kernel/net/net.h>
+#include <kernel/net/netdevice.h>
 #include <kernel/ke/sched.h>
 
 // ============================================================================
@@ -94,6 +95,13 @@
 #define NE_DCR_AR (1 << 4) // Auto-init remote
 #define NE_DCR_FT_8B (2 << 5) // FIFO threshold = 8 bytes
 
+// Page 0 tally counters (read clears): alignment, CRC, missed frames
+#define NE_P0_CNTR0 0x0D
+#define NE_P0_CNTR1 0x0E
+#define NE_P0_CNTR2 0x0F
+// RX header status bits
+#define NE_RSR_PRX 0x01
+
 // ============================================================================
 // RCR bits
 // ============================================================================
@@ -112,12 +120,14 @@
 
 // ============================================================================
 // SRAM layout (NE2000 has 16 KiB internal RAM at addr 0x4000..0x7FFF,
-// addressed in 256-byte pages).  Standard layout:
-//   TX buffer:  pages 0x40..0x45  (6 pages = 1536 bytes, one full Ethernet frame)
-//   RX ring:    pages 0x46..0x7F  (58 pages)
+// addressed in 256-byte pages).  Two transmit buffers, used in turn (one
+// is sent while the next frame is loaded into the other):
+//   TX buffers: pages 0x40..0x45 and 0x46..0x4B (6 pages = 1536 bytes each)
+//   RX ring:    pages 0x4C..0x7F  (52 pages)
 // ============================================================================
 #define NE_TX_PAGE_START 0x40
-#define NE_RX_PAGE_START 0x46
+#define NE_TX_PAGES 6 // per buffer
+#define NE_RX_PAGE_START 0x4C
 #define NE_RX_PAGE_STOP 0x80 // exclusive
 #define NE_PAGE_SIZE 256
 
@@ -128,12 +138,27 @@ typedef struct {
 	const pci_device_t *pci_dev;
 	uint16_t io_base;
 	uint8_t mac_addr[6];
-
 	uint8_t next_pkt; // Software RX read pointer (page number)
+	uint8_t imr; // interrupt mask as programmed
 	int link_up;
 	uint8_t msi_vector; // Always 0 — chip has no MSI
-	spinlock_t tx_lock; // Serializes ne2k_send() across CPUs
-
+	/* The chip lock: serializes every use of the command register, the page
+	 * select and the remote-DMA engine -- the transmit hook, the poll,
+	 * the watchdog and the interrupt handler alike.  Taken with
+	 * interrupts off; a leaf. */
+	spinlock_t tx_lock;
+	/* The two transmit buffers (under tx_lock): tx_len[i] != 0 while
+	 * buffer i holds a frame (loaded or being sent); tx_active is the
+	 * one being sent (-1: none), tx_next the one to load next. */
+	uint16_t tx_len[2];
+	int tx_active;
+	int tx_next;
+	uint64_t tx_stamp; // tick the active transmission started
+	struct napi_struct napi;
+	volatile int rx_mode_pending;
+	volatile int reset_pending;
+	uint8_t rx_bounce[1536]; // a frame read out of the ring (poll only)
+	uint64_t st_rx_frame, st_rx_crc, st_missed, st_overruns;
 	net_device_t net_dev;
 } ne2k_dev_t;
 
@@ -141,6 +166,6 @@ typedef struct {
 // Public API
 // ============================================================================
 void ne2k_init(void);
-void ne2k_irq_handler(void);
+int ne2k_irq_handler(void);
 
 #endif // _KERNEL_NE2K_H_

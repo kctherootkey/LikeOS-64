@@ -146,6 +146,8 @@
 #define SYS_SOCKETPAIR  354
 #define SYS_ACCEPT4     355
 #define SYS_SENDMSG     356
+#define SYS_SENDMMSG    377 /* (fd, mmsghdr *, vlen, flags) */
+#define SYS_RECVMMSG    378 /* (fd, mmsghdr *, vlen, flags, timespec *) */
 #define SYS_RECVMSG     357
 #define SYS_SENDFILE    358
 #define SYS_SELECT      359
@@ -157,6 +159,7 @@
 #define SYS_EPOLL_CTL   365
 #define SYS_EPOLL_WAIT  366
 #define SYS_EPOLL_PWAIT 367
+#define SYS_EPOLL_PWAIT2 379 /* (epfd, events, maxevents, timespec *, sigmask, sigsetsize) */
 #define SYS_DUP3        368
 #define SYS_DNS_RESOLVE 369
 #define SYS_SETHOSTNAME 370
@@ -228,6 +231,7 @@
 #define SYS_FCHMODAT    438   /* (dirfd, path, mode, flags) */
 #define SYS_SYNCFS      439   /* (fd) */
 #define SYS_READLINKAT  440   /* (dirfd, path, buf, bufsiz) */
+#define SYS_PRCTL       441   /* (option, arg2, arg3, arg4, arg5) */
 #define SYS_TKILL       258   /* (tid, sig) signal ONE thread */
 #define SYS_TGKILL      259   /* (tgid, tid, sig) same, group-checked */
 #define SYS_PTRACE      408   /* (request, pid, addr, data) — see sys/ptrace.h */

@@ -41,11 +41,47 @@
  * sched_enqueue_ready() all come from here. */
 #include <kernel/ke/sched.h>
 
+struct wait_queue_entry;
+struct wq_wake_ctx;
+
+/* A wake callback.  Called by the waker with the head's lock held and
+ * interrupts off, so it may only take locks that nest inside every wait
+ * queue lock, and it must not sleep, allocate or enqueue a task itself:
+ * a task to run goes into `ctx' (wq_ctx_claim) and work that needs no lock
+ * held goes into ctx's deferred list (wq_ctx_defer); the waker does both
+ * once the head is unlocked.  `key' is the readiness that changed (POLL*
+ * bits) or 0 when the waker does not say.  Returns nonzero when it woke
+ * something (an exclusive entry then uses up the wake). */
+typedef int (*wq_func_t)(struct wait_queue_entry *e, unsigned key,
+			 struct wq_wake_ctx *ctx);
+
+#define WQ_FLAG_EXCLUSIVE 0x01u
+
 struct wait_queue_entry {
 	struct wait_queue_entry *next;
 	struct wait_queue_entry **pprev; /* NULL when not queued */
 	task_t *task;
 	uint64_t seq; /* the head's wake_seq when it was queued */
+	/* NULL: wake `task'.  Otherwise the callback runs instead, and the
+	 * waker never unlinks the entry -- its owner does. */
+	wq_func_t func;
+	void *priv; /* for the callback */
+	uint32_t flags; /* WQ_FLAG_* */
+};
+
+/* What one pass of a waker collected while it held the head's lock.  Sized
+ * so a callback always finds room for one task and one deferred call: the
+ * walk ends its batch early when either is full and starts another. */
+#define WQ_WAKE_BATCH 16
+#define WQ_WAKE_DEFER 8
+struct wq_wake_ctx {
+	task_t *tasks[WQ_WAKE_BATCH];
+	int ntasks;
+	struct {
+		void (*fn)(void *arg);
+		void *arg;
+	} defer[WQ_WAKE_DEFER];
+	int ndefer;
 };
 
 struct wait_queue_head {
@@ -126,6 +162,46 @@ static inline void wq_entry_init(struct wait_queue_entry *e, task_t *t)
 	e->pprev = NULL;
 	e->task = t;
 	e->seq = 0;
+	e->func = NULL;
+	e->priv = NULL;
+	e->flags = 0;
+}
+
+/* An entry whose wake runs `func' (see wq_func_t) instead of waking a task. */
+static inline void wq_entry_init_func(struct wait_queue_entry *e, task_t *t,
+				      wq_func_t func, void *priv)
+{
+	wq_entry_init(e, t);
+	e->func = func;
+	e->priv = priv;
+}
+
+/* From a wake callback: make `t' runnable if it is parked.  The waker
+ * enqueues it once the head is unlocked.  Returns 1 when claimed. */
+static inline int wq_ctx_claim(struct wq_wake_ctx *ctx, task_t *t)
+{
+	if (!t || ctx->ntasks >= WQ_WAKE_BATCH)
+		return 0;
+	if (!sched_claim_wake(t, TASK_BLOCKED))
+		return 0;
+	t->wait_channel = NULL;
+	t->wakeup_tick = 0;
+	ctx->tasks[ctx->ntasks++] = t;
+	return 1;
+}
+
+/* From a wake callback: run fn(arg) after the waker has dropped every lock.
+ * Returns 0 when there is no room (cannot happen for a callback, which is
+ * only called with a free slot). */
+static inline int wq_ctx_defer(struct wq_wake_ctx *ctx, void (*fn)(void *),
+			       void *arg)
+{
+	if (ctx->ndefer >= WQ_WAKE_DEFER)
+		return 0;
+	ctx->defer[ctx->ndefer].fn = fn;
+	ctx->defer[ctx->ndefer].arg = arg;
+	ctx->ndefer++;
+	return 1;
 }
 
 /* True when the entry is currently on some queue. */
@@ -225,23 +301,65 @@ static inline void wq_remove(struct wait_queue_head *h,
  * A waiter that loses the claim (it timed out, or another waker got there
  * first) is skipped and left on the queue for its owner to remove.
  */
-static inline int wq_wake_all(struct wait_queue_head *h)
+/*
+ * The general form: `nr_exclusive' exclusive entries at most (0: all of
+ * them) and every non-exclusive one; `key' is handed to callbacks.
+ *
+ * An entry with a callback (wq_entry_init_func) is not woken but CALLED, with
+ * the lock held, and stays on the queue: it belongs to a poller that registered
+ * on this object (poll(), select(), an epoll set) and leaves when its owner
+ * says so.  A callback entry is called once per walk -- it is stamped with the
+ * walk's number, so the restart after a full batch skips it.  What callbacks
+ * ask for (tasks to run, deferred calls) is done after the lock is dropped,
+ * like the plain wakes: no run-queue lock and no other object's lock is ever
+ * taken beneath a wait-queue lock by the waker itself.
+ *
+ * Exclusive entries (WQ_FLAG_EXCLUSIVE, queued with wq_add_exclusive) are
+ * the ones of which only `nr_exclusive' are woken; one that could not be
+ * woken (its task was not parked, its callback found nothing to do) does not
+ * count.
+ */
+static inline int __wq_wake_common(struct wait_queue_head *h,
+				   int nr_exclusive, unsigned key)
 {
 	uint64_t start = 0;
 	int total = 0;
+	int excl_left = nr_exclusive > 0 ? nr_exclusive : 0x7fffffff;
 
 	for (;;) {
-		task_t *batch[16];
-		int n = 0;
+		struct wq_wake_ctx ctx;
+		int full = 0;
 		uint64_t flags;
 		struct wait_queue_entry *e, *next;
 
+		ctx.ntasks = 0;
+		ctx.ndefer = 0;
 		spin_lock_irqsave(&h->lock, &flags);
 		if (!start)
 			start = ++h->wake_seq;
-		for (e = h->first; e && n < 16; e = next) {
+		for (e = h->first; e; e = next) {
+			int excl;
+
 			next = e->next;
-			if (!e->task || e->seq >= start)
+			if (e->seq >= start)
+				continue;
+			excl = (e->flags & WQ_FLAG_EXCLUSIVE) != 0;
+			if (excl && excl_left <= 0)
+				continue;
+			if (ctx.ntasks >= WQ_WAKE_BATCH ||
+			    ctx.ndefer >= WQ_WAKE_DEFER) {
+				full = 1;
+				break;
+			}
+			if (e->func) {
+				/* Stamped first: called at most once per
+				 * walk, whatever the restarts. */
+				e->seq = start;
+				if (e->func(e, key, &ctx) && excl)
+					excl_left--;
+				continue;
+			}
+			if (!e->task)
 				continue;
 			if (!sched_claim_wake(e->task, TASK_BLOCKED))
 				continue;
@@ -255,18 +373,49 @@ static inline int wq_wake_all(struct wait_queue_head *h)
 				e->pprev = NULL;
 			}
 			e->task->wait_channel = NULL;
-			batch[n++] = e->task;
+			ctx.tasks[ctx.ntasks++] = e->task;
+			if (excl)
+				excl_left--;
 		}
 		spin_unlock_irqrestore(&h->lock, flags);
 
-		for (int i = 0; i < n; i++)
-			sched_enqueue_ready(batch[i]);
-		total += n;
+		for (int i = 0; i < ctx.ntasks; i++)
+			sched_enqueue_ready(ctx.tasks[i]);
+		for (int i = 0; i < ctx.ndefer; i++)
+			ctx.defer[i].fn(ctx.defer[i].arg);
+		total += ctx.ntasks;
 
-		if (n < 16)
+		if (!full)
 			break;
 	}
 	return total;
+}
+
+static inline int wq_wake_all(struct wait_queue_head *h)
+{
+	return __wq_wake_common(h, 0, 0);
+}
+
+/* A readiness change on an object that pollers may watch: every
+ * non-exclusive waiter, and one exclusive one (an epoll set registered
+ * with EPOLLEXCLUSIVE).  `key': the POLL* bits that changed, 0 unknown. */
+static inline int wq_wake_poll(struct wait_queue_head *h, unsigned key)
+{
+	return __wq_wake_common(h, 1, key);
+}
+
+/* Queue `e' at the tail as an exclusive waiter. */
+static inline void wq_add_exclusive(struct wait_queue_head *h,
+				    struct wait_queue_entry *e)
+{
+	uint64_t flags;
+
+	if (wq_entry_queued(e))
+		return;
+	e->flags |= WQ_FLAG_EXCLUSIVE;
+	spin_lock_irqsave(&h->lock, &flags);
+	wq_add_locked(h, e);
+	spin_unlock_irqrestore(&h->lock, flags);
 }
 
 /* ==========================================================================

@@ -1,0 +1,9 @@
+# Active open: connect sends SYN with our options, SYN-ACK in, ACK out.
+# Copyright (C) 2026 The LikeOS Project
+0.000 socket c stream
+0.000 connect c 8080 = -EINPROGRESS
+0.000 > S 0:0(0) win * <mss 1460,sackOK,TS val * ecr 0,nop,wscale *>
+0.050 < S. 0:0(0) ack 1 win 65535 <mss 1460,sackOK,TS val 500 ecr echo,nop,wscale 7>
+0.050 > . 1:1(0) ack 1 win * <nop,nop,TS val * ecr 500>
+0.050 state c ESTABLISHED
+0.050 so_error c = 0

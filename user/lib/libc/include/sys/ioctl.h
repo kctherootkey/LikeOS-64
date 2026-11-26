@@ -44,6 +44,12 @@ struct winsize {
 #define TIOCSGUARD 0x4C4B0001
 #define TIOCLINUX  0x541C
 #define FIONREAD   0x541B
+/* Socket queues: bytes readable (= FIONREAD), sent and not acknowledged,
+ * not yet sent; and whether the next byte read is the urgent one. */
+#define SIOCINQ     FIONREAD
+#define SIOCOUTQ    0x5411
+#define SIOCOUTQNSD 0x894B
+#define SIOCATMARK  0x8905
 #define FIONBIO    0x5421
 #define FIOCLEX    0x5451
 #define FIONCLEX   0x5450

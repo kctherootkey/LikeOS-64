@@ -67,6 +67,21 @@ extern "C" {
 #define IP_MULTICAST_LOOP      34
 #define IP_ADD_MEMBERSHIP      35
 #define IP_DROP_MEMBERSHIP     36
+#define IP_OPTIONS             4
+#define IP_MTU_DISCOVER        10
+#define IP_RECVERR             11
+#define IP_RECVTTL             12
+#define IP_RECVTOS             13
+#define IP_MTU                 14
+#define IP_MULTICAST_ALL       49
+
+/* IP_MTU_DISCOVER modes: path-MTU discovery per socket. */
+#define IP_PMTUDISC_DONT       0 /* never set DF */
+#define IP_PMTUDISC_WANT       1 /* DF while the datagram fits the path MTU */
+#define IP_PMTUDISC_DO         2 /* always DF; too big is EMSGSIZE */
+#define IP_PMTUDISC_PROBE      3 /* always DF, ignore the path MTU */
+#define IP_PMTUDISC_INTERFACE  4 /* the device MTU, no DF */
+#define IP_PMTUDISC_OMIT       5 /* like INTERFACE, fragments allowed */
 
 typedef uint32_t in_addr_t;
 typedef uint16_t in_port_t;

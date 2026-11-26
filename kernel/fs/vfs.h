@@ -589,6 +589,9 @@ size_t vfs_size(vfs_file_t *f);
 vfs_file_t *
 vfs_dup(vfs_file_t *f); // Increment refcount and return same pointer
 void vfs_incref(vfs_file_t *f); // Increment refcount
+/* Take a reference unless the last one is already gone (its close has begun).
+ * Returns 1 when taken.  `f' must be known to be allocated. */
+int vfs_tryget(vfs_file_t *f);
 
 /* Force-release any filesystem-private locks owned by the given task id.
  * Used by the scheduler's dead-thread reaper to recover from tasks killed

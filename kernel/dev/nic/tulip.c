@@ -10,7 +10,10 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/nic/tulip.h>
+#include <kernel/dev/nic/nic_util.h>
 #include <kernel/net/net.h>
+#include <kernel/net/netdevice.h>
+#include <kernel/net/skb.h>
 #include <kernel/hal/pci.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
@@ -88,119 +91,146 @@ static void tulip_delay_us(uint32_t us)
 }
 
 // ============================================================================
-// Read MAC from SROM (CSR9 serial EEPROM interface)
-//
-// The DC21040/41 expose the MAC in a 6-byte boot ROM at SROM offset 0;
-// QEMU populates it the same way for the 21143.  The classical SROM
-// access protocol is a bit-banged 93C46/93C66 via CSR9 — implementing
-// the full state machine is overkill, but on QEMU we can rely on the
-// chip having already latched the address into its receive address
-// filter (look at the first received packet's destination MAC, which the
-// chip uses for perfect filtering after a setup frame).
-//
-// Simpler approach: read SROM via CSR9.  Falls back to a synthesized
-// MAC (52:54:00:12:34:56 — QEMU's default) if SROM access fails.
+// SROM (serial EEPROM behind CSR9, a 93C46 or 93C66)
 // ============================================================================
-#define TULIP_SROM_READ_CMD 6
+#define TULIP_SROM_READ_CMD 6 // start bit + read opcode
 #define TULIP_CSR9_SR (1u << 11)
 #define TULIP_CSR9_RD (1u << 14)
-#define TULIP_CSR9_REG (1u << 10) // SROM access enable
 #define TULIP_CSR9_CS (1u << 0)
 #define TULIP_CSR9_SCLK (1u << 1)
 #define TULIP_CSR9_SDI (1u << 2)
 #define TULIP_CSR9_SDO (1u << 3)
+#define TULIP_SROM_BYTES 128
 
-static uint16_t tulip_srom_read(tulip_dev_t *dev, uint8_t addr)
+/* One SROM read transaction for word `loc' with `addr_bits' address bits.
+ * Returns every bit seen on SDO: the word in the low 16 bits, above it
+ * what the part drove while the command and address went out (a 93C46
+ * answers its dummy 0 two bits early when sent 8 address bits -- that is
+ * how the address width is told apart). */
+static uint32_t tulip_srom_xfer(tulip_dev_t *dev, uint32_t loc, int addr_bits)
 {
-	// Enable SROM access mode (SR | RD only — do NOT set REG (bit 10),
-	// that bit is the MII serial-register select and putting it on at
-	// the same time as SR confuses the SROM state machine and SDO
-	// returns nonsense).
-	tulip_csr_write(dev, TULIP_CSR9, TULIP_CSR9_SR | TULIP_CSR9_RD);
-	tulip_delay_us(10);
+	const uint32_t enb = TULIP_CSR9_SR | TULIP_CSR9_RD | TULIP_CSR9_CS;
+	uint32_t cmd = loc | ((uint32_t)TULIP_SROM_READ_CMD << addr_bits);
+	uint32_t ret = 0;
 
-	uint32_t base = TULIP_CSR9_SR | TULIP_CSR9_RD;
+	tulip_csr_write(dev, TULIP_CSR9, enb & ~TULIP_CSR9_CS);
+	tulip_csr_write(dev, TULIP_CSR9, enb);
+	for (int i = 4 + addr_bits; i >= 0; i--) {
+		uint32_t d = ((cmd >> i) & 1) ? TULIP_CSR9_SDI : 0;
 
-	// Drive CS high
-	tulip_csr_write(dev, TULIP_CSR9, base | TULIP_CSR9_CS);
-	tulip_delay_us(10);
-
-	// Build command: 3 cmd bits (110 = read) + 6 addr bits (MSB first)
-	uint16_t cmd = (TULIP_SROM_READ_CMD << 6) | (addr & 0x3F);
-
-	// Shift out 9 bits (3 cmd + 6 addr)
-	for (int i = 8; i >= 0; i--) {
-		uint32_t bit = (cmd >> i) & 1;
-		uint32_t v = base | TULIP_CSR9_CS | (bit ? TULIP_CSR9_SDI : 0);
-		tulip_csr_write(dev, TULIP_CSR9, v);
+		tulip_csr_write(dev, TULIP_CSR9, enb | d);
 		tulip_delay_us(2);
-		tulip_csr_write(dev, TULIP_CSR9, v | TULIP_CSR9_SCLK);
+		tulip_csr_write(dev, TULIP_CSR9, enb | d | TULIP_CSR9_SCLK);
 		tulip_delay_us(2);
-		tulip_csr_write(dev, TULIP_CSR9, v);
-		tulip_delay_us(2);
+		ret = (ret << 1) |
+		      ((tulip_csr_read(dev, TULIP_CSR9) & TULIP_CSR9_SDO) ? 1 :
+									    0);
 	}
-
-	// Shift in 16 data bits (sample SDO while SCLK is high)
-	uint16_t data = 0;
+	tulip_csr_write(dev, TULIP_CSR9, enb);
+	tulip_delay_us(2);
 	for (int i = 0; i < 16; i++) {
-		tulip_csr_write(dev, TULIP_CSR9,
-				base | TULIP_CSR9_CS | TULIP_CSR9_SCLK);
+		tulip_csr_write(dev, TULIP_CSR9, enb | TULIP_CSR9_SCLK);
 		tulip_delay_us(2);
-		uint32_t s = tulip_csr_read(dev, TULIP_CSR9);
-		data = (data << 1) | ((s & TULIP_CSR9_SDO) ? 1 : 0);
-		tulip_csr_write(dev, TULIP_CSR9, base | TULIP_CSR9_CS);
+		ret = (ret << 1) |
+		      ((tulip_csr_read(dev, TULIP_CSR9) & TULIP_CSR9_SDO) ? 1 :
+									    0);
+		tulip_csr_write(dev, TULIP_CSR9, enb);
 		tulip_delay_us(2);
 	}
-
-	// Drop CS, exit SROM mode
-	tulip_csr_write(dev, TULIP_CSR9, base);
-	tulip_csr_write(dev, TULIP_CSR9, 0);
-
-	return data;
+	tulip_csr_write(dev, TULIP_CSR9, enb & ~TULIP_CSR9_CS);
+	return ret;
 }
 
+/* The 21140 media leaf of a DEC-format SROM (format version 1..4): the
+ * general-purpose port direction, and from the default media block (else
+ * the first non-MII one) the port value and the CSR6 port bits it wants.
+ * Leaves gpr_valid 0 when the SROM has no usable leaf. */
+static void tulip_parse_media(tulip_dev_t *dev, const uint8_t *ee)
+{
+	uint32_t leaf, nblocks, p;
+	int chosen = 0;
+
+	if (dev->device_id != TULIP_DEV_DC21140)
+		return;
+	if (ee[18] < 1 || ee[18] > 4 || ee[19] < 1)
+		return; // not a DEC-format SROM
+	leaf = (uint32_t)ee[27] | ((uint32_t)ee[28] << 8);
+	if (leaf < 30 || leaf + 4 > TULIP_SROM_BYTES)
+		return;
+	dev->gpr_dir = ee[leaf + 2];
+	nblocks = ee[leaf + 3];
+	p = leaf + 4;
+	for (uint32_t b = 0; b < nblocks && p < TULIP_SROM_BYTES; b++) {
+		uint32_t len, gpr_off;
+		uint16_t cmd;
+
+		if (ee[p] & 0x80) { // extended block: length, type, data
+			len = (ee[p] & 0x7F) + 1u;
+			if (p + len > TULIP_SROM_BYTES || len < 6 ||
+			    ee[p + 1] != 0) {
+				p += len;
+				continue; // MII and other block types
+			}
+			gpr_off = p + 3;
+		} else { // compact block: media, GPR, command (16 bits)
+			len = 4;
+			if (p + len > TULIP_SROM_BYTES)
+				break;
+			gpr_off = p + 1;
+		}
+		cmd = (uint16_t)(ee[gpr_off + 1] |
+				 ((uint16_t)ee[gpr_off + 2] << 8));
+		if (!chosen || (cmd & 0x4000)) { // bit 14: default media
+			dev->gpr_data = ee[gpr_off];
+			dev->csr6_media = 0x02000000u | ((cmd & 0x71u) << 18);
+			chosen = 1;
+			if (cmd & 0x4000)
+				break;
+		}
+		p += len;
+	}
+	dev->gpr_valid = chosen;
+}
+
+/* The station address from the SROM: the address width probed, the first
+ * 128 bytes read; boards following the DEC SROM format keep the address at
+ * byte 20, older ones at byte 0 (recognisable by their first 8 bytes
+ * repeating at byte 16).  Only an SROM with no address at all leaves the
+ * fallback. */
 static void tulip_read_mac(tulip_dev_t *dev)
 {
-	// 21143 SROM places the 6-byte MAC at SROM offset 20 (decimal) as
-	// three 16-bit words.  21040/21041 use offset 0.  Try the standard
-	// 21143 location (word 10/11/12) first, then fall back to offset 0.
-	uint16_t w0 = tulip_srom_read(dev, 10);
-	uint16_t w1 = tulip_srom_read(dev, 11);
-	uint16_t w2 = tulip_srom_read(dev, 12);
-	if ((w0 == 0xFFFF && w1 == 0xFFFF && w2 == 0xFFFF) ||
-	    (w0 == 0x0000 && w1 == 0x0000 && w2 == 0x0000)) {
-		w0 = tulip_srom_read(dev, 0);
-		w1 = tulip_srom_read(dev, 1);
-		w2 = tulip_srom_read(dev, 2);
+	uint8_t ee[TULIP_SROM_BYTES];
+	int addr_bits =
+		(tulip_srom_xfer(dev, 0xFF, 8) & 0x40000u) ? 8 : 6;
+	int sa = 0;
+	uint32_t sum = 0;
+
+	for (uint32_t w = 0; w < TULIP_SROM_BYTES / 2; w++) {
+		uint16_t v = (uint16_t)tulip_srom_xfer(dev, w, addr_bits);
+
+		ee[2 * w] = (uint8_t)v;
+		ee[2 * w + 1] = (uint8_t)(v >> 8);
 	}
-	// Sanity-check: a valid unicast MAC has bit 0 of the first byte == 0.
-	// If the SROM is unreadable (e.g. QEMU's emulation does not actually
-	// populate one), synthesize a locally-administered MAC so we have a
-	// stable identity — the chip itself does not enforce source-MAC
-	// matching, and we'll be running with the perfect filter bypassed
-	// (CSR6.PR set) anyway.
-	uint8_t b0 = w0 & 0xFF;
-	int valid = !((w0 == 0xFFFF && w1 == 0xFFFF && w2 == 0xFFFF) ||
-		      (w0 == 0x0000 && w1 == 0x0000 && w2 == 0x0000) ||
-		      (b0 & 0x01));
-	if (!valid) {
-		kprintf("Tulip: SROM MAC unreadable (got %04x %04x %04x), "
-			"using fallback\n",
-			w0, w1, w2);
+	tulip_csr_write(dev, TULIP_CSR9, 0); // leave SROM mode
+	for (int i = 0; i < 8; i++)
+		if (ee[i] != ee[16 + i])
+			sa = 20;
+	if (ee[0] == 0xFF && ee[1] == 0xFF && ee[2] == 0)
+		sa = 2; // multiport boards: the address follows a marker
+	for (int i = 0; i < 6; i++) {
+		dev->mac_addr[i] = ee[sa + i];
+		sum += ee[sa + i];
+	}
+	if (sum == 0 || sum == 6 * 0xFF || (dev->mac_addr[0] & 0x01)) {
+		kprintf("Tulip: SROM holds no station address, using fallback\n");
 		dev->mac_addr[0] = 0x52;
 		dev->mac_addr[1] = 0x54;
 		dev->mac_addr[2] = 0x00;
 		dev->mac_addr[3] = 0x12;
 		dev->mac_addr[4] = 0x34;
 		dev->mac_addr[5] = 0x56;
-		return;
 	}
-	dev->mac_addr[0] = w0 & 0xFF;
-	dev->mac_addr[1] = (w0 >> 8) & 0xFF;
-	dev->mac_addr[2] = w1 & 0xFF;
-	dev->mac_addr[3] = (w1 >> 8) & 0xFF;
-	dev->mac_addr[4] = w2 & 0xFF;
-	dev->mac_addr[5] = (w2 >> 8) & 0xFF;
+	tulip_parse_media(dev, ee);
 }
 
 // ============================================================================
@@ -228,8 +258,42 @@ static int tulip_reset(tulip_dev_t *dev)
 }
 
 // ============================================================================
-// RX ring init
+// Rings
 // ============================================================================
+
+/* Every RX descriptor the chip's, every TX descriptor ours, positions at
+ * the start; the ring bases into CSR3/CSR4. */
+static void tulip_rings_reset(tulip_dev_t *dev)
+{
+	for (int i = 0; i < TULIP_NUM_RX_DESC; i++) {
+		// RDES1.BS1 is 11 bits (bits 0..10) — max 2047, so 2048 would
+		// wrap to 0 and the chip would silently drop every received
+		// frame.  Use 1536 (next multiple of 32 above max ethernet
+		// frame 1518).
+		dev->rx_descs[i].ctrl = 1536 & 0x7FF;
+		if (i == TULIP_NUM_RX_DESC - 1)
+			dev->rx_descs[i].ctrl |= TULIP_RDES1_RER;
+		dev->rx_descs[i].buf1 = (uint32_t)dev->rx_bufs_phys[i];
+		dev->rx_descs[i].buf2 = 0;
+		__asm__ volatile("" ::: "memory");
+		*(volatile uint32_t *)&dev->rx_descs[i].status = TULIP_RDES0_OWN;
+	}
+	for (int i = 0; i < TULIP_NUM_TX_DESC; i++) {
+		*(volatile uint32_t *)&dev->tx_descs[i].status = 0;
+		dev->tx_descs[i].ctrl =
+			(i == TULIP_NUM_TX_DESC - 1) ? TULIP_TDES1_TER : 0;
+		dev->tx_descs[i].buf1 = (uint32_t)dev->tx_bufs_phys[i];
+		dev->tx_descs[i].buf2 = 0;
+		dev->tx_stamp[i] = 0;
+	}
+	__asm__ volatile("mfence" ::: "memory");
+	dev->rx_cur = 0;
+	dev->tx_cur = 0;
+	dev->tx_dirty = 0;
+	tulip_csr_write(dev, TULIP_CSR3, (uint32_t)dev->rx_descs_phys);
+	tulip_csr_write(dev, TULIP_CSR4, (uint32_t)dev->tx_descs_phys);
+}
+
 static int tulip_init_rx(tulip_dev_t *dev)
 {
 	uint32_t bytes = sizeof(tulip_desc_t) * TULIP_NUM_RX_DESC;
@@ -245,9 +309,7 @@ static int tulip_init_rx(tulip_dev_t *dev)
 	}
 	dev->rx_descs = (tulip_desc_t *)phys_to_virt(phys);
 	dev->rx_descs_phys = phys;
-
-	for (uint32_t i = 0; i < bytes / 8; i++)
-		((uint64_t *)dev->rx_descs)[i] = 0;
+	mm_memset(dev->rx_descs, 0, bytes);
 
 	for (int i = 0; i < TULIP_NUM_RX_DESC; i++) {
 		uint64_t bp = mm_allocate_physical_page();
@@ -257,26 +319,10 @@ static int tulip_init_rx(tulip_dev_t *dev)
 		}
 		dev->rx_bufs[i] = (uint8_t *)phys_to_virt(bp);
 		dev->rx_bufs_phys[i] = bp;
-
-		dev->rx_descs[i].status = TULIP_RDES0_OWN; // hardware owns
-		// RDES1.BS1 is 11 bits (bits 0..10) — max 2047, so 2048 would
-		// wrap to 0 and the chip would silently drop every received
-		// frame.  Use 1536 (next multiple of 32 above max ethernet
-		// frame 1518) which is what real Tulip drivers use.
-		dev->rx_descs[i].ctrl = 1536 & 0x7FF;
-		if (i == TULIP_NUM_RX_DESC - 1)
-			dev->rx_descs[i].ctrl |= TULIP_RDES1_RER;
-		dev->rx_descs[i].buf1 = (uint32_t)bp;
-		dev->rx_descs[i].buf2 = 0;
 	}
-	dev->rx_cur = 0;
-	tulip_csr_write(dev, TULIP_CSR3, (uint32_t)phys);
 	return 0;
 }
 
-// ============================================================================
-// TX ring init
-// ============================================================================
 static int tulip_init_tx(tulip_dev_t *dev)
 {
 	uint32_t bytes = sizeof(tulip_desc_t) * TULIP_NUM_TX_DESC;
@@ -292,9 +338,7 @@ static int tulip_init_tx(tulip_dev_t *dev)
 	}
 	dev->tx_descs = (tulip_desc_t *)phys_to_virt(phys);
 	dev->tx_descs_phys = phys;
-
-	for (uint32_t i = 0; i < bytes / 8; i++)
-		((uint64_t *)dev->tx_descs)[i] = 0;
+	mm_memset(dev->tx_descs, 0, bytes);
 
 	for (int i = 0; i < TULIP_NUM_TX_DESC; i++) {
 		uint64_t bp = mm_allocate_physical_page();
@@ -304,98 +348,263 @@ static int tulip_init_tx(tulip_dev_t *dev)
 		}
 		dev->tx_bufs[i] = (uint8_t *)phys_to_virt(bp);
 		dev->tx_bufs_phys[i] = bp;
-
-		dev->tx_descs[i].status = 0; // software owns
-		dev->tx_descs[i].ctrl = 0;
-		if (i == TULIP_NUM_TX_DESC - 1)
-			dev->tx_descs[i].ctrl |= TULIP_TDES1_TER;
-		dev->tx_descs[i].buf1 = (uint32_t)bp;
-		dev->tx_descs[i].buf2 = 0;
 	}
-	dev->tx_cur = 0;
-	tulip_csr_write(dev, TULIP_CSR4, (uint32_t)phys);
 	return 0;
 }
 
 // ============================================================================
-// send / link_status / shutdown
+// Transmit (net_device_t xmit hook) and setup frames
 // ============================================================================
-static int tulip_send(net_device_t *ndev, const uint8_t *data, uint16_t len)
+#define TULIP_TX_WAKE_THRESH 8
+
+static uint32_t tulip_tx_unused(const tulip_dev_t *dev)
 {
-	BUG_ON(ndev == NULL);
-	tulip_dev_t *dev = (tulip_dev_t *)ndev->driver_data;
-	BUG_ON(dev == NULL);
-	if (len > TULIP_TX_BUF_SIZE)
-		return -1;
+	return nic_ring_unused(dev->tx_cur, dev->tx_dirty, TULIP_NUM_TX_DESC);
+}
 
-	// Serialize across CPUs: tx_cur, descriptor slot, CSR1 poll-demand.
-	uint64_t txflags;
-	spin_lock_irqsave(&dev->tx_lock, &txflags);
-
+/* Hand descriptor tx_cur (buffer filled, `ctrl' = TDES1 without the ring
+ * end bit) to the chip and kick the transmit process.  Caller holds
+ * tx_lock. */
+static void tulip_tx_post_locked(tulip_dev_t *dev, uint32_t ctrl)
+{
 	uint16_t slot = dev->tx_cur;
-	WARN_ON(slot >=
-		TULIP_NUM_TX_DESC); /* tx_cur out of TX ring bounds - wrap logic corrupted */
 	volatile tulip_desc_t *desc = &dev->tx_descs[slot];
 
-	if (desc->status & TULIP_TDES0_OWN) {
-		ndev->tx_errors++;
-		spin_unlock_irqrestore(&dev->tx_lock, txflags);
-		return -1;
-	}
-
-	uint16_t tx_len = (len < 60) ? 60 : len;
-	// rep movs — was a byte loop under tx_lock IRQs-off.
-	mm_memcpy(dev->tx_bufs[slot], data, len);
-	if (tx_len > len)
-		mm_memset(dev->tx_bufs[slot] + len, 0, tx_len - len);
-
-	uint32_t ctrl = TULIP_TDES1_FS | TULIP_TDES1_LS | TULIP_TDES1_IC;
-	// TDES1.BS1 is 11 bits — anything >= 2048 would wrap.  Our TX
-	// buffer is one page and we cap len at TULIP_TX_BUF_SIZE above,
-	// and ethernet frames are <= 1518, so this never happens in
-	// practice — but mask for safety.
-	ctrl |= (uint32_t)(tx_len & 0x7FF); // BS1 (size of buffer 1)
-	WARN_ON(tx_len >=
-		2048); /* TDES1.BS1 is 11-bit — length >= 2048 would wrap to 0 and silently drop the frame */
 	if (slot == TULIP_NUM_TX_DESC - 1)
 		ctrl |= TULIP_TDES1_TER;
 	desc->ctrl = ctrl;
 	desc->buf1 = (uint32_t)dev->tx_bufs_phys[slot];
 	desc->buf2 = 0;
-
 	__asm__ volatile("mfence" ::: "memory");
 	desc->status = TULIP_TDES0_OWN; // hand off to hardware
 	__asm__ volatile("mfence" ::: "memory");
+	{
+		uint64_t now = timer_ticks();
 
-	// Kick TX poll
-	tulip_csr_write(dev, TULIP_CSR1, 0xFFFFFFFFu);
+		dev->tx_stamp[slot] = now ? now : 1;
+	}
+	dev->tx_cur = (uint16_t)((slot + 1) % TULIP_NUM_TX_DESC);
+	tulip_csr_write(dev, TULIP_CSR1, 0xFFFFFFFFu); // transmit poll demand
+}
 
-	dev->tx_cur = (slot + 1) % TULIP_NUM_TX_DESC;
-	ndev->tx_packets++;
-	ndev->tx_bytes += len;
-	spin_unlock_irqrestore(&dev->tx_lock, txflags);
+/* Reclaim descriptors the chip handed back, counting the errors it
+ * reported.  Caller holds tx_lock. */
+static void tulip_tx_clean_locked(tulip_dev_t *dev)
+{
+	while (dev->tx_dirty != dev->tx_cur) {
+		volatile tulip_desc_t *d = &dev->tx_descs[dev->tx_dirty];
+		uint32_t st = d->status;
+
+		if (st & TULIP_TDES0_OWN)
+			break;
+		if (!(d->ctrl & TULIP_TDES1_SET)) {
+			if (st & TULIP_TDES0_ES) {
+				dev->net_dev.tx_errors++;
+				if (st & TULIP_TDES0_UF)
+					dev->st_tx_fifo++;
+				if (st & (TULIP_TDES0_NC | TULIP_TDES0_LO))
+					dev->st_tx_carrier++;
+				if (st & TULIP_TDES0_LC)
+					dev->st_tx_window++;
+				if (st & TULIP_TDES0_EC)
+					dev->st_tx_aborted++;
+			}
+			dev->st_colls += (st >> TULIP_TDES0_CC_SHIFT) & 0xF;
+		}
+		dev->tx_stamp[dev->tx_dirty] = 0;
+		dev->tx_dirty = (uint16_t)((dev->tx_dirty + 1) % TULIP_NUM_TX_DESC);
+	}
+	if (netif_queue_stopped(&dev->net_dev) &&
+	    tulip_tx_unused(dev) >= TULIP_TX_WAKE_THRESH)
+		netif_wake_queue(&dev->net_dev);
+}
+
+/* The receive filter: a setup frame (perfect filtering of up to 14
+ * multicast addresses plus broadcast and ours, the 512-bit hash beyond
+ * that) through the transmit ring, and CSR6's pass-all-multicast and
+ * promiscuous bits.  Caller holds tx_lock.  Returns -1 when the ring has
+ * no room (try again later). */
+static int tulip_set_filter_locked(tulip_dev_t *dev)
+{
+	uint8_t mc[NETDEV_MC_MAX][6];
+	int all = 0, n = 0;
+	uint32_t flags = 0, ctrl;
+
+	if (tulip_tx_unused(dev) == 0) {
+		tulip_tx_clean_locked(dev);
+		if (tulip_tx_unused(dev) == 0)
+			return -1;
+	}
+	if (dev->net_dev.core_ready) {
+		n = dev_mc_snapshot(&dev->net_dev, mc, NETDEV_MC_MAX, &all);
+		flags = __atomic_load_n(&dev->net_dev.flags, __ATOMIC_ACQUIRE);
+	}
+	uint32_t *frame = (uint32_t *)dev->tx_bufs[dev->tx_cur];
+
+	if (n <= NIC_TULIP_PERFECT_MAX) {
+		nic_tulip_setup_perfect(frame, dev->mac_addr,
+					(const uint8_t(*)[6])mc, n);
+		ctrl = TULIP_TDES1_SET | NIC_TULIP_SETUP_LEN;
+	} else {
+		nic_tulip_setup_hash(frame, dev->mac_addr,
+				     (const uint8_t(*)[6])mc, n);
+		ctrl = TULIP_TDES1_SET | TULIP_TDES1_FT0 | NIC_TULIP_SETUP_LEN;
+	}
+	tulip_tx_post_locked(dev, ctrl);
+
+	dev->csr6 &= ~(TULIP_CSR6_PR | TULIP_CSR6_PM);
+	if (flags & IFF_PROMISC)
+		dev->csr6 |= TULIP_CSR6_PR | TULIP_CSR6_PM;
+	else if (all || (flags & IFF_ALLMULTI))
+		dev->csr6 |= TULIP_CSR6_PM;
+	tulip_csr_write(dev, TULIP_CSR6, dev->csr6);
 	return 0;
+}
+
+static int tulip_xmit(sk_buff_t *skb, net_device_t *ndev)
+{
+	tulip_dev_t *dev = (tulip_dev_t *)ndev->driver_data;
+	uint32_t len = skb->len;
+	uint64_t f;
+
+	BUG_ON(dev == NULL);
+	if (len == 0 || len > 1536) { // TDES1.BS1: 11 bits
+		ndev->tx_dropped++;
+		skb_put(skb);
+		return NETDEV_TX_OK;
+	}
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	if (tulip_tx_unused(dev) == 0) {
+		tulip_tx_clean_locked(dev);
+		if (tulip_tx_unused(dev) == 0) {
+			netif_stop_queue(ndev);
+			spin_unlock_irqrestore(&dev->tx_lock, f);
+			return NETDEV_TX_BUSY;
+		}
+	}
+	uint32_t tx_len = (len < 60) ? 60 : len;
+	uint8_t *buf = dev->tx_bufs[dev->tx_cur];
+
+	mm_memcpy(buf, skb->data, len);
+	if (tx_len > len)
+		mm_memset(buf + len, 0, tx_len - len);
+	tulip_tx_post_locked(dev, TULIP_TDES1_FS | TULIP_TDES1_LS |
+					  TULIP_TDES1_IC | (tx_len & 0x7FF));
+	ndev->tx_packets++;
+	ndev->tx_bytes += tx_len;
+	if (tulip_tx_unused(dev) == 0)
+		netif_stop_queue(ndev);
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+	skb_put(skb);
+	return NETDEV_TX_OK;
+}
+
+/* Interrupt sources: all handled; the poll owns RX/TX completion and
+ * receive-unavailable while it runs. */
+#define TULIP_CSR7_ALL                                                   \
+	(TULIP_CSR7_RIE | TULIP_CSR7_TIE | TULIP_CSR7_RUE | TULIP_CSR7_LFE | \
+	 TULIP_CSR7_LPE | TULIP_CSR7_NIE | TULIP_CSR7_AIE | TULIP_CSR7_FBE)
+#define TULIP_CSR7_NAPI (TULIP_CSR7_RIE | TULIP_CSR7_TIE | TULIP_CSR7_RUE)
+
+/* Program the reset chip: rings, the 21140 general-purpose port, the
+ * filter (setup frame), receiver and transmitter on, interrupts.  Bring-up
+ * and the timeout restart (tx_lock held there). */
+static void tulip_hw_start(tulip_dev_t *dev)
+{
+	tulip_rings_reset(dev);
+	if (dev->gpr_valid) {
+		// direction first (bit 8 makes the write a direction write)
+		tulip_csr_write(dev, TULIP_CSR12, 0x100u | dev->gpr_dir);
+		tulip_csr_write(dev, TULIP_CSR12, dev->gpr_data);
+	}
+	/* Full duplex, store-and-forward, the SROM's port bits on the
+	 * 21140.  Receiver and transmitter start; the setup frame queued
+	 * first is what the transmit process takes first, so the address
+	 * filter is programmed before anything is sent -- no promiscuous
+	 * mode needed for the broadcast DHCP replies. */
+	dev->csr6 = TULIP_CSR6_SR | TULIP_CSR6_ST | TULIP_CSR6_FD |
+		    TULIP_CSR6_SF | dev->csr6_media;
+	(void)tulip_set_filter_locked(dev);
+	tulip_csr_write(dev, TULIP_CSR5, 0xFFFFFFFFu); // stale status
+	tulip_csr_write(dev, TULIP_CSR7, TULIP_CSR7_ALL);
+}
+
+// ============================================================================
+// Link, statistics, watchdog
+// ============================================================================
+static int tulip_csr12_link(tulip_dev_t *dev)
+{
+	/* Only the 21041 and 21142/21143 have link status bits in CSR12
+	 * (SIA status).  On the 21140 CSR12 is the general-purpose port --
+	 * it reads back what tulip_hw_start wrote there -- and the 21040's
+	 * SIA has another layout: no link indication, the link counts as
+	 * up. */
+	if (dev->device_id != TULIP_DEV_DC21142_43 &&
+	    dev->device_id != TULIP_DEV_DC21041)
+		return 1;
+	uint32_t sia = tulip_csr_read(dev, TULIP_CSR12);
+	// CSR12.LS10 / LS100 are active-low link-fail bits on the 21143:
+	// link is up if either of those is 0 in the appropriate medium.
+	return (!(sia & TULIP_CSR12_LS10) || !(sia & TULIP_CSR12_LS100)) ? 1 :
+									    0;
+}
+
+/* The carrier follows CSR12 once it has reported a link at all. */
+static void tulip_link_check(tulip_dev_t *dev)
+{
+	int now_up = tulip_csr12_link(dev);
+
+	if (now_up)
+		dev->link_seen = 1;
+	if (now_up == dev->link_up)
+		return;
+	dev->link_up = now_up;
+	kprintf("Tulip: Link %s\n", now_up ? "UP" : "DOWN");
+	if (now_up) {
+		netif_carrier_on(&dev->net_dev);
+	} else {
+		dhcp_invalidate(&dev->net_dev);
+		if (dev->link_seen)
+			netif_carrier_off(&dev->net_dev);
+	}
 }
 
 static int tulip_link_status(net_device_t *ndev)
 {
 	tulip_dev_t *dev = (tulip_dev_t *)ndev->driver_data;
-	uint32_t sia = tulip_csr_read(dev, TULIP_CSR12);
-	// CSR12.LS10 / LS100 are active-low link-fail bits on the 21143:
-	// link is up if either of those is 0 in the appropriate medium.
-	// We treat "either bit clear" as link-up — close enough for the
-	// generic case, and exactly what QEMU emulates.
-	int now_up = (!(sia & TULIP_CSR12_LS10) || !(sia & TULIP_CSR12_LS100)) ?
-			     1 :
-			     0;
-	int was_up = dev->link_up;
-	if (now_up != was_up) {
-		dev->link_up = now_up;
-		kprintf("Tulip: Link %s\n", now_up ? "UP" : "DOWN");
-		if (!now_up)
-			dhcp_invalidate(ndev);
-	}
-	return now_up;
+	int up = tulip_csr12_link(dev);
+
+	if (up != dev->link_up)
+		net_housekeeping_kick();
+	return up;
+}
+
+static void tulip_set_rx_mode(net_device_t *ndev)
+{
+	tulip_dev_t *dev = (tulip_dev_t *)ndev->driver_data;
+
+	__atomic_store_n(&dev->rx_mode_pending, 1, __ATOMIC_RELEASE);
+	net_housekeeping_kick();
+}
+
+static void tulip_get_stats64(net_device_t *ndev, struct net_device_stats64 *s)
+{
+	tulip_dev_t *dev = (tulip_dev_t *)ndev->driver_data;
+
+	s->rx_crc_errors = dev->st_rx_crc;
+	s->rx_length_errors = dev->st_rx_long;
+	s->rx_missed_errors = dev->st_missed;
+	s->tx_fifo_errors = dev->st_tx_fifo;
+	s->tx_carrier_errors = dev->st_tx_carrier;
+	s->tx_aborted_errors = dev->st_tx_aborted;
+	s->collisions = dev->st_colls;
+}
+
+static void tulip_tx_timeout(net_device_t *ndev)
+{
+	tulip_dev_t *dev = (tulip_dev_t *)ndev->driver_data;
+
+	__atomic_store_n(&dev->reset_pending, 1, __ATOMIC_RELEASE);
 }
 
 // Quiesce before ACPI S5: software reset (clears CSR6.ST/SR), mask CSR7,
@@ -431,15 +640,134 @@ static void tulip_shutdown(net_device_t *ndev)
 	}
 }
 
+// Network housekeeping softirq, CPU 0, ~10 Hz and when kicked.
+static void tulip_watchdog(net_device_t *ndev)
+{
+	tulip_dev_t *dev = (tulip_dev_t *)ndev->driver_data;
+	uint64_t f, now = timer_ticks();
+	int hang = 0;
+
+	if (!dev || !g_tulip_initialized)
+		return;
+	tulip_link_check(dev);
+	// CSR8: missed frames (bits 15:0), cleared on read
+	dev->st_missed += tulip_csr_read(dev, TULIP_CSR8) & 0xFFFF;
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	tulip_tx_clean_locked(dev);
+	if (__atomic_load_n(&dev->rx_mode_pending, __ATOMIC_ACQUIRE) &&
+	    tulip_set_filter_locked(dev) == 0)
+		__atomic_store_n(&dev->rx_mode_pending, 0, __ATOMIC_RELEASE);
+	if (dev->tx_dirty != dev->tx_cur && dev->tx_stamp[dev->tx_dirty] &&
+	    now - dev->tx_stamp[dev->tx_dirty] > net_ms_to_ticks(5000))
+		hang = 1;
+	if (hang || __atomic_exchange_n(&dev->reset_pending, 0,
+					__ATOMIC_ACQ_REL)) {
+		/* Transmit timeout or fatal bus error: reset the chip and
+		 * program it anew; what the rings held is dropped. */
+		kprintf("Tulip: transmit timed out or bus error, resetting the chip\n");
+		dev->net_dev.tx_errors +=
+			(uint32_t)((dev->tx_cur + TULIP_NUM_TX_DESC -
+				    dev->tx_dirty) %
+				   TULIP_NUM_TX_DESC);
+		tulip_csr_write(dev, TULIP_CSR7, 0);
+		if (tulip_reset(dev) == 0)
+			tulip_hw_start(dev);
+		if (netif_queue_stopped(&dev->net_dev))
+			netif_wake_queue(&dev->net_dev);
+		spin_unlock_irqrestore(&dev->tx_lock, f);
+		napi_schedule(&dev->napi);
+		return;
+	}
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+}
+
+// ============================================================================
+// Receive (NAPI poll)
+// ============================================================================
+static int tulip_rx_clean(tulip_dev_t *dev, int budget)
+{
+	net_device_t *nd = &dev->net_dev;
+	int work = 0;
+
+	while (work < budget) {
+		uint16_t slot = dev->rx_cur;
+		volatile tulip_desc_t *desc = &dev->rx_descs[slot];
+		uint32_t st = desc->status;
+
+		if (st & TULIP_RDES0_OWN)
+			break;
+		if (!(st & TULIP_RDES0_ES) && (st & TULIP_RDES0_FS) &&
+		    (st & TULIP_RDES0_LS)) {
+			uint32_t len = (st & TULIP_RDES0_FL_MASK) >>
+				       TULIP_RDES0_FL_SHIFT;
+			// Hardware reports FCS-included length; strip 4 bytes
+			if (len > 4)
+				len -= 4;
+			if (len >= 14 && len <= 1536) {
+				sk_buff_t *skb = skb_alloc(len);
+
+				if (skb) {
+					const uint8_t *b = dev->rx_bufs[slot];
+
+					skb->dev = nd;
+					mm_memcpy(skb_append(skb, len), b, len);
+					nd->rx_packets++;
+					nd->rx_bytes += len;
+					if (b[0] & 1)
+						nd->multicast++;
+					napi_gro_receive(&dev->napi, skb);
+				} else {
+					nd->rx_dropped++;
+				}
+			} else {
+				nd->rx_errors++;
+				dev->st_rx_long++;
+			}
+		} else {
+			nd->rx_errors++;
+			if (st & TULIP_RDES0_CE)
+				dev->st_rx_crc++;
+			if (st & TULIP_RDES0_TL)
+				dev->st_rx_long++;
+		}
+		// Hand back to hardware
+		desc->status = TULIP_RDES0_OWN;
+		dev->rx_cur = (uint16_t)((slot + 1) % TULIP_NUM_RX_DESC);
+		work++;
+	}
+	return work;
+}
+
+static int tulip_poll(struct napi_struct *n, int budget)
+{
+	tulip_dev_t *dev = (tulip_dev_t *)n->dev->driver_data;
+	uint64_t f;
+	int work;
+
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	tulip_tx_clean_locked(dev);
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+	work = tulip_rx_clean(dev, budget);
+	/* The receiver suspends when it finds no descriptor of its own
+	 * (RU); with descriptors handed back, a poll demand restarts it. */
+	if (work || __atomic_exchange_n(&dev->ru_seen, 0, __ATOMIC_ACQ_REL))
+		tulip_csr_write(dev, TULIP_CSR2, 0xFFFFFFFFu);
+	if (work < budget && napi_complete_done(n, work))
+		tulip_csr_write(dev, TULIP_CSR7, TULIP_CSR7_ALL);
+	return work;
+}
+
 // ============================================================================
 // IRQ handler
 // ============================================================================
-void tulip_irq_handler(void)
+/* Returns 1 when the interrupt was this chip's, 0 otherwise (shared legacy
+ * line); the dispatcher acknowledges the local APIC.  Receive/transmit
+ * work goes to the NAPI poll with those sources masked in CSR7 until it
+ * is done; link changes and errors to the watchdog. */
+int tulip_irq_handler(void)
 {
-	if (!g_tulip_initialized) {
-		lapic_eoi();
-		return;
-	}
+	if (!g_tulip_initialized)
+		return 0;
 
 	{
 		extern void entropy_add_interrupt_timing(uint64_t extra);
@@ -451,68 +779,28 @@ void tulip_irq_handler(void)
 	tulip_dev_t *dev = &g_tulip;
 	BUG_ON(dev == NULL);
 	uint32_t sr = tulip_csr_read(dev, TULIP_CSR5);
-	if (sr == 0) {
-		lapic_eoi();
-		return;
+	/* Ours when an enabled source is pending: the chip sums those into
+	 * the normal/abnormal summary bits. */
+	if (!(sr & (TULIP_CSR5_NIS | TULIP_CSR5_AIS)) || sr == 0xFFFFFFFFu)
+		return 0;
+	// Acknowledge the interrupt bits by writing 1s back
+	tulip_csr_write(dev, TULIP_CSR5, sr & TULIP_CSR5_INT_MASK);
+
+	if (sr & (TULIP_CSR5_LNF | TULIP_CSR5_LNP))
+		net_housekeeping_kick();
+	if (sr & TULIP_CSR5_RU)
+		__atomic_store_n(&dev->ru_seen, 1, __ATOMIC_RELEASE);
+	if (sr & TULIP_CSR5_FBE) {
+		__atomic_store_n(&dev->reset_pending, 1, __ATOMIC_RELEASE);
+		net_housekeeping_kick();
 	}
-	// Acknowledge by writing 1s back
-	tulip_csr_write(dev, TULIP_CSR5, sr);
-
-	if (sr & (TULIP_CSR5_LNF | TULIP_CSR5_LNP)) {
-		uint32_t sia = tulip_csr_read(dev, TULIP_CSR12);
-		int now_up = (!(sia & TULIP_CSR12_LS10) ||
-			      !(sia & TULIP_CSR12_LS100)) ?
-				     1 :
-				     0;
-		int was_up = dev->link_up;
-		dev->link_up = now_up;
-		if (now_up != was_up) {
-			kprintf("Tulip: Link %s\n", now_up ? "UP" : "DOWN");
-			if (!now_up)
-				dhcp_invalidate(&dev->net_dev);
-		}
+	if (sr & (TULIP_CSR5_RI | TULIP_CSR5_RU | TULIP_CSR5_TI |
+		  TULIP_CSR5_UNF | TULIP_CSR5_TPS)) {
+		tulip_csr_write(dev, TULIP_CSR7,
+				TULIP_CSR7_ALL & ~TULIP_CSR7_NAPI);
+		napi_schedule(&dev->napi);
 	}
-
-	if (sr & TULIP_CSR5_RI) {
-		// Process all completed RX descriptors
-		while (1) {
-			uint16_t slot = dev->rx_cur;
-			WARN_RATELIMIT(
-				slot >= TULIP_NUM_RX_DESC,
-				"Tulip: rx_cur=%u out of RX ring bounds (%u) - ring wrap corrupted",
-				slot, TULIP_NUM_RX_DESC);
-			volatile tulip_desc_t *desc = &dev->rx_descs[slot];
-			if (desc->status & TULIP_RDES0_OWN)
-				break;
-
-			uint32_t st = desc->status;
-			if (!(st & TULIP_RDES0_ES) && (st & TULIP_RDES0_FS) &&
-			    (st & TULIP_RDES0_LS)) {
-				uint16_t len =
-					(uint16_t)((st & TULIP_RDES0_FL_MASK) >>
-						   TULIP_RDES0_FL_SHIFT);
-				// Hardware reports FCS-included length; strip 4 bytes
-				if (len > 4)
-					len -= 4;
-				if (len > 0 && len <= TULIP_RX_BUF_SIZE) {
-					net_rx_packet(&dev->net_dev,
-						      dev->rx_bufs[slot], len);
-				} else {
-					dev->net_dev.rx_errors++;
-				}
-			} else {
-				dev->net_dev.rx_errors++;
-			}
-
-			// Hand back to hardware
-			desc->status = TULIP_RDES0_OWN;
-			dev->rx_cur = (slot + 1) % TULIP_NUM_RX_DESC;
-		}
-		// Kick RX poll in case the chip suspended
-		tulip_csr_write(dev, TULIP_CSR2, 0xFFFFFFFFu);
-	}
-
-	lapic_eoi();
+	return 1;
 }
 
 // ============================================================================
@@ -527,31 +815,20 @@ static int tulip_resolve_bar(tulip_dev_t *dev)
 		dev->io_base = (uint16_t)(bar0 & 0xFFFC);
 		return 0;
 	}
-	// Memory-mapped BAR
+	// Memory-mapped BAR, strictly uncached
 	dev->use_mmio = 1;
 	uint64_t phys = bar0 & 0xFFFFFFF0ULL;
 	if ((bar0 & 0x06) == 0x04)
 		phys |= ((uint64_t)dev->pci_dev->bar[1]) << 32;
 
 	dev->mmio_phys = phys;
-	uint32_t size = 256; // 16 CSRs * 8 bytes ample, but map a full page
-	uint64_t virt = (uint64_t)phys_to_virt(phys);
-	uint32_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-	if (pages == 0)
-		pages = 1;
-	for (uint32_t i = 0; i < pages; i++) {
-		uint64_t pp =
-			(phys & ~((uint64_t)PAGE_SIZE - 1)) + i * PAGE_SIZE;
-		uint64_t pv =
-			(virt & ~((uint64_t)PAGE_SIZE - 1)) + i * PAGE_SIZE;
-		if (!mm_is_page_mapped(pv)) {
-			mm_map_page(pv, pp,
-				    PAGE_PRESENT | PAGE_WRITABLE |
-					    PAGE_CACHE_DISABLE |
-					    PAGE_WRITE_THROUGH);
-		}
+	uint64_t page = phys & ~((uint64_t)PAGE_SIZE - 1);
+	uint64_t virt = mm_map_device_mmio(page, 1);
+	if (!virt) {
+		kprintf("Tulip: cannot map the CSR BAR\n");
+		return -1;
 	}
-	dev->mmio_base = (volatile uint8_t *)virt;
+	dev->mmio_base = (volatile uint8_t *)(virt + (phys - page));
 	return 0;
 }
 
@@ -575,6 +852,7 @@ void tulip_init(void)
 		tulip_dev_t *dev = &g_tulip;
 		dev->pci_dev = &devs[i];
 		dev->device_id = devs[i].device_id;
+		dev->tx_lock = (spinlock_t)SPINLOCK_INIT("tulip_tx");
 
 		pci_enable_busmaster_mem(dev->pci_dev);
 
@@ -672,7 +950,6 @@ void tulip_init(void)
 
 		// Init net_device fields BEFORE enabling chip-side IRQs
 		dev->net_dev.lock = (spinlock_t)SPINLOCK_INIT("tulip");
-		dev->tx_lock = (spinlock_t)SPINLOCK_INIT("tulip_tx");
 		dev->net_dev.rx_packets = 0;
 		dev->net_dev.tx_packets = 0;
 		dev->net_dev.rx_bytes = 0;
@@ -680,32 +957,16 @@ void tulip_init(void)
 		dev->net_dev.rx_errors = 0;
 		dev->net_dev.tx_errors = 0;
 		dev->net_dev.rx_dropped = 0;
+		dev->net_dev.driver_data = dev;
+		// the poll exists before the handler can be called
+		netif_napi_add(&dev->net_dev, &dev->napi, tulip_poll,
+			       NAPI_POLL_WEIGHT);
+		napi_enable(&dev->napi);
 		g_tulip_initialized = 1;
 
-		// Start RX + TX (full duplex, store-and-forward).  Set CSR6.PR
-		// (promiscuous) so the chip's perfect/hash address filter is
-		// bypassed — we have not (yet) sent a Setup Frame to program
-		// the filter, and without one the 21143 drops every incoming
-		// packet (including broadcast DHCP OFFERs).  In promiscuous mode
-		// the chip delivers all frames to the host and the kernel's
-		// ethernet layer does the per-MAC matching itself.
-		uint32_t csr6 = TULIP_CSR6_SR | TULIP_CSR6_ST | TULIP_CSR6_FD |
-				TULIP_CSR6_SF | TULIP_CSR6_PR;
-		tulip_csr_write(dev, TULIP_CSR6, csr6);
-
-		// Unmask interrupts: RX, TX, link change, normal/abnormal summaries
-		tulip_csr_write(dev, TULIP_CSR7,
-				TULIP_CSR7_RIE | TULIP_CSR7_TIE |
-					TULIP_CSR7_RUE | TULIP_CSR7_LFE |
-					TULIP_CSR7_LPE | TULIP_CSR7_NIE |
-					TULIP_CSR7_AIE);
-
 		// Initial link probe
-		uint32_t sia = tulip_csr_read(dev, TULIP_CSR12);
-		dev->link_up = (!(sia & TULIP_CSR12_LS10) ||
-				!(sia & TULIP_CSR12_LS100)) ?
-				       1 :
-				       0;
+		dev->link_up = tulip_csr12_link(dev);
+		dev->link_seen = dev->link_up;
 		kprintf("Tulip: Link %s\n", dev->link_up ? "UP" : "DOWN");
 
 		dev->net_dev.name = "eth0";
@@ -716,12 +977,29 @@ void tulip_init(void)
 		dev->net_dev.netmask = 0;
 		dev->net_dev.gateway = 0;
 		dev->net_dev.dns_server = 0;
-		dev->net_dev.send = tulip_send;
+		dev->net_dev.send = NULL;
+		dev->net_dev.xmit = tulip_xmit;
 		dev->net_dev.link_status = tulip_link_status;
 		dev->net_dev.shutdown = tulip_shutdown;
-		dev->net_dev.driver_data = dev;
+		dev->net_dev.watchdog = tulip_watchdog;
+		dev->net_dev.tx_timeout = tulip_tx_timeout;
+		dev->net_dev.set_rx_mode = tulip_set_rx_mode;
+		dev->net_dev.get_stats64 = tulip_get_stats64;
 
 		net_register(&dev->net_dev);
+
+		/* Rings, general-purpose port, setup frame, RX + TX on,
+		 * interrupts unmasked. */
+		{
+			uint64_t f;
+
+			spin_lock_irqsave(&dev->tx_lock, &f);
+			tulip_hw_start(dev);
+			spin_unlock_irqrestore(&dev->tx_lock, f);
+		}
+		if (dev->gpr_valid)
+			kprintf("Tulip: SROM media: GPR dir %02x data %02x, CSR6 %08x\n",
+				dev->gpr_dir, dev->gpr_data, dev->csr6_media);
 
 		kprintf("Tulip: Driver initialized successfully\n");
 		return;

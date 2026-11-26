@@ -1,0 +1,16 @@
+# The peer shuts its window with a pure window update (same sequence, same
+# ACK): it is believed -- the queued data waits and window probes go out.
+# Copyright (C) 2026 The LikeOS Project
+0.000 socket s stream
+0.000 bind s 8080
+0.000 listen s 16
+0.100 < S 0:0(0) win 65535 <mss 1460,sackOK,TS val 100 ecr 0,nop,wscale 7>
+0.100 > S. 0:0(0) ack 1 win * <mss 1460,sackOK,TS val * ecr 100,nop,wscale *>
+0.200 < . 1:1(0) ack 1 win 512 <nop,nop,TS val 200 ecr echo>
+0.200 accept s c
+0.300 < . 1:1(0) ack 1 win 0 <nop,nop,TS val 300 ecr echo>
+0.400 send c 100 = 100
+0.700 > . 0:0(0) ack 1 win * <nop,nop,TS val * ecr 300>
+0.750 < . 1:1(0) ack 1 win 512 <nop,nop,TS val 750 ecr echo>
+0.750 > P. 1:101(100) ack 1 win * <nop,nop,TS val * ecr 750>
+0.800 < . 1:1(0) ack 101 win 512 <nop,nop,TS val 800 ecr echo>

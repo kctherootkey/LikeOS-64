@@ -284,6 +284,40 @@ int64_t sys_set_tid_address(uint64_t tidptr)
 	return cur->id;
 }
 
+// prctl options handled by the kernel
+#define PR_GET_DUMPABLE 3
+#define PR_SET_DUMPABLE 4
+
+/* SYS_PRCTL - process control.  The kernel side covers the dumpable state:
+ * a process that dropped privileges with setuid() is not dumpable
+ * (cred_drop_dumpable_on_change), and asks to be traceable by its new owner
+ * again with PR_SET_DUMPABLE 1 -- or, holding secrets, makes itself
+ * untraceable with PR_SET_DUMPABLE 0.  Only 0 and 1 may be set.  Options the
+ * kernel does not know are EINVAL; the C library answers the ones that need
+ * no kernel state itself. */
+int64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
+		  uint64_t arg4, uint64_t arg5)
+{
+	task_t *cur = sched_current();
+
+	(void)arg3;
+	(void)arg4;
+	(void)arg5;
+	if (!cur)
+		return -ESRCH;
+	switch (option) {
+	case PR_GET_DUMPABLE:
+		return task_dumpable(cur) ? 1 : 0;
+	case PR_SET_DUMPABLE:
+		if (arg2 > 1)
+			return -EINVAL;
+		task_set_dumpable(cur, (int)arg2);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 // arch_prctl codes
 #define ARCH_SET_GS 0x1001
 #define ARCH_SET_FS 0x1002

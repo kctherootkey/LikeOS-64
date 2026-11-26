@@ -8,7 +8,10 @@
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/dev/nic/rtl8139.h>
+#include <kernel/dev/nic/nic_util.h>
 #include <kernel/net/net.h>
+#include <kernel/net/netdevice.h>
+#include <kernel/net/skb.h>
 #include <kernel/hal/pci.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
@@ -195,86 +198,313 @@ static int rtl_init_tx(rtl8139_dev_t *dev)
 		}
 		dev->tx_bufs[i] = (uint8_t *)phys_to_virt(phys);
 		dev->tx_bufs_phys[i] = phys;
-		rtl_write32(dev, RTL_TSAD0 + i * 4, (uint32_t)phys);
 	}
-	dev->tx_cur = 0;
 	return 0;
 }
 
-// ============================================================================
-// Send a single Ethernet frame (net_device_t callback)
-// ============================================================================
-static int rtl8139_send(net_device_t *ndev, const uint8_t *data, uint16_t len)
+// Interrupt sources the driver handles, and those it keeps while the
+// NAPI poll runs (receive and transmit completion are the poll's).
+#define RTL_INTR_MASK                                                  \
+	(RTL_INT_SERR | RTL_INT_TIMEOUT | RTL_INT_PUN | RTL_INT_RXOVW | \
+	 RTL_INT_FOVW | RTL_INT_TER | RTL_INT_TOK | RTL_INT_RER |      \
+	 RTL_INT_ROK)
+#define RTL_INTR_NAPI                                                  \
+	(RTL_INT_RXOVW | RTL_INT_FOVW | RTL_INT_TER | RTL_INT_TOK |    \
+	 RTL_INT_RER | RTL_INT_ROK)
+// Early TX threshold to start with: 256 bytes (8 x 32)
+#define RTL_TX_FLAG_START (8u << RTL_TSD_ERTXTH_SHIFT)
+
+/* The receive filter: broadcast and our address always, multicast through
+ * the 64-bit hash in MAR0..7, everything with IFF_PROMISC.  CPU 0
+ * (watchdog / bring-up). */
+static void rtl_set_rx_filter(rtl8139_dev_t *dev)
 {
-	BUG_ON(ndev == NULL);
+	uint32_t mar[2] = { 0, 0 };
+	uint32_t mode = RTL_RCR_AB | RTL_RCR_APM | RTL_RCR_AM;
+	uint32_t flags = 0;
+	uint8_t mc[NETDEV_MC_MAX][6];
+	int all = 0, n = 0;
+
+	if (dev->net_dev.core_ready) {
+		n = dev_mc_snapshot(&dev->net_dev, mc, NETDEV_MC_MAX, &all);
+		flags = __atomic_load_n(&dev->net_dev.flags, __ATOMIC_ACQUIRE);
+	}
+	if (flags & IFF_PROMISC) {
+		mode |= RTL_RCR_AAP;
+		mar[0] = mar[1] = 0xFFFFFFFFu;
+	} else if (all || (flags & IFF_ALLMULTI)) {
+		mar[0] = mar[1] = 0xFFFFFFFFu;
+	} else {
+		for (int i = 0; i < n; i++) {
+			uint32_t bit = nic_mc_hash64_be(mc[i]);
+
+			mar[bit >> 5] |= 1u << (bit & 31);
+		}
+	}
+	dev->rx_config = RTL_RCR_WRAP | RTL_RCR_RBLEN_32K |
+			 RTL_RCR_MXDMA_UNLIM | mode;
+	rtl_write32(dev, RTL_RCR, dev->rx_config);
+	rtl_write32(dev, RTL_MAR0, mar[0]);
+	rtl_write32(dev, RTL_MAR0 + 4, mar[1]);
+}
+
+/* Program the reset chip: ring addresses, receive and transmit config,
+ * the filter, the read pointer, the interrupt mask, RX/TX on.  Both rings
+ * start empty.  Bring-up and the TX-timeout restart (watchdog, tx_lock
+ * held by the caller there). */
+static void rtl_hw_start(rtl8139_dev_t *dev)
+{
+	rtl_write32(dev, RTL_RBSTART, (uint32_t)dev->rx_buf_phys);
+	for (int i = 0; i < RTL8139_NUM_TX_DESC; i++) {
+		rtl_write32(dev, RTL_TSAD0 + i * 4,
+			    (uint32_t)dev->tx_bufs_phys[i]);
+		dev->tx_stamp[i] = 0;
+	}
+	dev->tx_cur = dev->tx_dirty = 0;
+	dev->tx_flag = RTL_TX_FLAG_START;
+	dev->rx_offset = 0;
+	dev->rx_early_tick = 0;
+
+	// RX and TX on before their configuration (the chip ignores it
+	// otherwise), as the datasheet's sequence has it
+	rtl_write8(dev, RTL_CR, RTL_CR_TE | RTL_CR_RE);
+	// 32K ring with WRAP (a frame past the end goes on into the pad --
+	// the chip ignores WRAP at 64K, see rtl8139.h), unlimited DMA burst
+	rtl_set_rx_filter(dev);
+	// TX: max DMA burst 1024 B, normal IFG
+	rtl_write32(dev, RTL_TCR, RTL_TCR_MXDMA_1024 | RTL_TCR_IFG_NORMAL);
+	rtl_write32(dev, RTL_MPC, 0); // missed packet counter
+	rtl_write16(dev, RTL_CAPR, 0xFFF0); // -16: nothing read yet
+	rtl_write16(dev, RTL_ISR, 0xFFFF);
+	rtl_write16(dev, RTL_IMR, RTL_INTR_MASK);
+}
+
+// ============================================================================
+// Transmit (net_device_t xmit hook)
+// ============================================================================
+
+/* Complete the frames the chip is done with (TOK, underrun, abort), oldest
+ * first.  An underrun raises the early TX threshold by 64 bytes; an abort
+ * is cleared in TCR.  Caller holds tx_lock. */
+static void rtl_tx_clean_locked(rtl8139_dev_t *dev)
+{
+	uint32_t dirty = dev->tx_dirty;
+
+	while (dirty != dev->tx_cur) {
+		uint32_t entry = dirty % RTL8139_NUM_TX_DESC;
+		uint32_t tsd = rtl_read32(dev, RTL_TSD0 + entry * 4);
+
+		if (!(tsd & (RTL_TSD_TOK | RTL_TSD_TUN | RTL_TSD_TABT)))
+			break; // still being sent
+		if (tsd & (RTL_TSD_OWC | RTL_TSD_TABT)) {
+			dev->net_dev.tx_errors++;
+			if (tsd & RTL_TSD_TABT) {
+				dev->st_tx_aborted++;
+				rtl_write32(dev, RTL_TCR,
+					    RTL_TCR_MXDMA_1024 |
+						    RTL_TCR_IFG_NORMAL |
+						    RTL_TCR_CLRABT);
+				rtl_write16(dev, RTL_ISR, RTL_INT_TER);
+			}
+			if (tsd & RTL_TSD_CRS)
+				dev->st_tx_carrier++;
+			if (tsd & RTL_TSD_OWC)
+				dev->st_tx_window++;
+		} else {
+			if ((tsd & RTL_TSD_TUN) && dev->tx_flag < 0x00300000u) {
+				dev->tx_flag += 2u << RTL_TSD_ERTXTH_SHIFT;
+				dev->st_tx_fifo++;
+			}
+			dev->st_colls += (tsd >> RTL_TSD_NCC_SHIFT) & 15;
+		}
+		dev->tx_stamp[entry] = 0;
+		dirty++;
+	}
+	if (dirty != dev->tx_dirty) {
+		dev->tx_dirty = dirty;
+		if (netif_queue_stopped(&dev->net_dev))
+			netif_wake_queue(&dev->net_dev);
+	}
+}
+
+static int rtl8139_xmit(sk_buff_t *skb, net_device_t *ndev)
+{
 	rtl8139_dev_t *dev = (rtl8139_dev_t *)ndev->driver_data;
+	uint32_t len = skb->len;
+	uint64_t f;
+
 	BUG_ON(dev == NULL);
-
-	if (len > RTL8139_TX_BUF_SIZE)
-		return -1;
-
-	// Serialize across CPUs: tx_cur, the descriptor slot buffer, and the
-	// TSD MMIO write form one critical section.
-	uint64_t txflags;
-	spin_lock_irqsave(&dev->tx_lock, &txflags);
-
-	if (len < 60) {
-		// Hardware does not pad short frames in software descriptor mode.
-		// We zero-pad to the 60-byte (sans-FCS) minimum here.
-		for (uint16_t i = len; i < 60; i++)
-			dev->tx_bufs[dev->tx_cur][i] = 0;
-		// 'len' is what we actually copied; we still tell the HW to send 60.
+	if (len == 0 || len > 1792) { // TSD size field: at most 1792 bytes
+		ndev->tx_dropped++;
+		skb_put(skb);
+		return NETDEV_TX_OK;
 	}
 
-	// Wait for descriptor to be free (OWN=1 means previous DMA done).  On
-	// first use TSD reads back as 0 so we treat that as "free".
-	uint8_t slot = dev->tx_cur;
-	WARN_ON(slot >=
-		RTL8139_NUM_TX_DESC); /* tx_cur out of TX ring bounds - wrap logic corrupted */
-	uint32_t tsd_off = RTL_TSD0 + slot * 4;
-	uint32_t tsd = rtl_read32(dev, tsd_off);
-	if (tsd != 0 && !(tsd & RTL_TSD_OWN)) {
-		// Descriptor still busy — drop
-		ndev->tx_errors++;
-		spin_unlock_irqrestore(&dev->tx_lock, txflags);
-		return -1;
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	if (dev->tx_cur - dev->tx_dirty >= RTL8139_NUM_TX_DESC) {
+		rtl_tx_clean_locked(dev);
+		if (dev->tx_cur - dev->tx_dirty >= RTL8139_NUM_TX_DESC) {
+			netif_stop_queue(ndev);
+			spin_unlock_irqrestore(&dev->tx_lock, f);
+			return NETDEV_TX_BUSY;
+		}
 	}
 
-	// Copy payload into the slot buffer (rep movs — was a byte loop).
-	mm_memcpy(dev->tx_bufs[slot], data, len);
+	uint32_t entry = dev->tx_cur % RTL8139_NUM_TX_DESC;
 
-	uint16_t tx_len = (len < 60) ? 60 : len;
+	mm_memcpy(dev->tx_bufs[entry], skb->data, len);
+	/* Hardware does not pad short frames: zero-pad to the 60-byte
+	 * (sans-FCS) minimum. */
+	if (len < 60)
+		mm_memset(dev->tx_bufs[entry] + len, 0, 60 - len);
+	uint32_t tx_len = (len < 60) ? 60 : len;
+	{
+		uint64_t now = timer_ticks();
 
-	// Ensure prior writes are visible to the device DMA before kicking it.
+		dev->tx_stamp[entry] = now ? now : 1;
+	}
+
+	// The buffer is visible to the device's DMA before the start.
 	__asm__ volatile("mfence" ::: "memory");
 
-	// Writing the size to TSD with OWN=0 starts the transmission.
-	// We leave Early TX Threshold at 0 (= use default).
-	rtl_write32(dev, tsd_off, (uint32_t)tx_len & RTL_TSD_SIZE_MASK);
+	// Writing the size (OWN clear) with the early TX threshold starts
+	// the transmission.
+	rtl_write32(dev, RTL_TSD0 + entry * 4,
+		    dev->tx_flag | (tx_len & RTL_TSD_SIZE_MASK));
+	dev->tx_cur++;
 
-	dev->tx_cur = (slot + 1) % RTL8139_NUM_TX_DESC;
 	ndev->tx_packets++;
 	ndev->tx_bytes += tx_len;
-	spin_unlock_irqrestore(&dev->tx_lock, txflags);
-	return 0;
+	if (dev->tx_cur - dev->tx_dirty >= RTL8139_NUM_TX_DESC)
+		netif_stop_queue(ndev);
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+	skb_put(skb);
+	return NETDEV_TX_OK;
 }
 
 // ============================================================================
-// Link status callback
+// Link, receive filter, statistics, watchdog
 // ============================================================================
+static int rtl_msr_link(rtl8139_dev_t *dev)
+{
+	// MSR.LINKB is INVERSE: 1 means link DOWN.
+	return (rtl_read8(dev, RTL_MSR) & RTL_MSR_LINKB) ? 0 : 1;
+}
+
+/* The carrier follows MSR once it has reported a link at all. */
+static void rtl_link_check(rtl8139_dev_t *dev)
+{
+	int now_up = rtl_msr_link(dev);
+
+	if (now_up)
+		dev->link_seen = 1;
+	if (now_up == dev->link_up)
+		return;
+	dev->link_up = now_up;
+	kprintf("RTL8139: Link %s\n", now_up ? "UP" : "DOWN");
+	if (now_up) {
+		netif_carrier_on(&dev->net_dev);
+	} else {
+		dhcp_invalidate(&dev->net_dev);
+		if (dev->link_seen)
+			netif_carrier_off(&dev->net_dev);
+	}
+}
+
 static int rtl8139_link_status(net_device_t *ndev)
 {
 	rtl8139_dev_t *dev = (rtl8139_dev_t *)ndev->driver_data;
-	// MSR.LINKB is INVERSE: 1 means link DOWN.
-	int now_up = (rtl_read8(dev, RTL_MSR) & RTL_MSR_LINKB) ? 0 : 1;
-	int was_up = dev->link_up;
-	if (now_up != was_up) {
-		dev->link_up = now_up;
-		kprintf("RTL8139: Link %s\n", now_up ? "UP" : "DOWN");
-		if (!now_up)
-			dhcp_invalidate(ndev);
+	int up = rtl_msr_link(dev);
+
+	if (up != dev->link_up)
+		net_housekeeping_kick();
+	return up;
+}
+
+static void rtl8139_set_rx_mode(net_device_t *ndev)
+{
+	rtl8139_dev_t *dev = (rtl8139_dev_t *)ndev->driver_data;
+
+	__atomic_store_n(&dev->rx_mode_pending, 1, __ATOMIC_RELEASE);
+	net_housekeeping_kick();
+}
+
+static void rtl8139_get_stats64(net_device_t *ndev,
+				struct net_device_stats64 *s)
+{
+	rtl8139_dev_t *dev = (rtl8139_dev_t *)ndev->driver_data;
+
+	s->tx_aborted_errors = dev->st_tx_aborted;
+	s->tx_carrier_errors = dev->st_tx_carrier;
+	s->tx_fifo_errors = dev->st_tx_fifo;
+	s->collisions = dev->st_colls;
+	s->rx_crc_errors = dev->st_rx_crc;
+	s->rx_frame_errors = dev->st_rx_frame;
+	s->rx_length_errors = dev->st_rx_length;
+	s->rx_fifo_errors = dev->st_rx_fifo;
+	s->rx_missed_errors = dev->st_missed;
+}
+
+static void rtl8139_tx_timeout(net_device_t *ndev)
+{
+	rtl8139_dev_t *dev = (rtl8139_dev_t *)ndev->driver_data;
+
+	__atomic_store_n(&dev->reset_pending, 1, __ATOMIC_RELEASE);
+}
+
+/* Restart after a transmit timeout: the chip is reset (its descriptor
+ * order starts again at 0) and programmed anew; queued frames are
+ * dropped.  Watchdog context (CPU 0): the poll is not running. */
+static void rtl_restart(rtl8139_dev_t *dev)
+{
+	uint64_t f;
+
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	rtl_write16(dev, RTL_IMR, 0);
+	dev->net_dev.tx_errors += dev->tx_cur - dev->tx_dirty;
+	rtl_write8(dev, RTL_CR, RTL_CR_RST);
+	for (int i = 0; i < 1000; i++) {
+		if (!(rtl_read8(dev, RTL_CR) & RTL_CR_RST))
+			break;
+		rtl_delay_us(10);
 	}
-	return now_up;
+	rtl_hw_start(dev);
+	if (netif_queue_stopped(&dev->net_dev))
+		netif_wake_queue(&dev->net_dev);
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+	napi_schedule(&dev->napi);
+}
+
+// Network housekeeping softirq, CPU 0, ~10 Hz and when kicked.
+static void rtl8139_watchdog(net_device_t *ndev)
+{
+	rtl8139_dev_t *dev = (rtl8139_dev_t *)ndev->driver_data;
+	uint64_t f, now = timer_ticks();
+	int hang = 0;
+
+	if (!dev || !g_rtl8139_initialized)
+		return;
+	rtl_link_check(dev);
+	if (__atomic_exchange_n(&dev->rx_mode_pending, 0, __ATOMIC_ACQ_REL))
+		rtl_set_rx_filter(dev);
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	rtl_tx_clean_locked(dev);
+	if (dev->tx_cur != dev->tx_dirty) {
+		uint64_t stamp =
+			dev->tx_stamp[dev->tx_dirty % RTL8139_NUM_TX_DESC];
+
+		if (stamp && now - stamp > net_ms_to_ticks(5000))
+			hang = 1;
+	}
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+	dev->st_missed += rtl_read32(dev, RTL_MPC);
+	rtl_write32(dev, RTL_MPC, 0);
+	if (hang) {
+		kprintf("RTL8139: transmit timed out, restarting the chip\n");
+		__atomic_store_n(&dev->reset_pending, 1, __ATOMIC_RELEASE);
+	}
+	if (__atomic_exchange_n(&dev->reset_pending, 0, __ATOMIC_ACQ_REL))
+		rtl_restart(dev);
 }
 
 // Quiesce the controller ahead of an ACPI S5 transition.  Per the
@@ -314,12 +544,30 @@ static void rtl8139_shutdown(net_device_t *ndev)
 }
 
 // ============================================================================
-// Drain the RX ring buffer
+// Receive (NAPI poll)
 // ============================================================================
-static void rtl_drain_rx(rtl8139_dev_t *dev)
+
+/* Lost in the ring (a bad header): receiver off, read position back to the
+ * start of the ring, filter and read pointer reprogrammed, receiver on.
+ * Frames in the ring are dropped.  Poll context (CPU 0). */
+static void rtl_rx_reset(rtl8139_dev_t *dev)
 {
-	int processed_any = 0;
-	while (!(rtl_read8(dev, RTL_CR) & RTL_CR_BUFE)) {
+	dev->st_rx_resets++;
+	rtl_write8(dev, RTL_CR, RTL_CR_TE); // receiver off
+	rtl_write32(dev, RTL_RBSTART, (uint32_t)dev->rx_buf_phys);
+	dev->rx_offset = 0;
+	dev->rx_early_tick = 0;
+	rtl_write8(dev, RTL_CR, RTL_CR_TE | RTL_CR_RE);
+	rtl_write32(dev, RTL_RCR, dev->rx_config);
+	rtl_write16(dev, RTL_CAPR, 0xFFF0);
+}
+
+static int rtl_rx_clean(rtl8139_dev_t *dev, int budget)
+{
+	net_device_t *nd = &dev->net_dev;
+	int work = 0;
+
+	while (work < budget && !(rtl_read8(dev, RTL_CR) & RTL_CR_BUFE)) {
 		// The chip DMAs the header and frame into rx_buf behind the
 		// compiler's back, and inb carries no memory clobber: keep the
 		// reads below after the BUFE check that says they are there.
@@ -328,57 +576,98 @@ static void rtl_drain_rx(rtl8139_dev_t *dev)
 		//   [0..1]  status (16-bit, little-endian)
 		//   [2..3]  length INCLUDING 4-byte CRC (16-bit)
 		//   [4..]   packet data (length-4 bytes)
-		uint8_t *p = dev->rx_buf + dev->rx_offset;
+		volatile uint8_t *p = dev->rx_buf + dev->rx_offset;
 		uint16_t status = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 		uint16_t length = (uint16_t)p[2] | ((uint16_t)p[3] << 8);
 
-		// Bit 0 of status is ROK; if not set or length is bogus, reset RX.
-		if (!(status & 0x01) || length < 4 || length > 1518) {
-			dev->net_dev.rx_errors++;
-			// Reinitialise RX path on a corrupt header
-			rtl_write8(dev, RTL_CR, RTL_CR_TE); // disable RX only
-			rtl_write32(dev, RTL_RBSTART,
-				    (uint32_t)dev->rx_buf_phys);
-			dev->rx_offset = 0;
-			rtl_write8(dev, RTL_CR, RTL_CR_TE | RTL_CR_RE);
-			return;
+		/* The chip is still copying this frame (early receive):
+		 * its length reads 0xFFF0 until it is complete.  Not ready
+		 * -- unless it stays so for two ticks, then it is garbage. */
+		if (length == NIC_RTL_RX_EARLY_LEN) {
+			uint64_t now = timer_ticks();
+
+			if (!dev->rx_early_tick) {
+				dev->rx_early_tick = now ? now : 1;
+				break;
+			}
+			if (now - dev->rx_early_tick <= 2)
+				break;
+			length = 0; // stuck: treat as lost in the ring
+		}
+		dev->rx_early_tick = 0;
+
+		if (!(status & RTL_RXS_ROK) || length < 8 ||
+		    length > RTL_MAX_RX_SIZE) {
+			nd->rx_errors++;
+			if (status & RTL_RXS_CRC)
+				dev->st_rx_crc++;
+			if (status & RTL_RXS_FAE)
+				dev->st_rx_frame++;
+			if (status & (RTL_RXS_LONG | RTL_RXS_RUNT))
+				dev->st_rx_length++;
+			rtl_rx_reset(dev);
+			work++;
+			break;
 		}
 
 		// Deliver to upper layers (length includes 4-byte CRC; strip it)
-		if (length >= 4) {
-			uint16_t payload = length - 4;
-			net_rx_packet(&dev->net_dev, p + 4, payload);
+		uint32_t payload = length - 4u;
+		sk_buff_t *skb = skb_alloc(payload);
+
+		if (skb) {
+			skb->dev = nd;
+			mm_memcpy(skb_append(skb, payload), (const void *)(p + 4),
+				  payload);
+			nd->rx_packets++;
+			nd->rx_bytes += payload;
+			if (p[4] & 1)
+				nd->multicast++;
+			napi_gro_receive(&dev->napi, skb);
+		} else {
+			nd->rx_dropped++;
 		}
 
-		// Advance offset, 4-byte aligned, accounting for 4-byte header
-		dev->rx_offset = (dev->rx_offset + length + 4 + 3) & ~3;
-		if (dev->rx_offset >= RTL8139_RX_BUF_SIZE)
-			dev->rx_offset -= RTL8139_RX_BUF_SIZE;
-		WARN_RATELIMIT(
-			dev->rx_offset >= RTL8139_RX_BUF_TOTAL,
-			"RTL8139: rx_offset=%u out of RX ring bounds (%u) after wrap",
-			dev->rx_offset, RTL8139_RX_BUF_TOTAL);
-
-		processed_any = 1;
+		// Advance offset, 4-byte aligned, accounting for 4-byte header.
+		// The ring wraps at RTL8139_RX_RING_LEN (a frame that ran past
+		// it was written on into the padding, see rtl8139.h).  The read
+		// pointer goes to the chip at once: it decides BUFE (and frees
+		// ring space) from it.
+		dev->rx_offset = (uint16_t)nic_rtl8139_rx_next(
+			dev->rx_offset, length, RTL8139_RX_RING_LEN);
+		rtl_write16(dev, RTL_CAPR,
+			    nic_rtl8139_capr(dev->rx_offset));
+		work++;
 	}
+	return work;
+}
 
-	// Batched CAPR write: tell the chip once per drain pass where we've
-	// read up to, instead of after every packet.  CAPR is offset by 16
-	// bytes from the buffer start (hardware quirk).
-	if (processed_any) {
-		rtl_write16(dev, RTL_CAPR, dev->rx_offset - 16);
-	}
+static int rtl8139_poll(struct napi_struct *n, int budget)
+{
+	rtl8139_dev_t *dev = (rtl8139_dev_t *)n->dev->driver_data;
+	uint64_t f;
+	int work;
+
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	rtl_tx_clean_locked(dev);
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+	work = rtl_rx_clean(dev, budget);
+	if (dev->rx_early_tick)
+		return budget; // a frame is being copied: look again soon
+	if (work < budget && napi_complete_done(n, work))
+		rtl_write16(dev, RTL_IMR, RTL_INTR_MASK);
+	return work;
 }
 
 // ============================================================================
 // Top-half IRQ handler (called from kernel/ke/interrupt.c dispatcher)
 // ============================================================================
-void rtl8139_irq_handler(void)
+/* Returns 1 when the interrupt was this chip's, 0 otherwise (shared line);
+ * the dispatcher acknowledges the local APIC.  Receive and transmit work
+ * goes to the NAPI poll with those sources masked until it is done. */
+int rtl8139_irq_handler(void)
 {
-	if (!g_rtl8139_initialized) {
-		lapic_eoi();
-		return;
-	}
+	if (!g_rtl8139_initialized)
+		return 0;
 
 	// Feed entropy from NIC IRQ timing
 	{
@@ -391,43 +680,33 @@ void rtl8139_irq_handler(void)
 	rtl8139_dev_t *dev = &g_rtl8139;
 	BUG_ON(dev == NULL);
 	uint16_t isr = rtl_read16(dev, RTL_ISR);
-	if (isr == 0) {
-		lapic_eoi();
-		return;
-	}
+	int handled;
+	if (isr == 0 || isr == 0xFFFF)
+		return 0;
+	// ours only for a cause it has enabled (nic_rtl8139_irq_ours)
+	handled = nic_rtl8139_irq_ours(isr, rtl_read16(dev, RTL_IMR));
 
 	// ACK by writing 1s to the bits we handled (write-1-to-clear).
 	rtl_write16(dev, RTL_ISR, isr);
 
-	if (isr & (RTL_INT_PUN | RTL_INT_LENCHG)) {
-		int now_up = (rtl_read8(dev, RTL_MSR) & RTL_MSR_LINKB) ? 0 : 1;
-		int was_up = dev->link_up;
-		dev->link_up = now_up;
-		if (now_up != was_up) {
-			kprintf("RTL8139: Link %s\n", now_up ? "UP" : "DOWN");
-			if (!now_up)
-				dhcp_invalidate(&dev->net_dev);
-		}
-	}
-
-	if (isr & RTL_INT_ROK) {
-		rtl_drain_rx(dev);
-	}
-	if (isr & RTL_INT_RER) {
-		dev->net_dev.rx_errors++;
-	}
+	if (isr & RTL_INT_PUN) // packet underrun / link change
+		net_housekeeping_kick();
 	if (isr & (RTL_INT_RXOVW | RTL_INT_FOVW)) {
-		// Overflow — reset RX pointer
-		dev->net_dev.rx_dropped++;
-		rtl_write8(dev, RTL_CR, RTL_CR_TE);
-		rtl_write32(dev, RTL_RBSTART, (uint32_t)dev->rx_buf_phys);
-		dev->rx_offset = 0;
-		rtl_write8(dev, RTL_CR, RTL_CR_TE | RTL_CR_RE);
+		/* The ring or the FIFO overflowed: frames were lost; the
+		 * poll empties the ring and the chip goes on. */
+		dev->net_dev.rx_errors++;
+		dev->st_rx_fifo++;
 	}
-	// TOK / TER are handled implicitly by send() polling OWN bit; nothing
-	// to do here.
-
-	lapic_eoi();
+	if (isr & RTL_INT_SERR)
+		dev->net_dev.rx_errors++;
+	/* Receive/transmit work also when the interrupt was another
+	 * device's: the cause is acknowledged above, and a poll about to
+	 * re-enable its interrupts would not hear of it otherwise. */
+	if (isr & RTL_INTR_NAPI) {
+		rtl_write16(dev, RTL_IMR, RTL_INTR_MASK & ~RTL_INTR_NAPI);
+		napi_schedule(&dev->napi);
+	}
+	return handled;
 }
 
 // ============================================================================
@@ -465,6 +744,7 @@ void rtl8139_init(void)
 
 		rtl8139_dev_t *dev = &g_rtl8139;
 		dev->pci_dev = &devs[i];
+		dev->tx_lock = (spinlock_t)SPINLOCK_INIT("rtl8139_tx");
 
 		pci_enable_busmaster_mem(dev->pci_dev);
 
@@ -499,17 +779,6 @@ void rtl8139_init(void)
 			return;
 		if (rtl_init_tx(dev) < 0)
 			return;
-
-		// Configure RX: accept broadcast+physical-match, 8K buffer, WRAP set
-		// so we can read past the buffer end into our pad area.
-		rtl_write32(dev, RTL_RCR,
-			    RTL_RCR_APM | RTL_RCR_AB | RTL_RCR_AM |
-				    RTL_RCR_WRAP | RTL_RCR_RBLEN_64K |
-				    RTL_RCR_MXDMA_UNLIM);
-
-		// Configure TX: max DMA burst 1024 B, normal IFG.
-		rtl_write32(dev, RTL_TCR,
-			    RTL_TCR_MXDMA_1024 | RTL_TCR_IFG_NORMAL);
 
 		// RTL8139 has no MSI capability in the real silicon nor in QEMU's
 		// emulation, but we still try — pci_enable_msi() will fail
@@ -587,7 +856,6 @@ void rtl8139_init(void)
 		// dispatcher (which routes the legacy IRQ to us once the
 		// initialised flag is set) always sees a valid net_dev.
 		dev->net_dev.lock = (spinlock_t)SPINLOCK_INIT("rtl8139");
-		dev->tx_lock = (spinlock_t)SPINLOCK_INIT("rtl8139_tx");
 		dev->net_dev.rx_packets = 0;
 		dev->net_dev.tx_packets = 0;
 		dev->net_dev.rx_bytes = 0;
@@ -595,21 +863,12 @@ void rtl8139_init(void)
 		dev->net_dev.rx_errors = 0;
 		dev->net_dev.tx_errors = 0;
 		dev->net_dev.rx_dropped = 0;
+		dev->net_dev.driver_data = dev;
+		// the poll exists before the handler can be called
+		netif_napi_add(&dev->net_dev, &dev->napi, rtl8139_poll,
+			       NAPI_POLL_WEIGHT);
+		napi_enable(&dev->napi);
 		g_rtl8139_initialized = 1;
-
-		// Enable RX + TX
-		rtl_write8(dev, RTL_CR, RTL_CR_TE | RTL_CR_RE);
-
-		// Reset RX read pointer
-		rtl_write16(dev, RTL_CAPR, 0xFFF0); // -16
-		dev->rx_offset = 0;
-
-		// Clear and then enable interrupts we care about
-		rtl_write16(dev, RTL_ISR, 0xFFFF);
-		rtl_write16(dev, RTL_IMR,
-			    RTL_INT_ROK | RTL_INT_RER | RTL_INT_TOK |
-				    RTL_INT_TER | RTL_INT_RXOVW | RTL_INT_FOVW |
-				    RTL_INT_PUN | RTL_INT_LENCHG);
 
 		// Initial link status (give the link a moment to come up)
 		uint8_t msr = rtl_read8(dev, RTL_MSR);
@@ -625,6 +884,7 @@ void rtl8139_init(void)
 			}
 		}
 		dev->link_up = (msr & RTL_MSR_LINKB) ? 0 : 1;
+		dev->link_seen = dev->link_up;
 		kprintf("RTL8139: Link %s\n", dev->link_up ? "UP" : "DOWN");
 
 		// Wire up net_device_t and register
@@ -636,12 +896,19 @@ void rtl8139_init(void)
 		dev->net_dev.netmask = 0;
 		dev->net_dev.gateway = 0;
 		dev->net_dev.dns_server = 0;
-		dev->net_dev.send = rtl8139_send;
+		dev->net_dev.send = NULL;
+		dev->net_dev.xmit = rtl8139_xmit;
 		dev->net_dev.link_status = rtl8139_link_status;
 		dev->net_dev.shutdown = rtl8139_shutdown;
-		dev->net_dev.driver_data = dev;
+		dev->net_dev.watchdog = rtl8139_watchdog;
+		dev->net_dev.tx_timeout = rtl8139_tx_timeout;
+		dev->net_dev.set_rx_mode = rtl8139_set_rx_mode;
+		dev->net_dev.get_stats64 = rtl8139_get_stats64;
 
 		net_register(&dev->net_dev);
+
+		// Rings, filter, RX + TX on, the interrupts it handles
+		rtl_hw_start(dev);
 		kprintf("RTL8139: Driver initialized successfully\n");
 		return; // first device only
 	}

@@ -37,21 +37,30 @@
 //         LPLU=1 on Lenovo P50; without this TX hangs on link-up)
 //       - K1 disabled, KMRN HD_CTRL programmed for negotiated speed
 //       - K1 workaround for LPT-LP / SPT / CNP+ at 100 Mb FD
-//       - EEE disabled at MAC and PHY (EEER / IPCNFG / EMI 0x040E)
+//       - EEE disabled at MAC and PHY (EEER / IPCNFG / EMI 0x8001)
 //       - I82577 PHY config (CRS_ON_TX, downshift=3)
 //       - SPT TX-hang workaround: IOSFPC bit 16, FEXTNVM11.DISABLE_MULR_FIX,
 //         TARC0 CB_MULTIQ_2_REQ
 //       - TCTL.MULR + RRTHRESH set on PCH-LAN (the actual TX-stall gate;
 //         without MULR the TX engine fetches one descriptor and stalls)
 //       - KABGTXD.BGSQLBIAS, MAC DPG exit, ME H2ME ENFORCE_SETTINGS
-//   * Legacy RX/TX descriptor rings, single-queue, contiguous DMA.
+//   * Legacy RX/TX descriptor rings, single-queue, contiguous DMA;
+//     packet buffers write-back mapped where the DMA is snooped (8257x,
+//     SPT and later), descriptor rings uncached.
+//   * NAPI receive (budgeted ring drain, descriptor error checks), TX
+//     reclaim in the poll with queue stop/wake, adaptive interrupt
+//     moderation (ITR), RX checksum offload, multicast table, hardware
+//     statistics, transmit hang detection.
+//   * Per-link-up configuration for the speed negotiated each time (KMRN
+//     timing, K1, and on SPT+ TIPG, PLL clock gate, pointer gap, LTR,
+//     flow control resolved from the autonegotiation).
 //   * Legacy INTx via ACPI _PRT GSI lookup, or MSI when available.
 //   * Link state tracking via LSC interrupt + STATUS.LU polling.
 //   * MAC address read from RAL0/RAH0 (UEFI-programmed) with EEPROM fallback.
 //
 // What is intentionally NOT implemented:
 //   * MSI-X, multi-queue RX/TX, RSS, VMDq, SR-IOV.
-//   * TX/RX checksum offload, TSO/LSO, header-split.
+//   * TX checksum offload, TSO/LSO, header-split.
 //   * VLAN tagging (CTRL.VME left at hardware default).
 //   * Wake-on-LAN / D3-cold (CTRL.ADVD3WUC left at hardware default).
 //   * Energy-Efficient Ethernet (explicitly disabled — saves debugging pain).
@@ -68,7 +77,10 @@
 
 #include <kernel/dev/nic/e1000e.h>
 #include <kernel/dev/nic/e1000.h>
+#include <kernel/dev/nic/nic_util.h>
 #include <kernel/net/net.h>
+#include <kernel/net/netdevice.h>
+#include <kernel/net/skb.h>
 #include <kernel/hal/pci.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
@@ -615,7 +627,15 @@ static inline void e1000e_write(e1000e_dev_t *dev, uint32_t reg, uint32_t val)
 // sits at MDIO address 2 (verified empirically on real hardware).
 #define E1000E_PHY_ADDR 2
 #define PHY_CONTROL_REG 0 // MII BMCR
-#define E1000E_HV_INTC_FC_PAGE_START 778
+/* The I219 spreads its registers over two MDIO addresses (datasheet §9.3,
+ * table 9-1): the general, PAGED registers at address 1 -- every page from
+ * 768 up, page 768 being that address's page 0 (OEM bits, SMBus address,
+ * ...) -- and the PHY-specific ones at address 2, page 0.  The threshold
+ * was 778, which sent pages 768..777 -- the OEM bits, the SMBus control at
+ * 769, the LPI registers at 772 -- to address 2, where those register
+ * numbers are the interrupt status, PHY Control and PHY Configuration
+ * registers.  See e1000e_phy_paged_access(). */
+#define E1000E_HV_INTC_FC_PAGE_START 768
 
 // Paged HV PHY registers used by the PCH-LAN SMBus / ULP handoff.
 #define E1000_CV_SMB_CTRL E1000E_PHY_REG(769, 23)
@@ -674,11 +694,17 @@ static inline void e1000e_write(e1000e_dev_t *dev, uint32_t reg, uint32_t val)
 //   * I217_EEE_ADVERTISEMENT (0x040E) — local EEE ability  (must be 0)
 //   * I217_EEE_LP_ABILITY    (0x040F) — link-partner EEE   (read-only)
 //   * I217_EEE_PCS_STATUS    (0x06E8 on I218, 0x06E9 on I217) — PCS state
-// Page 776 hosts the EMI window on I217/I218/I219.
-#define I82579_EMI_ADDR E1000E_PHY_REG(776, 22)
-#define I82579_EMI_DATA E1000E_PHY_REG(776, 23)
-#define I217_EEE_ADVERTISEMENT 0x040E
-#define I217_EEE_LP_ABILITY 0x040F
+// The EMI window is PHY address 2, page 0, registers 16 (address) and 17
+// (data) -- I219 datasheet §9.5.12.1.  It used to be addressed as page 776
+// registers 22/23, which on address 2 are PHY Configuration and PHY
+// Control: the "EEE disable" wrote the EMI address into the first and 0
+// into the second, clearing LNK_EN and dropping the link.  On the I217
+// and later, the EEE advertisement is EMI 0x8001 (IEEE MMD 7.60) and the
+// partner's 0x8002 (7.61); 0x040E/0x040F were the 82579's.
+#define I82579_EMI_ADDR E1000E_PHY_REG(0, 16)
+#define I82579_EMI_DATA E1000E_PHY_REG(0, 17)
+#define I217_EEE_ADVERTISEMENT 0x8001
+#define I217_EEE_LP_ABILITY 0x8002
 
 // HV LPI Control register (paged): bit 7 enables 100Mb LPI auto-shutoff,
 // bit 16 (across the 32-bit MAC mirror) enables 1000Mb LPI.  On the
@@ -743,6 +769,35 @@ static inline void e1000e_write(e1000e_dev_t *dev, uint32_t reg, uint32_t val)
 #define E1000_PHY_CTRL_NOND0A_LPLU (1u << 3)
 #define E1000_PHY_CTRL_D0A_LPLU (1u << 2)
 
+// Per-link-up configuration of the SPT and later PCH-LAN MACs/PHYs.
+#define E1000_PCIEANACFG 0x00F18 // PCIe analog config (K1-off mirror)
+#define E1000_LTRV 0x000F8 // Latency Tolerance Reporting value
+#define E1000_LTRV_REQ_SHIFT 15
+#define E1000_LTRV_NOSNOOP_SHIFT 16
+#define E1000_LTRV_SEND (1u << 30)
+#define E1000_PCI_LTR_CAP_LPT 0xA8 // platform max snoop/no-snoop latency
+#define E1000_FCRTV_PCH 0x05F40 // flow control refresh timer
+#define E1000_FCRTL_XONE 0x80000000u // send XON below the low mark
+#define E1000_CTRL_SPD_100 (1u << 8)
+#define E1000_CTRL_SPD_1000 (1u << 9)
+#define E1000_CTRL_RFCE (1u << 27) // honour received pause frames
+#define E1000_CTRL_TFCE (1u << 28) // send pause frames
+#define E1000_TIPG_IPGT_MASK 0x3FFu
+#define E1000_RFCTL_NFSW_DIS (1u << 6)
+#define E1000_RFCTL_NFSR_DIS (1u << 7)
+#define I217_RX_CONFIG 0xB20C // EMI: analog RX latency
+#define I217_PLL_CLOCK_GATE_REG E1000E_PHY_REG(772, 28)
+#define I217_PLL_CLOCK_GATE_MASK 0x07FFu
+#define HV_PM_CTRL E1000E_PHY_REG(770, 17)
+#define HV_PM_CTRL_K1_CLK_REQ 0x0200u
+#define I219_PTR_GAP_REG E1000E_PHY_REG(776, 20) // MAC/PHY pointer gap
+#define BM_PORT_CTRL_PAUSE E1000E_PHY_REG(769, 27) // PHY-side pause time
+// Flow control on SPT and later with the standard MTU and PBA 26 KB.
+#define E1000E_PCH_FC_HIGH_WATER 0x05C20u
+#define E1000E_PCH_FC_LOW_WATER 0x05048u
+#define E1000E_FC_PAUSE_TIME 0xFFFFu
+#define E1000E_MAX_FRAME 1518u // 1500 + Ethernet header + FCS
+
 // PMA timer-based microsecond delay forward decl
 static void e1000e_delay_us(uint32_t us);
 
@@ -797,35 +852,114 @@ static void __attribute__((unused)) e1000e_dump_pci_dma_state(e1000e_dev_t *dev,
 #endif
 }
 
-// Wait for the SW flag to be released by ME firmware so we can safely
-// touch PHY-side configuration.  Best-effort: if we can't get it within
-// 100 ms we proceed anyway — the MAC-side workarounds below still help
-// even when the PHY remains owned by ME.
-static int __attribute__((unused)) e1000e_acquire_swflag(e1000e_dev_t *dev)
+/* The software/firmware semaphore for the PHY (EXTCNF_CTRL.SWFLAG), as
+ * every PCH-LAN driver takes it: wait up to 50 ms for the flag to be FREE
+ * -- the Management Engine holds it while it uses the PHY itself -- then
+ * request it and wait up to a second for the hardware to grant it.  This
+ * used to clear a flag it found set, i.e. take the PHY away from the ME in
+ * the middle of whatever the ME was doing with it, and to give up after
+ * 100 ms of asking.
+ *
+ * It also takes dev->phy_busy, the lock that keeps the CPUs off the MDIC
+ * register at the same time: the link watchdog, the transmit path's link
+ * poll, initialisation and shutdown all talk to the PHY.  Every PHY access
+ * after initialisation goes through here.  phy_busy is a plain spin flag,
+ * not an interrupts-off lock -- the holders busy-wait for milliseconds on
+ * the MDIO bus -- and it is never taken from hard-IRQ context. */
+#define E1000E_SWFLAG_FREE_MS 50
+#define E1000E_SWFLAG_GRANT_MS 1000
+
+static int e1000e_acquire_swflag(e1000e_dev_t *dev)
 {
-	uint32_t ext = e1000e_read(dev, E1000_EXTCNF_CTRL);
-	if (ext & E1000_EXTCNF_CTRL_SWFLAG) {
-		// Already held — clear stale flag first
-		e1000e_write(dev, E1000_EXTCNF_CTRL,
-			     ext & ~E1000_EXTCNF_CTRL_SWFLAG);
-		e1000e_delay_us(2000);
-	}
-	for (int i = 0; i < 100; i++) {
+	uint32_t ext;
+	int i;
+
+	while (__atomic_exchange_n(&dev->phy_busy, 1, __ATOMIC_ACQUIRE))
+		__asm__ volatile("pause" ::: "memory");
+
+	for (i = 0; i < E1000E_SWFLAG_FREE_MS; i++) {
 		ext = e1000e_read(dev, E1000_EXTCNF_CTRL);
-		e1000e_write(dev, E1000_EXTCNF_CTRL,
-			     ext | E1000_EXTCNF_CTRL_SWFLAG);
+		if (!(ext & E1000_EXTCNF_CTRL_SWFLAG))
+			break;
 		e1000e_delay_us(1000);
-		ext = e1000e_read(dev, E1000_EXTCNF_CTRL);
-		if (ext & E1000_EXTCNF_CTRL_SWFLAG)
-			return 0;
 	}
+	if (i == E1000E_SWFLAG_FREE_MS) {
+		e1000e_dbg("E1000E: SWFLAG held by firmware (EXTCNF=%08x)\n",
+			   ext);
+		__atomic_store_n(&dev->phy_busy, 0, __ATOMIC_RELEASE);
+		return -1;
+	}
+
+	e1000e_write(dev, E1000_EXTCNF_CTRL, ext | E1000_EXTCNF_CTRL_SWFLAG);
+	for (i = 0; i < E1000E_SWFLAG_GRANT_MS; i++) {
+		ext = e1000e_read(dev, E1000_EXTCNF_CTRL);
+		if (ext & E1000_EXTCNF_CTRL_SWFLAG) {
+			dev->swflag_held = 1;
+			return 0;
+		}
+		e1000e_delay_us(1000);
+	}
+	// Not granted: withdraw the request.
+	e1000e_write(dev, E1000_EXTCNF_CTRL, ext & ~E1000_EXTCNF_CTRL_SWFLAG);
+	e1000e_dbg("E1000E: SWFLAG not granted (FWSM=%08x)\n",
+		   e1000e_read(dev, E1000_FWSM));
+	__atomic_store_n(&dev->phy_busy, 0, __ATOMIC_RELEASE);
 	return -1;
 }
 
-static void __attribute__((unused)) e1000e_release_swflag(e1000e_dev_t *dev)
+/* Release what e1000e_acquire_swflag() took.  A no-op when it failed: the
+ * flag then belongs to the firmware and must not be cleared. */
+static void e1000e_release_swflag(e1000e_dev_t *dev)
 {
+	if (!dev->swflag_held)
+		return;
 	uint32_t ext = e1000e_read(dev, E1000_EXTCNF_CTRL);
 	e1000e_write(dev, E1000_EXTCNF_CTRL, ext & ~E1000_EXTCNF_CTRL_SWFLAG);
+	dev->swflag_held = 0;
+	__atomic_store_n(&dev->phy_busy, 0, __ATOMIC_RELEASE);
+}
+
+/* MDIC transactions are retried on MTP-class MACs and later (up to two
+ * retries, 10 ms apart), whose PHY interface is known to fail the odd
+ * transaction; a transaction there also only counts when the MAC echoes
+ * the register number that was asked for. */
+static int e1000e_mdic_retries(const e1000e_dev_t *dev)
+{
+	return e1000e_mac_gen(dev->device_id) >= E1000E_MAC_PCH_MTP ? 2 : 0;
+}
+
+/* One MDIC transaction: `mdic' is the command word.  Returns the final
+ * MDIC value with READY set, or 0 on failure. */
+static uint32_t e1000e_mdic_xfer(e1000e_dev_t *dev, uint32_t mdic, uint8_t reg)
+{
+	int retries = e1000e_mdic_retries(dev);
+
+	for (int attempt = 0; attempt <= retries; attempt++) {
+		uint32_t v = 0;
+		int ok = 0;
+
+		e1000e_write(dev, E1000_MDIC, mdic);
+		// Spec: completes within ~64 us on a 25 MHz MDIO; allow up to 5 ms.
+		for (int i = 0; i < 100; i++) {
+			e1000e_delay_us(50);
+			v = e1000e_read(dev, E1000_MDIC);
+			if (v & E1000_MDIC_READY) {
+				ok = 1;
+				break;
+			}
+		}
+		if (ok && (v & E1000_MDIC_ERROR))
+			ok = 0;
+		if (ok && retries &&
+		    ((v >> E1000_MDIC_REG_SHIFT) & E1000E_MAX_PHY_REG_ADDRESS) !=
+			    reg)
+			ok = 0;
+		if (ok)
+			return v;
+		if (attempt < retries)
+			e1000e_delay_us(10000);
+	}
+	return 0;
 }
 
 // Minimal MDIO-via-MAC PHY register read.  Used on PCH-LAN parts to
@@ -842,24 +976,13 @@ static int e1000e_phy_read_at(e1000e_dev_t *dev, uint8_t phy_addr, uint8_t reg,
 	uint32_t mdic = ((uint32_t)reg << E1000_MDIC_REG_SHIFT) |
 			((uint32_t)phy_addr << E1000_MDIC_PHY_SHIFT) |
 			E1000_MDIC_OP_READ;
-	e1000e_write(dev, E1000_MDIC, mdic);
+	uint32_t v = e1000e_mdic_xfer(dev, mdic, reg);
 
-	// Spec: completes within ~64 us on a 25 MHz MDIO; allow up to 5 ms.
-	for (int i = 0; i < 100; i++) {
-		e1000e_delay_us(50);
-		mdic = e1000e_read(dev, E1000_MDIC);
-		if (mdic & E1000_MDIC_READY) {
-			WARN_ON_ONCE(
-				mdic &
-				E1000_MDIC_ERROR); /* MDIC PHY read error bit set */
-			if (mdic & E1000_MDIC_ERROR)
-				return -1;
-			if (val)
-				*val = (uint16_t)(mdic & E1000_MDIC_DATA_MASK);
-			return 0;
-		}
-	}
-	return -1;
+	if (!v)
+		return -1;
+	if (val)
+		*val = (uint16_t)(v & E1000_MDIC_DATA_MASK);
+	return 0;
 }
 
 static int e1000e_phy_write_at(e1000e_dev_t *dev, uint8_t phy_addr, uint8_t reg,
@@ -869,16 +992,8 @@ static int e1000e_phy_write_at(e1000e_dev_t *dev, uint8_t phy_addr, uint8_t reg,
 			((uint32_t)reg << E1000_MDIC_REG_SHIFT) |
 			((uint32_t)phy_addr << E1000_MDIC_PHY_SHIFT) |
 			E1000_MDIC_OP_WRITE;
-	e1000e_write(dev, E1000_MDIC, mdic);
 
-	for (int i = 0; i < 100; i++) {
-		e1000e_delay_us(50);
-		mdic = e1000e_read(dev, E1000_MDIC);
-		if (mdic & E1000_MDIC_READY) {
-			return (mdic & E1000_MDIC_ERROR) ? -1 : 0;
-		}
-	}
-	return -1;
+	return e1000e_mdic_xfer(dev, mdic, reg) ? 0 : -1;
 }
 
 static uint8_t e1000e_phy_addr_for_hv_page(uint16_t page)
@@ -886,40 +1001,48 @@ static uint8_t e1000e_phy_addr_for_hv_page(uint16_t page)
 	return (page >= E1000E_HV_INTC_FC_PAGE_START) ? 1 : E1000E_PHY_ADDR;
 }
 
-static int e1000e_phy_read_paged_locked(e1000e_dev_t *dev, uint32_t offset,
-					uint16_t *val)
+/* A paged PHY register, E1000E_PHY_REG(page, reg), as the I219 datasheet
+ * lays them out (§9.3): pages 768 and up live at MDIO address 1, page 768
+ * being that address's page 0; page 0 is address 2.  The page is selected
+ * by writing page * 32 to register 31 before touching a register above
+ * 15 (0-15 are the IEEE registers, identical on every page).  Pages 1..767
+ * are the 82577/82578 debug window, which nothing here uses; asking for one
+ * is a bug.  Caller holds the PHY (e1000e_acquire_swflag). */
+static int e1000e_phy_paged_access(e1000e_dev_t *dev, uint32_t offset,
+				   uint16_t *val, int write)
 {
 	uint16_t page = (uint16_t)(offset >> E1000E_IGP_PAGE_SHIFT);
 	uint8_t reg = (uint8_t)(offset & E1000E_MAX_PHY_REG_ADDRESS);
 	uint8_t phy_addr = e1000e_phy_addr_for_hv_page(page);
 
-	if (offset > E1000E_MAX_PHY_REG_ADDRESS) {
-		if (e1000e_phy_write_at(
-			    dev, phy_addr, E1000E_IGP_PHY_PAGE_SELECT,
-			    (uint16_t)(page << E1000E_IGP_PAGE_SHIFT)) != 0) {
-			return -1;
-		}
-	}
-
+	if (WARN_ON_ONCE(page > 0 && page < E1000E_HV_INTC_FC_PAGE_START))
+		return -1;
+	if (page == E1000E_HV_INTC_FC_PAGE_START)
+		page = 0;
+	if (reg > 15 &&
+	    e1000e_phy_write_at(dev, phy_addr, E1000E_IGP_PHY_PAGE_SELECT,
+				(uint16_t)(page << E1000E_IGP_PAGE_SHIFT)) != 0)
+		return -1;
+	if (write)
+		return e1000e_phy_write_at(dev, phy_addr, reg, *val);
 	return e1000e_phy_read_at(dev, phy_addr, reg, val);
+}
+
+static int e1000e_phy_read_paged_locked(e1000e_dev_t *dev, uint32_t offset,
+					uint16_t *val)
+{
+	uint16_t tmp = 0;
+	int rc = e1000e_phy_paged_access(dev, offset, &tmp, 0);
+
+	if (rc == 0 && val)
+		*val = tmp;
+	return rc;
 }
 
 static int e1000e_phy_write_paged_locked(e1000e_dev_t *dev, uint32_t offset,
 					 uint16_t val)
 {
-	uint16_t page = (uint16_t)(offset >> E1000E_IGP_PAGE_SHIFT);
-	uint8_t reg = (uint8_t)(offset & E1000E_MAX_PHY_REG_ADDRESS);
-	uint8_t phy_addr = e1000e_phy_addr_for_hv_page(page);
-
-	if (offset > E1000E_MAX_PHY_REG_ADDRESS) {
-		if (e1000e_phy_write_at(
-			    dev, phy_addr, E1000E_IGP_PHY_PAGE_SELECT,
-			    (uint16_t)(page << E1000E_IGP_PAGE_SHIFT)) != 0) {
-			return -1;
-		}
-	}
-
-	return e1000e_phy_write_at(dev, phy_addr, reg, val);
+	return e1000e_phy_paged_access(dev, offset, &val, 1);
 }
 
 static void e1000e_force_exit_phy_ulp(e1000e_dev_t *dev)
@@ -1045,15 +1168,14 @@ static int __attribute__((unused)) e1000e_phy_read(e1000e_dev_t *dev,
 // GBE_DIS and set RESTART_AN; without this we get exactly our symptom:
 // BMSR.AN_COMPLETE=1, LSTATUS=1, but BMCR result bits show 10 Mb/s and
 // MAC STATUS.SPEED reads 00.
-// HV_OEM_BITS lives on PHY page 769 (BM_PORT_CTRL_PAGE), reg 25 — i.e.
-//     PHY_REG(769, 25)
-// Accessing it as raw reg 0x19 (page 0) — which we did before — reads a
-// completely different MII register and any write is silently dropped.
-// That is exactly the failure we observed:
+// HV_OEM_BITS is PHY ADDRESS 1, page 0, register 25 (I219 datasheet
+// §9.5.8.2), written PHY_REG(768, 25): page 768 is address 1's page 0.
+// Raw register 0x19 on address 2 -- what this was first read as -- is the
+// Interrupt Status register, which reads 0 and ignores writes:
 //     E1000E: HV_OEM_BITS 0 -> 0 (... RESTART_AN set)
-// — the read returned 0 and the write of 0x0400 had no effect, so the
-// PHY's LPLU bit was NEVER cleared and autoneg never restarted.
-#define HV_OEM_BITS E1000E_PHY_REG(769, 25)
+// The later PHY_REG(769, 25), with the page threshold at 778, still went
+// to address 2 register 25, so the bits were never actually cleared.
+#define HV_OEM_BITS E1000E_PHY_REG(768, 25)
 #define HV_OEM_BITS_LPLU 0x0004 // Low-Power Link-Up enable
 #define HV_OEM_BITS_A1KDIS 0x0008 // 1Gb idle disable
 #define HV_OEM_BITS_GBE_DIS 0x0040 // Gigabit ethernet disable
@@ -1138,7 +1260,7 @@ static int e1000e_oem_bits_clear_lplu_ex(e1000e_dev_t *dev, int restart_an)
 	e1000e_release_swflag(dev);
 
 	e1000e_dbg(
-		"E1000E: HV_OEM_BITS(769.25) %04x -> %04x (LPLU/GBE_DIS cleared, RESTART_AN=%d)\n",
+		"E1000E: HV_OEM_BITS(768.25) %04x -> %04x (LPLU/GBE_DIS cleared, RESTART_AN=%d)\n",
 		before, after, restart_an ? 1 : 0);
 	return rc;
 }
@@ -1176,11 +1298,16 @@ static void e1000e_disable_eee(e1000e_dev_t *dev)
 		eeer_before, e1000e_read(dev, E1000_EEER), ipc_before,
 		e1000e_read(dev, E1000_IPCNFG));
 
-	// 2. PHY-side disable: clear the EEE advertisement (EMI 0x040E).
-	//    The EMI window is two paged PHY registers on page 776: write the
-	//    EMI register address into I82579_EMI_ADDR, then the data into
-	//    I82579_EMI_DATA.
+	// 2. PHY-side disable: clear the EEE advertisement (EMI 0x8001,
+	//    IEEE MMD 7.60): write the EMI register address into
+	//    I82579_EMI_ADDR, then the data through I82579_EMI_DATA.  The EMI
+	//    window is PHY address 2, page 0, registers 16/17 -- holding the
+	//    PHY semaphore, as every other PHY access does.
 	uint16_t lp = 0xFFFF, adv_after = 0xFFFF;
+	if (e1000e_acquire_swflag(dev) != 0) {
+		e1000e_dbg("E1000E: EEE: PHY semaphore not granted, skipped\n");
+		return;
+	}
 	if (e1000e_phy_write_paged_locked(dev, I82579_EMI_ADDR,
 					  I217_EEE_ADVERTISEMENT) == 0 &&
 	    e1000e_phy_write_paged_locked(dev, I82579_EMI_DATA, 0x0000) == 0) {
@@ -1196,14 +1323,18 @@ static void e1000e_disable_eee(e1000e_dev_t *dev)
 					  I217_EEE_LP_ABILITY) == 0) {
 		(void)e1000e_phy_read_paged_locked(dev, I82579_EMI_DATA, &lp);
 	}
+	e1000e_release_swflag(dev);
 	e1000e_dbg(
-		"E1000E: PHY EEE adv cleared (EMI[040E]=%04x) LP_ability(EMI[040F])=%04x\n",
+		"E1000E: PHY EEE adv cleared (EMI[8001]=%04x) LP_ability(EMI[8002])=%04x\n",
 		adv_after, lp);
-	// NOTE: do NOT touch "LPI_CTRL" at page 776 reg 18 — that register on
-	// this PHY is NOT the I82579-style I82579_LPI_CTRL (which lives at page
-	// 772 reg 20).  Page 776 reg 18 is some PHY-internal config that
-	// defaults to 0x8402 and clearing it breaks autoneg completely
-	// (verified empirically: LPAR=0, BMSR unchanged, AN_COMPLETE=0).
+	(void)lp;
+	(void)adv_after;
+	// NOTE: I218_LPI_CTRL (page 776 reg 18) is not touched.  With the old
+	// page threshold it resolved to PHY address 2 register 18, PHY
+	// Control 2, and clearing THAT is what broke autoneg ("LPAR=0,
+	// AN_COMPLETE=0") when it was tried; the real LPI control register
+	// is page 772 register 20 at address 1, and EEE is already off
+	// through the advertisement above.
 }
 
 // PHY-front-end copper config that MUST run before autoneg restart on
@@ -1829,7 +1960,7 @@ static void e1000e_pch_lan_init(e1000e_dev_t *dev)
 	//   27  — same family (required on I219)
 	// TARC1 bits:
 	//   24  set   — match TARC0
-	//   28  clear — gates TX entirely on some I219 steppings
+	//   28  set only while TCTL.MULR is clear (it is set: see below)
 	{
 		uint32_t tarc0 = e1000e_read(dev, E1000_TARC0);
 #if E1000E_DBG
@@ -1838,15 +1969,23 @@ static void e1000e_pch_lan_init(e1000e_dev_t *dev)
 		tarc0 |= (1u << 23) | (1u << 24) | (1u << 26) | (1u << 27);
 		e1000e_write(dev, E1000_TARC0, tarc0);
 
-		// TARC1: per the I218/I219 datasheet, set bits 24, 26, 30 (and
-		// conditionally 28 based on TCTL.MULR).  We are not enabling MULR,
-		// so we set bit 28 too.
+		// TARC1: per the I218/I219 datasheet, set bits 24, 26, 30, and
+		// bit 28 only while TCTL.MULR is clear.  e1000e_init_tx() sets
+		// MULR on every PCH-LAN part, so bit 28 is cleared here.
 		uint32_t tarc1 = e1000e_read(dev, E1000_TARC1);
 #if E1000E_DBG
 		uint32_t tarc1_before = tarc1;
 #endif
-		tarc1 |= (1u << 24) | (1u << 26) | (1u << 28) | (1u << 30);
+		tarc1 |= (1u << 24) | (1u << 26) | (1u << 30);
+		tarc1 &= ~(1u << 28);
 		e1000e_write(dev, E1000_TARC1, tarc1);
+
+		// Descriptor data corruption during NFS v2 UDP traffic: the
+		// NFS filtering of the receive filter is switched off.
+		e1000e_write(dev, E1000_RFCTL,
+			     e1000e_read(dev, E1000_RFCTL) |
+				     E1000_RFCTL_NFSW_DIS |
+				     E1000_RFCTL_NFSR_DIS);
 
 		e1000e_dbg("E1000E: TARC0 %08x -> %08x, TARC1 %08x -> %08x\n",
 			   tarc0_before, e1000e_read(dev, E1000_TARC0),
@@ -2134,19 +2273,38 @@ static void e1000e_configure_kmrn_for_1000(e1000e_dev_t *dev)
 // ============================================================================
 // EEPROM Read
 // ============================================================================
-static uint16_t e1000e_read_eeprom(e1000e_dev_t *dev, uint8_t addr)
+/* EERD on the 8257x / 80003 / 82574 / 82583 parts.  Their layout is not the
+ * 8254x one in e1000.h: the word address starts at bit 2 (not 8) and DONE
+ * is bit 1 (not 4); data is bits 31:16 in both.  With the 8254x layout the
+ * read asked for the wrong word and never saw DONE.
+ *
+ * Never on ICH8-10 or PCH parts: they have no EERD at all -- offset 0x14
+ * there is FEXTNVM5, a PHY/power configuration register, which every MAC
+ * read used to overwrite three times.  Their NVM is the platform flash,
+ * and the MAC address it holds is already loaded into RAL0/RAH0.
+ *
+ * Returns 0 and the word, or -1 when the read did not complete. */
+#define E1000E_EERD_START 0x00000001u
+#define E1000E_EERD_DONE 0x00000002u
+#define E1000E_EERD_ADDR_SHIFT 2
+#define E1000E_EERD_DATA_SHIFT 16
+
+static int e1000e_read_eeprom(e1000e_dev_t *dev, uint8_t addr, uint16_t *out)
 {
+	if (WARN_ON_ONCE(e1000e_is_pch_lan(dev->device_id)))
+		return -1;
 	e1000e_write(dev, E1000_EERD,
-		     (uint32_t)addr << E1000_EERD_ADDR_SHIFT |
-			     E1000_EERD_START);
-	uint32_t val;
-	for (int i = 0; i < 10000; i++) {
-		val = e1000e_read(dev, E1000_EERD);
-		if (val & E1000_EERD_DONE) {
-			return (uint16_t)(val >> E1000_EERD_DATA_SHIFT);
+		     ((uint32_t)addr << E1000E_EERD_ADDR_SHIFT) |
+			     E1000E_EERD_START);
+	for (int i = 0; i < 100000; i++) {
+		uint32_t val = e1000e_read(dev, E1000_EERD);
+		if (val & E1000E_EERD_DONE) {
+			*out = (uint16_t)(val >> E1000E_EERD_DATA_SHIFT);
+			return 0;
 		}
+		e1000e_delay_us(5);
 	}
-	return 0;
+	return -1;
 }
 
 // ============================================================================
@@ -2154,11 +2312,14 @@ static uint16_t e1000e_read_eeprom(e1000e_dev_t *dev, uint8_t addr)
 // ============================================================================
 static void e1000e_read_mac(e1000e_dev_t *dev)
 {
-	uint16_t w0 = e1000e_read_eeprom(dev, 0);
-	uint16_t w1 = e1000e_read_eeprom(dev, 1);
-	uint16_t w2 = e1000e_read_eeprom(dev, 2);
+	uint16_t w0 = 0, w1 = 0, w2 = 0;
+	int nvm_ok = !e1000e_is_pch_lan(dev->device_id) &&
+		     e1000e_read_eeprom(dev, 0, &w0) == 0 &&
+		     e1000e_read_eeprom(dev, 1, &w1) == 0 &&
+		     e1000e_read_eeprom(dev, 2, &w2) == 0;
 
-	if (w0 != 0 || w1 != 0 || w2 != 0) {
+	if (nvm_ok && (w0 != 0 || w1 != 0 || w2 != 0) &&
+	    !(w0 == 0xFFFF && w1 == 0xFFFF && w2 == 0xFFFF)) {
 		dev->mac_addr[0] = w0 & 0xFF;
 		dev->mac_addr[1] = (w0 >> 8) & 0xFF;
 		dev->mac_addr[2] = w1 & 0xFF;
@@ -2166,7 +2327,7 @@ static void e1000e_read_mac(e1000e_dev_t *dev)
 		dev->mac_addr[4] = w2 & 0xFF;
 		dev->mac_addr[5] = (w2 >> 8) & 0xFF;
 	} else {
-		// Fallback: read from RAL/RAH (preprogrammed by firmware)
+		// RAL/RAH, loaded from the NVM by the hardware (firmware on PCH)
 		uint32_t ral = e1000e_read(dev, E1000_RAL);
 		uint32_t rah = e1000e_read(dev, E1000_RAH);
 		dev->mac_addr[0] = ral & 0xFF;
@@ -2191,6 +2352,25 @@ static void e1000e_delay_us(uint32_t us)
 	}
 	while (timer_pmtimer_delta_us(t0, timer_pmtimer_read_raw()) < us)
 		__asm__ volatile("pause");
+}
+
+/* E1000E_CACHED_DMA_BUFFERS: leave the RX/TX packet buffers write-back
+ * mapped where the device's DMA is cache-coherent -- PCIe snooped, which
+ * every 8257x/82583 does and the SPT and later PCH-LAN MACs do with GCR's
+ * no-snoop requests cleared (e1000e_pch_lan_init).  The copy out of an
+ * uncached receive buffer costs an uncached read per word on every frame.
+ * Older ICH/PCH LAN parts (ICH8..LPT) keep uncached buffers.  The
+ * descriptor rings are uncached in every case: the CPU and the device
+ * update them word by word.  0 restores uncached buffers everywhere. */
+#define E1000E_CACHED_DMA_BUFFERS 1
+
+static int e1000e_buffers_cacheable(uint16_t did)
+{
+	if (!E1000E_CACHED_DMA_BUFFERS)
+		return 0;
+	if (!e1000e_is_pch_lan(did))
+		return 1;
+	return e1000e_mac_gen(did) >= E1000E_MAC_PCH_SPT;
 }
 
 static void e1000e_make_dma_pages_uncached(uint64_t phys_base,
@@ -2282,7 +2462,8 @@ static int e1000e_init_rx(e1000e_dev_t *dev)
 		}
 		dev->rx_bufs[i] = (uint8_t *)phys_to_virt(buf_phys);
 		dev->rx_bufs_phys[i] = buf_phys;
-		e1000e_make_dma_pages_uncached(buf_phys, 1, "rx-buf");
+		if (!dev->buffers_cached)
+			e1000e_make_dma_pages_uncached(buf_phys, 1, "rx-buf");
 
 		dev->rx_descs[i].buffer_addr = buf_phys;
 		dev->rx_descs[i].status = 0;
@@ -2311,11 +2492,28 @@ static int e1000e_init_rx(e1000e_dev_t *dev)
 		e1000e_write(dev, E1000_RXDCTL, rxdctl);
 	}
 
+	/* Receive checksum offload: the MAC verifies IPv4 header and TCP/UDP
+	 * checksums and reports the result in each descriptor (e1000e_rx). */
+	e1000e_write(dev, E1000_RXCSUM,
+		     e1000e_read(dev, E1000_RXCSUM) | E1000_RXCSUM_IPOFL |
+			     E1000_RXCSUM_TUOFL);
+
+	/* Interrupt moderation: no per-frame receive delay (RDTR 0, so the
+	 * absolute delay RADV is idle too) and the interrupt rate capped by
+	 * ITR, starting at 20000/s; the NAPI poll adapts it to the traffic
+	 * (e1000e_update_itr). */
+	e1000e_write(dev, E1000_RDTR, 0);
+	e1000e_write(dev, E1000_RADV, 8);
+	dev->itr_rate = NIC_ITR_RATE_LOW;
+	dev->itr_rx_class = dev->itr_tx_class = NIC_ITR_LOW;
+	e1000e_write(dev, E1000_ITR, nic_itr_reg(dev->itr_rate));
+
 	uint32_t rctl = E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_BSIZE_2048 |
 			E1000_RCTL_SECRC;
 	e1000e_write(dev, E1000_RCTL, rctl);
 
 	dev->rx_tail = E1000E_NUM_RX_DESC - 1;
+	dev->rx_discarding = 0;
 	return 0;
 }
 
@@ -2349,7 +2547,9 @@ static int e1000e_init_tx(e1000e_dev_t *dev)
 		}
 		dev->tx_bufs[i] = (uint8_t *)phys_to_virt(buf_phys);
 		dev->tx_bufs_phys[i] = buf_phys;
-		e1000e_make_dma_pages_uncached(buf_phys, 1, "tx-buf");
+		dev->tx_stamp[i] = 0;
+		if (!dev->buffers_cached)
+			e1000e_make_dma_pages_uncached(buf_phys, 1, "tx-buf");
 	}
 
 	e1000e_write(dev, E1000_TDBAL, (uint32_t)(tx_phys & 0xFFFFFFFF));
@@ -2373,7 +2573,9 @@ static int e1000e_init_tx(e1000e_dev_t *dev)
 	// matching what working hardware ground-truth shows on PCH-LAN.  Pure
 	// latency tuning — does not gate TX.
 	e1000e_write(dev, E1000_TIDV, 8);
-	e1000e_write(dev, E1000_TADV, 0);
+	// TADV bounds the delay of a TXDW behind a stream of frames that
+	// keep restarting TIDV (descriptors carry IDE: e1000e_xmit).
+	e1000e_write(dev, E1000_TADV, 32);
 
 	// TXDCTL — use the canonical PCH-LAN values from the datasheet:
 	//
@@ -2487,244 +2689,128 @@ static int e1000e_init_tx(e1000e_dev_t *dev)
 	}
 
 	dev->tx_tail = 0;
+	dev->tx_clean = 0;
 	return 0;
 }
 
 // ============================================================================
-// Send (net_device_t callback)
+// Transmit (net_device_t xmit hook)
 // ============================================================================
-// Forward declaration: defined alongside e1000e_link_status() below.
-static void e1000e_link_state_poll(e1000e_dev_t *dev);
+/* Wake a stopped transmit queue once this many descriptors are free. */
+#define E1000E_TX_WAKE_THRESH 32
+#define MII_LPA 0x05 // link partner ability
 
-static int e1000e_send(net_device_t *ndev, const uint8_t *data, uint16_t len)
+/* Interrupt causes the NAPI poll owns (masked while it is scheduled), and
+ * every cause the driver uses. */
+#define E1000E_IMS_NAPI                                       \
+	(E1000_ICR_RXT0 | E1000_ICR_TXDW | E1000_ICR_RXDMT0 | \
+	 E1000_ICR_RXO)
+#define E1000E_IMS_ALL (E1000E_IMS_NAPI | E1000_ICR_LSC)
+
+static uint32_t e1000e_tx_unused(const e1000e_dev_t *dev)
 {
-	BUG_ON(ndev == NULL);
+	return nic_ring_unused(dev->tx_tail, dev->tx_clean, E1000E_NUM_TX_DESC);
+}
+
+/* Reclaim the descriptors the hardware has written back (DD), oldest first.
+ * The packet bytes were copied into the ring's own buffers at transmit, so
+ * nothing else is released.  Caller holds tx_lock. */
+static uint32_t e1000e_tx_clean_locked(e1000e_dev_t *dev)
+{
+	uint32_t n = 0;
+
+	while (dev->tx_clean != dev->tx_tail) {
+		volatile e1000_tx_desc_legacy_t *d =
+			&dev->tx_descs[dev->tx_clean];
+		uint8_t st = d->status;
+
+		if (!(st & E1000_TXD_STAT_DD))
+			break;
+		if (st & (E1000_TXD_STAT_EC | E1000_TXD_STAT_LC))
+			dev->net_dev.tx_errors++;
+		dev->itr_tx_packets++;
+		dev->itr_tx_bytes += d->length;
+		d->cmd = 0;
+		d->status = 0;
+		dev->tx_stamp[dev->tx_clean] = 0;
+		dev->tx_clean = (uint16_t)((dev->tx_clean + 1) %
+					   E1000E_NUM_TX_DESC);
+		n++;
+	}
+	return n;
+}
+
+/* Wake the queue if the transmit hook stopped it and room is back.  Caller
+ * holds tx_lock, so a stop cannot slip in between the check and the wake. */
+static void e1000e_tx_maybe_wake_locked(e1000e_dev_t *dev)
+{
+	if (netif_queue_stopped(&dev->net_dev) &&
+	    e1000e_tx_unused(dev) >= E1000E_TX_WAKE_THRESH)
+		netif_wake_queue(&dev->net_dev);
+}
+
+/* Hand one frame to the hardware.  Called by the device core one CPU at a
+ * time (qdisc_run); tx_lock orders it against the poll's reclaim and the
+ * watchdog's ring reset on CPU 0.  A full ring stops the queue and answers
+ * NETDEV_TX_BUSY: the core keeps the frame and the reclaim wakes the queue
+ * again. */
+static int e1000e_xmit(sk_buff_t *skb, net_device_t *ndev)
+{
+	e1000e_dev_t *dev = (e1000e_dev_t *)ndev->driver_data;
+	uint32_t len = skb->len;
+	uint64_t f;
+	uint16_t i;
+
+	BUG_ON(dev == NULL);
 	BUILD_BUG_ON(sizeof(e1000_rx_desc_legacy_t) != 16);
 	BUILD_BUG_ON(sizeof(e1000_tx_desc_legacy_t) != 16);
-	e1000e_dev_t *dev = (e1000e_dev_t *)ndev->driver_data;
-	BUG_ON(dev == NULL);
+	if (len == 0 || len > E1000E_RX_BUF_SIZE) {
+		ndev->tx_dropped++;
+		skb_put(skb);
+		return NETDEV_TX_OK;
+	}
 
-	// Always service the link state on the TX path.  After a cable
-	// replug we must re-clear LPLU on the PHY or the descriptor will
-	// be fetched but the buffer payload will never be pulled across
-	// the MII interface (silent TX drop).  Polling unconditionally
-	// (rather than gating on link_change_pending) closes the race
-	// where userland calls send() before the LSC IRQ has been taken.
-	e1000e_link_state_poll(dev);
-
-	if (len > E1000E_RX_BUF_SIZE)
-		return -1;
-
-	// Serialize across CPUs: tx_tail, descriptor slot, and TDT MMIO
-	// write form one critical section; without this two CPUs can
-	// (a) read the same tx_tail, (b) write the same descriptor slot,
-	// and (c) lose one packet to the duplicate-tail-bump.  Hold IRQs
-	// disabled for the few MMIO cycles so an IRQ-tail TX (e.g. softirq
-	// sending a TCP ACK) cannot preempt user-context TX from the same
-	// CPU mid-slot.
-	uint64_t txflags;
-	spin_lock_irqsave(&dev->tx_lock, &txflags);
-
-	uint16_t tail = dev->tx_tail;
-	volatile e1000_tx_desc_legacy_t *desc = &dev->tx_descs[tail];
-	if (tail != 0 || desc->cmd != 0) {
-		if (!(desc->status & E1000_TXD_STAT_DD) && desc->cmd != 0) {
-			ndev->tx_errors++;
-			spin_unlock_irqrestore(&dev->tx_lock, txflags);
-			return -1;
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	if (e1000e_tx_unused(dev) == 0) {
+		e1000e_tx_clean_locked(dev);
+		if (e1000e_tx_unused(dev) == 0) {
+			netif_stop_queue(ndev);
+			spin_unlock_irqrestore(&dev->tx_lock, f);
+			return NETDEV_TX_BUSY;
 		}
 	}
 
-	// rep movs — was a byte loop under tx_lock IRQs-off, throttling
-	// ACK emission and feeding back into receiver flow control.
-	mm_memcpy(dev->tx_bufs[tail], data, len);
+	i = dev->tx_tail;
+	volatile e1000_tx_desc_legacy_t *desc = &dev->tx_descs[i];
 
-	desc->buffer_addr = dev->tx_bufs_phys[tail];
-	desc->length = len;
+	mm_memcpy(dev->tx_bufs[i], skb->data, len);
+	desc->buffer_addr = dev->tx_bufs_phys[i];
+	desc->length = (uint16_t)len;
 	desc->cso = 0;
-	desc->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS;
 	desc->status = 0;
 	desc->css = 0;
 	desc->special = 0;
+	desc->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS |
+		    E1000_TXD_CMD_IDE;
+	{
+		uint64_t now = timer_ticks();
 
+		dev->tx_stamp[i] = now ? now : 1;
+	}
+
+	// The buffer and descriptor before the doorbell.
 	__asm__ volatile("mfence" ::: "memory");
 
-	dev->tx_tail = (tail + 1) % E1000E_NUM_TX_DESC;
+	dev->tx_tail = (uint16_t)((i + 1) % E1000E_NUM_TX_DESC);
 	e1000e_write(dev, E1000_TDT, dev->tx_tail);
 
 	ndev->tx_packets++;
 	ndev->tx_bytes += len;
-	spin_unlock_irqrestore(&dev->tx_lock, txflags);
-
-#if E1000E_DBG
-	// Diagnostic: after each of the first 8 transmits, snapshot the MAC
-	// RX stat counters.  Most of these registers are read-to-clear, so
-	// each line shows what arrived since the previous dump — which for
-	// the first call is everything since RCTL.EN was set, and for
-	// subsequent calls is everything between back-to-back TX events.
-	// This catches DHCP OFFER replies (or their absence) that arrive
-	// 10-100 ms after our DISCOVER, long after the init path has
-	// returned.
-	{
-		static uint32_t tx_dump_count = 0;
-		if (tx_dump_count < 8) {
-			tx_dump_count++;
-			uint32_t s = e1000e_read(dev, E1000_STATUS);
-			uint32_t rdh = e1000e_read(dev, E1000_RDH);
-			uint32_t rdt = e1000e_read(dev, E1000_RDT);
-			uint32_t gprc = e1000e_read(dev, E1000_GPRC);
-			uint32_t tpr = e1000e_read(dev, E1000_TPR);
-			uint32_t gptc = e1000e_read(dev, E1000_GPTC);
-			uint32_t tpt = e1000e_read(dev, E1000_TPT);
-			uint32_t crc = e1000e_read(dev, E1000_CRCERRS);
-			uint32_t rxe = e1000e_read(dev, E1000_RXERRC);
-			uint32_t mpc = e1000e_read(dev, E1000_MPC);
-			uint32_t rnbc = e1000e_read(dev, E1000_RNBC);
-			uint32_t tdh = e1000e_read(dev, E1000_TDH);
-			uint32_t tdt = e1000e_read(dev, E1000_TDT);
-			uint32_t tctl = e1000e_read(dev, E1000_TCTL);
-			uint32_t txdctl = e1000e_read(dev, E1000_TXDCTL);
-			uint32_t tipg = e1000e_read(dev, E1000_TIPG);
-			uint32_t tidv = e1000e_read(dev, E1000_TIDV);
-			uint32_t tadv = e1000e_read(dev, E1000_TADV);
-			uint32_t tdbal = e1000e_read(dev, E1000_TDBAL);
-			uint32_t tdbah = e1000e_read(dev, E1000_TDBAH);
-			uint32_t tdlen = e1000e_read(dev, E1000_TDLEN);
-			uint32_t ctrl = e1000e_read(dev, E1000_CTRL);
-			const char *spd[] = { "10", "100", "1000", "rsv" };
-			e1000e_dbg(
-				"E1000E: tx#%u STATUS=%08x CTRL=%08x speed=%s LU=%u GIO_MASTER=%u "
-				"RDH=%u RDT=%u TDH=%u TDT=%u "
-				"GPRC=%u TPR=%u GPTC=%u TPT=%u "
-				"CRCERRS=%u RXERRC=%u MPC=%u RNBC=%u\n",
-				tx_dump_count, s, ctrl, spd[(s >> 6) & 3],
-				(s & E1000_STATUS_LU) ? 1 : 0, (s >> 19) & 1,
-				rdh, rdt, tdh, tdt, gprc, tpr, gptc, tpt, crc,
-				rxe, mpc, rnbc);
-			e1000e_dbg(
-				"E1000E: tx#%u TCTL=%08x TXDCTL=%08x TIPG=%08x TIDV=%08x TADV=%08x TDBA=%08x:%08x TDLEN=%u\n",
-				tx_dump_count, tctl, txdctl, tipg, tidv, tadv,
-				tdbah, tdbal, tdlen);
-			// Dump the descriptor we just wrote so we can confirm the
-			// MAC sees a valid one (DEXT=0, EOP/IFCS/RS in cmd, status=0).
-			volatile uint64_t *d =
-				(volatile uint64_t *)&dev->tx_descs[tail];
-			e1000e_dbg(
-				"E1000E: tx#%u desc[%u] @%016llx: %016llx %016llx (cmd=%02x sta=%02x len=%u)\n",
-				tx_dump_count, tail,
-				(unsigned long long)(dev->tx_descs_phys +
-						     tail * sizeof(e1000_tx_desc_legacy_t)),
-				(unsigned long long)d[0],
-				(unsigned long long)d[1], desc->cmd,
-				desc->status, desc->length);
-
-			// Poll for up to ~50 ms.  We sample TDFH separately from
-			// TDH: TDFH advancing past TDFHS means the on-chip TX FIFO
-			// popped the descriptor and queued the packet bytes for
-			// the wire.  TDH advancing means the writeback completed.
-			// If TDFH never advances either, the TX scheduler is gated
-			// BEFORE the FIFO — a flow-control / arbiter / ME-ownership
-			// problem, not a writeback / completion problem.
-			uint8_t sta_after = 0;
-			uint32_t tdh_after = tdh;
-			uint32_t gptc_after = 0, tpt_after = 0;
-			uint32_t tdfh_after = 0, tdft_after = 0;
-			uint32_t tdfhs_after = 0, tdfts_after = 0;
-			uint32_t tdfh_first_change_us = 0;
-			uint32_t tdh_first_change_us = 0;
-			uint32_t tdfh_initial = e1000e_read(dev, E1000_TDFH);
-			for (int i = 0; i < 50; i++) {
-				e1000e_delay_us(1000);
-				sta_after = desc->status;
-				tdh_after = e1000e_read(dev, E1000_TDH);
-				uint32_t tdfh_now =
-					e1000e_read(dev, E1000_TDFH);
-				if (tdfh_first_change_us == 0 &&
-				    tdfh_now != tdfh_initial)
-					tdfh_first_change_us =
-						(uint32_t)((i + 1) * 1000);
-				if (tdh_first_change_us == 0 &&
-				    tdh_after != tdh)
-					tdh_first_change_us =
-						(uint32_t)((i + 1) * 1000);
-				if (sta_after != 0 || tdh_after != tdh)
-					break;
-			}
-			gptc_after = e1000e_read(dev, E1000_GPTC);
-			tpt_after = e1000e_read(dev, E1000_TPT);
-			tdfh_after = e1000e_read(dev, E1000_TDFH);
-			tdft_after = e1000e_read(dev, E1000_TDFT);
-			tdfhs_after = e1000e_read(dev, E1000_TDFHS);
-			tdfts_after = e1000e_read(dev, E1000_TDFTS);
-			e1000e_dbg(
-				"E1000E: tx#%u after 50ms: desc.sta=%02x TDH=%u GPTC=%u TPT=%u TDFH=%08x TDFT=%08x TDFHS=%08x TDFTS=%08x\n",
-				tx_dump_count, sta_after, tdh_after, gptc_after,
-				tpt_after, tdfh_after, tdft_after, tdfhs_after,
-				tdfts_after);
-			e1000e_dbg(
-				"E1000E: tx#%u motion: TDFH_first_change_us=%u TDH_first_change_us=%u (0=never)\n",
-				tx_dump_count, tdfh_first_change_us,
-				tdh_first_change_us);
-
-			// Gating-state dump: distinguishes flow-control pause,
-			// arbiter mis-config, and ME-ownership gating.  All
-			// read-only, no behaviour change.
-			{
-				uint32_t st = e1000e_read(dev, E1000_STATUS);
-				uint32_t tctl_rb = e1000e_read(dev, E1000_TCTL);
-				uint32_t txdctl_rb =
-					e1000e_read(dev, E1000_TXDCTL);
-				uint32_t tarc0_rb =
-					e1000e_read(dev, E1000_TARC0);
-				uint32_t tarc1_rb =
-					e1000e_read(dev, E1000_TARC1);
-				uint32_t fcrtl = e1000e_read(dev, E1000_FCRTL);
-				uint32_t fcrth = e1000e_read(dev, E1000_FCRTH);
-				uint32_t fcttv = e1000e_read(dev, E1000_FCTTV);
-				uint32_t fcal = e1000e_read(dev, E1000_FCAL);
-				uint32_t fcah = e1000e_read(dev, E1000_FCAH);
-				uint32_t fct = e1000e_read(dev, E1000_FCT);
-				uint32_t rfctl = e1000e_read(dev, E1000_RFCTL);
-				uint32_t manc = e1000e_read(dev, E1000_MANC);
-				uint32_t fwsm = e1000e_read(dev, E1000_FWSM);
-				uint32_t h2me = e1000e_read(dev, E1000_H2ME);
-				uint32_t ctrl_ext_rb =
-					e1000e_read(dev, E1000_CTRL_EXT);
-				e1000e_dbg(
-					"E1000E: tx#%u gate: STATUS=%08x TXOFF=%u TCTL=%08x(EN=%u) TXDCTL=%08x(EN=%u GRAN=%u) TARC0=%08x TARC1=%08x\n",
-					tx_dump_count, st, (st >> 4) & 1,
-					tctl_rb, (tctl_rb >> 1) & 1, txdctl_rb,
-					(txdctl_rb >> 25) & 1,
-					(txdctl_rb >> 24) & 1, tarc0_rb,
-					tarc1_rb);
-				e1000e_dbg(
-					"E1000E: tx#%u flow: FCRTL=%08x FCRTH=%08x FCTTV=%08x FCAL=%08x FCAH=%08x FCT=%08x RFCTL=%08x\n",
-					tx_dump_count, fcrtl, fcrth, fcttv,
-					fcal, fcah, fct, rfctl);
-				e1000e_dbg(
-					"E1000E: tx#%u me  : MANC=%08x FWSM=%08x H2ME=%08x CTRL_EXT=%08x\n",
-					tx_dump_count, manc, fwsm, h2me,
-					ctrl_ext_rb);
-			}
-
-			if (sta_after == 0 && tdh_after == tdh &&
-			    gptc_after == 0 && tpt_after == 0) {
-				e1000e_dump_pci_dma_state(dev, tx_dump_count);
-			}
-
-			// NOTE: do NOT read ICR here.  ICR is read-to-clear; if we
-			// peek it from non-IRQ context we destroy pending RX/LSC
-			// causes that the IRQ handler hasn't had a chance to see
-			// yet, and the RX ring is never drained.  IMS is safe (RW).
-			uint32_t ims = e1000e_read(dev, E1000_IMS);
-			e1000e_dbg(
-				"E1000E: tx#%u IMS=%08x (ICR not peeked; would be destructive)\n",
-				tx_dump_count, ims);
-		}
-	}
-#endif // E1000E_DBG
-
-	return 0;
+	if (e1000e_tx_unused(dev) == 0)
+		netif_stop_queue(ndev);
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+	skb_put(skb);
+	return NETDEV_TX_OK;
 }
 
 // ============================================================================
@@ -2742,61 +2828,620 @@ static int e1000e_send(net_device_t *ndev, const uint8_t *data, uint16_t len)
 // so TX appears to "succeed" while no frame ever leaves the wire.
 //
 // We must therefore re-clear the LPLU / GBE_DIS bits on every observed
-// link-down -> link-up edge.  This is too heavy to do from the LSC IRQ
-// handler (the OEM-bits write needs the SW_FLAG semaphore, paged PHY
-// access, and ms-scale delays), so the IRQ only sets a pending flag
-// and the real edge handler runs in process context the next time
-// either the link_status callback or the send path is invoked.
+// link-down -> link-up edge, and redo the configuration that depends on
+// the speed the link came up at.  This is too heavy to do from the LSC
+// IRQ handler (the PHY writes need the SW_FLAG semaphore, paged PHY
+// access, and ms-scale delays), so the IRQ only sets a pending flag and
+// kicks the link watchdog (network housekeeping softirq, CPU 0).
+
+/* After the link went down, or when the transmit unit hangs, transmit
+ * descriptors the MAC had not yet sent stay owned by it: the ring fills
+ * and nothing more goes out.  Throw them away and restart the ring empty,
+ * touching only the transmit queue (TCTL.EN off, head and tail to 0, TCTL
+ * restored), nothing of the PHY or the rest of the MAC. */
+static void e1000e_tx_ring_reset(e1000e_dev_t *dev)
+{
+	uint64_t txflags;
+	uint32_t pending;
+
+	spin_lock_irqsave(&dev->tx_lock, &txflags);
+	e1000e_tx_clean_locked(dev);
+	pending = (uint32_t)((dev->tx_tail + E1000E_NUM_TX_DESC -
+			      dev->tx_clean) %
+			     E1000E_NUM_TX_DESC);
+	if (!pending) {
+		spin_unlock_irqrestore(&dev->tx_lock, txflags);
+		return;
+	}
+	uint32_t tctl = e1000e_read(dev, E1000_TCTL);
+	e1000e_write(dev, E1000_TCTL, tctl & ~E1000_TCTL_EN);
+	(void)e1000e_read(dev, E1000_STATUS); // posting flush
+	e1000e_delay_us(100);
+	for (int i = 0; i < E1000E_NUM_TX_DESC; i++) {
+		volatile e1000_tx_desc_legacy_t *d = &dev->tx_descs[i];
+
+		d->cmd = 0;
+		d->status = 0;
+		d->length = 0;
+		dev->tx_stamp[i] = 0;
+	}
+	__asm__ volatile("mfence" ::: "memory");
+	dev->tx_tail = 0;
+	dev->tx_clean = 0;
+	e1000e_write(dev, E1000_TDH, 0);
+	e1000e_write(dev, E1000_TDT, 0);
+	e1000e_write(dev, E1000_TCTL, tctl);
+	dev->net_dev.tx_errors += pending;
+	e1000e_tx_maybe_wake_locked(dev);
+	spin_unlock_irqrestore(&dev->tx_lock, txflags);
+}
+
+/* A K1 change takes effect only after the MAC re-syncs its clocks to the
+ * Kumeran interface: speed forced (FRCSPD, speed bits clear) with the
+ * speed bypass set for a moment, then CTRL and CTRL_EXT restored.  Caller
+ * holds the PHY semaphore when it got it (the Kumeran register is shared
+ * with the firmware). */
+static void e1000e_configure_k1_locked(e1000e_dev_t *dev, int enable)
+{
+	uint16_t k1 = 0;
+
+	e1000e_kmrn_read(dev, E1000_KMRN_K1_CONFIG_OFFSET, &k1);
+	if (enable)
+		k1 |= E1000_KMRN_K1_ENABLE;
+	else
+		k1 &= ~E1000_KMRN_K1_ENABLE;
+	e1000e_kmrn_write(dev, E1000_KMRN_K1_CONFIG_OFFSET, k1);
+	e1000e_delay_us(20);
+
+	uint32_t ext = e1000e_read(dev, E1000_CTRL_EXT);
+	uint32_t ctrl = e1000e_read(dev, E1000_CTRL);
+	uint32_t forced = (ctrl & ~(E1000_CTRL_SPD_1000 | E1000_CTRL_SPD_100)) |
+			  E1000_CTRL_FRCSPD;
+
+	e1000e_write(dev, E1000_CTRL, forced);
+	e1000e_write(dev, E1000_CTRL_EXT, ext | E1000_CTRL_EXT_SPD_BYPS);
+	(void)e1000e_read(dev, E1000_STATUS);
+	e1000e_delay_us(20);
+	e1000e_write(dev, E1000_CTRL, ctrl);
+	e1000e_write(dev, E1000_CTRL_EXT, ext);
+	(void)e1000e_read(dev, E1000_STATUS);
+	e1000e_delay_us(20);
+}
+
+static uint32_t e1000e_status_speed(uint32_t status)
+{
+	switch ((status >> 6) & 0x3) {
+	case 0:
+		return 10;
+	case 1:
+		return 100;
+	default:
+		return 1000;
+	}
+}
+
+/* The Kumeran timing for the speed the link came up at, and on the parts
+ * this driver was brought up on (ThinkPad P50, SPT I219) K1 per speed at
+ * full duplex: on at 1000 Mb/s, off with the PLL clock request held at
+ * 10/100.  Run at every link-up -- the speed can differ each time. */
+static void e1000e_pch_link_timing(e1000e_dev_t *dev, uint32_t status)
+{
+	uint32_t speed = e1000e_status_speed(status);
+	int held = e1000e_acquire_swflag(dev) == 0;
+
+	if (speed == 1000)
+		e1000e_configure_kmrn_for_1000(dev);
+	else
+		e1000e_configure_kmrn_for_10_100(dev);
+
+	if (e1000e_has_10_100_k1_pll_quirk(dev->device_id) &&
+	    (status & E1000_STATUS_LU) && (status & E1000_STATUS_FD)) {
+		if (speed == 1000) {
+			e1000e_configure_k1_locked(dev, 1);
+		} else {
+			e1000e_configure_k1_locked(dev, 0);
+			e1000e_write(dev, E1000_FEXTNVM6,
+				     e1000e_read(dev, E1000_FEXTNVM6) |
+					     E1000_FEXTNVM6_REQ_PLL_CLK);
+		}
+	}
+	if (held)
+		e1000e_release_swflag(dev);
+}
+
+/* Latency Tolerance Reporting: with link, the time the receive packet
+ * buffer can absorb at this speed, capped to the platform's maximum; with
+ * no link, no requirement.  SPT and later. */
+static void e1000e_set_ltr(e1000e_dev_t *dev, int link, uint32_t speed)
+{
+	uint32_t reg = E1000_LTRV_SEND;
+
+	if (link) {
+		const pci_device_t *p = dev->pci_dev;
+		uint32_t cap = pci_cfg_read32(p->bus, p->device, p->function,
+					      E1000_PCI_LTR_CAP_LPT);
+		uint16_t max_snoop = (uint16_t)(cap & 0xFFFF);
+		uint16_t max_nosnoop = (uint16_t)(cap >> 16);
+		uint16_t pmax = max_snoop > max_nosnoop ? max_snoop :
+							  max_nosnoop;
+		uint16_t enc = nic_ltr_encode(e1000e_read(dev, E1000_PBA) &
+						      0xFFFF,
+					      E1000E_MAX_FRAME, speed, pmax);
+
+		if (enc == 0xFFFF)
+			return; // not encodable: leave what is programmed
+		reg |= (1u << (E1000_LTRV_REQ_SHIFT +
+			       E1000_LTRV_NOSNOOP_SHIFT)) |
+		       (1u << E1000_LTRV_REQ_SHIFT) | enc |
+		       ((uint32_t)enc << E1000_LTRV_NOSNOOP_SHIFT);
+	}
+	e1000e_write(dev, E1000_LTRV, reg);
+}
+
+/* What the SPT and later MACs need at every link-up, for the speed and
+ * duplex the link came up at:
+ *   - TIPG.IPGT 0xC at 10/100 full duplex, 8 otherwise (the half-duplex
+ *     10 Mb/s 0xFF value is never used: IPGT 0xFF parks the transmitter)
+ *   - the analog receive latency (EMI I217_RX_CONFIG)
+ *   - the PLL clock gate count: 0x3E8 at 10/100, 0xFA at 1000
+ *   - K1 clock request at 1000 Mb/s
+ *   - the MAC/PHY pointer gap: at least 0x18 at 1000, 0xC023 at 10/100
+ *   - LTR, the SPT K1-off mirror (PCIEANACFG -> FEXTNVM6)
+ *   - flow control resolved from the autonegotiation (RFCE/TFCE).
+ * Pre-SPT PCH parts and the 8257x keep their configuration. */
+static void e1000e_spt_link_up(e1000e_dev_t *dev, uint32_t status)
+{
+	enum e1000e_mac_gen gen = e1000e_mac_gen(dev->device_id);
+	uint32_t speed = e1000e_status_speed(status);
+	int fd = (status & E1000_STATUS_FD) != 0;
+	uint16_t anar = 0, lpa = 0;
+	int fc_known = 0;
+
+	if (gen < E1000E_MAC_PCH_SPT)
+		return;
+
+	uint32_t tipg = e1000e_read(dev, E1000_TIPG) & ~E1000_TIPG_IPGT_MASK;
+	tipg |= (fd && speed != 1000) ? 0xCu : 0x8u;
+	e1000e_write(dev, E1000_TIPG, tipg);
+
+	if (e1000e_acquire_swflag(dev) == 0) {
+		uint16_t v;
+
+		(void)(e1000e_phy_write_paged_locked(dev, I82579_EMI_ADDR,
+						     I217_RX_CONFIG) == 0 &&
+		       e1000e_phy_write_paged_locked(dev, I82579_EMI_DATA,
+						     (!fd && speed == 10) ? 0 :
+									   1));
+		if (e1000e_phy_read_paged_locked(dev, I217_PLL_CLOCK_GATE_REG,
+						 &v) == 0) {
+			v &= (uint16_t)~I217_PLL_CLOCK_GATE_MASK;
+			v |= speed == 1000 ? 0xFA : 0x3E8;
+			(void)e1000e_phy_write_paged_locked(
+				dev, I217_PLL_CLOCK_GATE_REG, v);
+		}
+		if (speed == 1000 &&
+		    e1000e_phy_read_paged_locked(dev, HV_PM_CTRL, &v) == 0)
+			(void)e1000e_phy_write_paged_locked(
+				dev, HV_PM_CTRL,
+				(uint16_t)(v | HV_PM_CTRL_K1_CLK_REQ));
+		if (speed == 1000) {
+			if (e1000e_phy_read_paged_locked(dev, I219_PTR_GAP_REG,
+							 &v) == 0 &&
+			    ((v >> 2) & 0x3FF) < 0x18) {
+				v &= (uint16_t)~(0x3FFu << 2);
+				v |= 0x18u << 2;
+				(void)e1000e_phy_write_paged_locked(
+					dev, I219_PTR_GAP_REG, v);
+			}
+		} else {
+			(void)e1000e_phy_write_paged_locked(
+				dev, I219_PTR_GAP_REG, 0xC023);
+		}
+		fc_known = e1000e_phy_read_at(dev, E1000E_PHY_ADDR, MII_ANAR,
+					      &anar) == 0 &&
+			   e1000e_phy_read_at(dev, E1000E_PHY_ADDR,
+					      MII_LPA, &lpa) == 0;
+		e1000e_release_swflag(dev);
+	}
+
+	e1000e_set_ltr(dev, 1, speed);
+
+	if (gen == E1000E_MAC_PCH_SPT) {
+		uint32_t fx6 = e1000e_read(dev, E1000_FEXTNVM6);
+
+		if (e1000e_read(dev, E1000_PCIEANACFG) &
+		    E1000_FEXTNVM6_K1_OFF_ENABLE)
+			fx6 |= E1000_FEXTNVM6_K1_OFF_ENABLE;
+		else
+			fx6 &= ~E1000_FEXTNVM6_K1_OFF_ENABLE;
+		e1000e_write(dev, E1000_FEXTNVM6, fx6);
+	}
+
+	/* Flow control: what both ends advertised decides whether pause
+	 * frames are honoured (RFCE) and sent (TFCE). */
+	dev->fc_mode = fc_known ? nic_fc_resolve(anar, lpa, fd) : NIC_FC_NONE;
+	uint32_t ctrl = e1000e_read(dev, E1000_CTRL) &
+			~(E1000_CTRL_RFCE | E1000_CTRL_TFCE);
+	if (dev->fc_mode & NIC_FC_RX)
+		ctrl |= E1000_CTRL_RFCE;
+	if (dev->fc_mode & NIC_FC_TX)
+		ctrl |= E1000_CTRL_TFCE;
+	e1000e_write(dev, E1000_CTRL, ctrl);
+}
+
+/* The one place link state changes are acted on.  The LSC interrupt only
+ * flags that something changed (link_change_pending) and kicks the
+ * watchdog.  Called from the watchdog (CPU 0) and from init, never from
+ * hard-IRQ context; concurrent callers skip. */
 static void e1000e_link_state_poll(e1000e_dev_t *dev)
 {
+	if (__atomic_exchange_n(&dev->link_busy, 1, __ATOMIC_ACQUIRE))
+		return;
+
 	uint32_t status = e1000e_read(dev, E1000_STATUS);
 	int now_up = (status & E1000_STATUS_LU) ? 1 : 0;
 	int was_up = dev->link_up;
 
-	int pending = dev->link_change_pending;
-	dev->link_change_pending = 0;
+	int pending = __atomic_exchange_n(&dev->link_change_pending, 0,
+					  __ATOMIC_ACQ_REL);
 
-	// Detect edge two ways: by direct STATUS.LU comparison (covers the
-	// case where LSC is masked / hasn't fired yet) AND via the IRQ-set
-	// pending flag (covers the case where the IRQ already updated
-	// dev->link_up before we got here).
-	int edge = (now_up != was_up) || pending;
-	if (!edge)
-		return;
-
-	if (now_up != was_up) {
-		dev->link_up = now_up;
-		kprintf("E1000E: Link %s\n", now_up ? "UP" : "DOWN");
-		if (!now_up) {
-			// Link went down: invalidate any DHCP lease.  The network
-			// we get back may be different (cable moved to another
-			// switch, hypervisor toggled bridged<->NAT, ...) so the
-			// cached IP/gateway/DHCP-server are no longer trustworthy.
-			// Clearing them now makes the next dhclient invocation
-			// do a full DISCOVER instead of a unicast renewal aimed
-			// at the previous network's server.
-			dhcp_invalidate(&dev->net_dev);
-		}
+	/* The LSC storm guard masked LSC a while ago: unmask it again once
+	 * a second has passed. */
+	if (dev->lsc_masked_tick &&
+	    timer_ticks() - dev->lsc_masked_tick >= net_ms_to_ticks(1000)) {
+		dev->lsc_masked_tick = 0;
+		e1000e_write(dev, E1000_IMS, E1000_ICR_LSC);
 	}
 
-	if (now_up) {
-		// Cable was just (re-)plugged and the PHY just finished a
-		// fresh autoneg.  Re-clear the LPLU / GBE_DIS gates so the
-		// MII data path is not throttled.  Do NOT request an autoneg
-		// restart — link is already up and a restart would drop it.
+	// An edge: a changed STATUS.LU (also covers a lost or masked LSC), or
+	// an LSC the interrupt saw -- a down/up bounce shorter than a poll.
+	if (now_up == was_up && !pending)
+		goto out;
+
+	if (!now_up) {
+		if (was_up) {
+			dev->link_up = 0;
+			dev->link_speed = 0;
+			kprintf("E1000E: Link DOWN\n");
+			netif_carrier_off(&dev->net_dev);
+			/* Invalidate any DHCP lease: the network we get back
+			 * may be a different one (cable moved, hypervisor
+			 * switched bridged<->NAT), and a unicast renewal aimed
+			 * at the old server would go nowhere. */
+			dhcp_invalidate(&dev->net_dev);
+		}
+		// drop what the transmit ring can no longer send
+		e1000e_tx_ring_reset(dev);
+		if (e1000e_mac_gen(dev->device_id) >= E1000E_MAC_PCH_SPT)
+			e1000e_set_ltr(dev, 0, 0);
+		goto out;
+	}
+
+	/* Up, or down and up again since the last look.  The PHY just ran
+	 * a fresh autoneg: re-clear the LPLU / GBE_DIS gates (without an
+	 * autoneg restart -- the link is up) and redo what depends on the
+	 * speed it came up at. */
+	if (e1000e_is_pch_lan(dev->device_id)) {
 		e1000e_clear_mac_phy_ctrl_lplu(dev);
 		(void)e1000e_oem_bits_clear_lplu_ex(dev, 0);
+		status = e1000e_read(dev, E1000_STATUS);
+		if (status & E1000_STATUS_LU) {
+			e1000e_pch_link_timing(dev, status);
+			e1000e_spt_link_up(dev, status);
+		}
+	}
+	dev->link_speed = e1000e_status_speed(status);
+	dev->link_fd = (status & E1000_STATUS_FD) != 0;
+	if (!was_up) {
+		dev->link_up = 1;
+		kprintf("E1000E: Link UP (%u Mb/s, %s duplex)\n",
+			dev->link_speed, dev->link_fd ? "full" : "half");
+	}
+	netif_carrier_on(&dev->net_dev);
+out:
+	__atomic_store_n(&dev->link_busy, 0, __ATOMIC_RELEASE);
+}
+
+// ============================================================================
+// Receive filter, statistics, watchdog
+// ============================================================================
+
+/* Program the multicast table and the promiscuous bits from the device's
+ * multicast list and flags.  Watchdog context (CPU 0). */
+static void e1000e_apply_rx_mode(e1000e_dev_t *dev)
+{
+	uint8_t mc[NETDEV_MC_MAX][6];
+	uint32_t mta[128];
+	int all = 0;
+	int n = dev_mc_snapshot(&dev->net_dev, mc, NETDEV_MC_MAX, &all);
+	uint32_t flags = __atomic_load_n(&dev->net_dev.flags, __ATOMIC_ACQUIRE);
+
+	for (uint32_t r = 0; r < dev->mta_regs; r++)
+		mta[r] = 0;
+	for (int i = 0; i < n; i++) {
+		uint32_t h = nic_mta_hash(mc[i], dev->mta_regs);
+
+		mta[h >> 5] |= 1u << (h & 31);
+	}
+	for (uint32_t r = 0; r < dev->mta_regs; r++)
+		e1000e_write(dev, E1000_MTA + r * 4, mta[r]);
+
+	uint32_t rctl = e1000e_read(dev, E1000_RCTL) &
+			~(E1000_RCTL_UPE | E1000_RCTL_MPE);
+	if (flags & IFF_PROMISC)
+		rctl |= E1000_RCTL_UPE | E1000_RCTL_MPE;
+	else if (all || (flags & IFF_ALLMULTI))
+		rctl |= E1000_RCTL_MPE;
+	e1000e_write(dev, E1000_RCTL, rctl);
+}
+
+static void e1000e_set_rx_mode(net_device_t *ndev)
+{
+	e1000e_dev_t *dev = (e1000e_dev_t *)ndev->driver_data;
+
+	__atomic_store_n(&dev->rx_mode_pending, 1, __ATOMIC_RELEASE);
+	net_housekeeping_kick();
+}
+
+/* Fold the hardware's clear-on-read error counters into ours. */
+static void e1000e_update_stats(e1000e_dev_t *dev)
+{
+	dev->st_crc += e1000e_read(dev, E1000_ST_CRCERRS);
+	dev->st_align += e1000e_read(dev, E1000_ST_ALGNERRC);
+	dev->st_rxerr += e1000e_read(dev, E1000_ST_RXERRC);
+	dev->st_missed += e1000e_read(dev, E1000_ST_MPC);
+	dev->st_colls += e1000e_read(dev, E1000_ST_COLC);
+	dev->st_latecol += e1000e_read(dev, E1000_ST_LATECOL);
+	dev->st_ecol += e1000e_read(dev, E1000_ST_ECOL);
+	dev->st_tncrs += e1000e_read(dev, E1000_ST_TNCRS);
+	dev->st_rlen += e1000e_read(dev, E1000_ST_RLEC) +
+			e1000e_read(dev, E1000_ST_RUC) +
+			e1000e_read(dev, E1000_ST_ROC);
+	dev->st_nobuf += e1000e_read(dev, E1000_ST_RNBC);
+}
+
+static void e1000e_get_stats64(net_device_t *ndev, struct net_device_stats64 *s)
+{
+	e1000e_dev_t *dev = (e1000e_dev_t *)ndev->driver_data;
+
+	s->rx_crc_errors = dev->st_crc;
+	s->rx_frame_errors = dev->st_align;
+	s->rx_missed_errors = dev->st_missed;
+	s->rx_length_errors = dev->st_rlen + dev->st_rx_frag;
+	s->rx_fifo_errors = dev->st_nobuf;
+	s->collisions = dev->st_colls;
+	s->tx_aborted_errors = dev->st_ecol;
+	s->tx_carrier_errors = dev->st_tncrs;
+	s->rx_errors += dev->st_crc + dev->st_align + dev->st_rxerr +
+			dev->st_rlen;
+	s->tx_errors += dev->st_ecol + dev->st_latecol;
+}
+
+/* Transmit hang check: the oldest descriptor not done for longer than the
+ * link speed allows, the link up and the transmitter not paused by flow
+ * control.  The transmit ring is then restarted. */
+static void e1000e_check_tx_hang(e1000e_dev_t *dev)
+{
+	static uint32_t reported;
+	uint64_t now = timer_ticks(), f;
+	uint32_t limit_ms;
+	int hang = 0;
+
+	if (!dev->link_up)
+		return;
+	limit_ms = dev->link_speed == 1000 ? 2000 :
+		   dev->link_speed == 100  ? 10000 :
+					     16000;
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	if (dev->tx_clean != dev->tx_tail) {
+		uint64_t stamp = dev->tx_stamp[dev->tx_clean];
+
+		if (stamp && now - stamp > net_ms_to_ticks(limit_ms) &&
+		    !(e1000e_read(dev, E1000_STATUS) & E1000_STATUS_TXOFF))
+			hang = 1;
+	}
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+	if (!hang)
+		return;
+	dev->st_tx_hangs++;
+	if (reported < 5) {
+		reported++;
+		kprintf("E1000E: transmit unit hang (TDH=%u TDT=%u), restarting the transmit ring\n",
+			e1000e_read(dev, E1000_TDH),
+			e1000e_read(dev, E1000_TDT));
+	}
+	e1000e_tx_ring_reset(dev);
+}
+
+static void e1000e_tx_timeout(net_device_t *ndev)
+{
+	e1000e_dev_t *dev = (e1000e_dev_t *)ndev->driver_data;
+
+	dev->st_tx_hangs++;
+	e1000e_tx_ring_reset(dev);
+}
+
+// net_device_t watchdog: ~10 times a second and right after an LSC
+// interrupt (see net_housekeeping_softirq()), on CPU 0.
+static void e1000e_watchdog(net_device_t *ndev)
+{
+	e1000e_dev_t *dev = (e1000e_dev_t *)ndev->driver_data;
+	uint64_t f;
+
+	if (!dev || !g_e1000e_initialized)
+		return;
+	e1000e_link_state_poll(dev);
+	if (__atomic_exchange_n(&dev->rx_mode_pending, 0, __ATOMIC_ACQ_REL))
+		e1000e_apply_rx_mode(dev);
+	/* A completion whose interrupt was lost still frees its descriptor
+	 * and wakes a stopped queue. */
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	e1000e_tx_clean_locked(dev);
+	e1000e_tx_maybe_wake_locked(dev);
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+	e1000e_check_tx_hang(dev);
+	if (timer_ticks() - dev->stats_tick >= net_ms_to_ticks(2000)) {
+		dev->stats_tick = timer_ticks();
+		e1000e_update_stats(dev);
 	}
 }
 
 static int e1000e_link_status(net_device_t *ndev)
 {
 	e1000e_dev_t *dev = (e1000e_dev_t *)ndev->driver_data;
-	// Always poll: the LSC IRQ may not have fired yet (or may have
-	// been collapsed into another cause), and STATUS.LU is the only
-	// ground truth.  Cheap — single MMIO read in the no-change case.
-	e1000e_link_state_poll(dev);
-	return dev->link_up;
+	// STATUS.LU is the ground truth; a change is handed to the watchdog.
+	int up = (e1000e_read(dev, E1000_STATUS) & E1000_STATUS_LU) ? 1 : 0;
+
+	if (up != dev->link_up) {
+		__atomic_store_n(&dev->link_change_pending, 1,
+				 __ATOMIC_RELEASE);
+		net_housekeeping_kick();
+	}
+	return up;
+}
+
+// ============================================================================
+// Receive (NAPI poll)
+// ============================================================================
+
+/* One good frame: copied out of the ring buffer into an skb, marked with
+ * what the MAC found of its checksum, and passed up. */
+static void e1000e_rx_deliver(e1000e_dev_t *dev, const uint8_t *buf,
+			      uint32_t len, uint8_t status, uint8_t errors)
+{
+	net_device_t *nd = &dev->net_dev;
+	sk_buff_t *skb = skb_alloc(len);
+	int cs;
+
+	if (!skb) {
+		nd->rx_dropped++;
+		return;
+	}
+	skb->dev = nd;
+	mm_memcpy(skb_append(skb, len), buf, len);
+	cs = nic_e1000_rx_csum(status, errors, 1, 1);
+	if (cs == NIC_CSUM_OK && (nd->features & NETIF_F_RXCSUM))
+		skb->ip_summed = CHECKSUM_UNNECESSARY;
+	else if (cs == NIC_CSUM_BAD)
+		dev->st_csum_err++;
+	nd->rx_packets++;
+	nd->rx_bytes += len;
+	if (nic_is_multicast(buf))
+		nd->multicast++;
+	dev->itr_rx_packets++;
+	dev->itr_rx_bytes += len;
+	napi_gro_receive(&dev->napi, skb);
+}
+
+/* Clean up to `budget' completed receive descriptors, returning them to
+ * the hardware in batches.  Only the poll calls this. */
+static int e1000e_rx_clean(e1000e_dev_t *dev, int budget)
+{
+	uint16_t ntc = (uint16_t)((dev->rx_tail + 1) % E1000E_NUM_RX_DESC);
+	uint16_t last = dev->rx_tail;
+	int work = 0, refill = 0;
+
+	while (work < budget) {
+		volatile e1000_rx_desc_legacy_t *d = &dev->rx_descs[ntc];
+		uint8_t status = d->status;
+
+		if (!(status & E1000_RXD_STAT_DD))
+			break;
+		// Descriptors are uncached device memory: the fields below are
+		// read after DD, in program order.
+		uint8_t errors = d->errors;
+		uint16_t len = d->length;
+
+		switch (nic_e1000_rx_verdict(status, errors, len,
+					     E1000E_RX_BUF_SIZE,
+					     &dev->rx_discarding)) {
+		case NIC_RXV_DELIVER:
+			e1000e_rx_deliver(dev, dev->rx_bufs[ntc], len, status,
+					  errors);
+			break;
+		case NIC_RXV_ERROR:
+			dev->net_dev.rx_errors++;
+			break;
+		default:
+			dev->st_rx_frag++;
+			break;
+		}
+
+		d->status = 0;
+		d->errors = 0;
+		last = ntc;
+		ntc = (uint16_t)((ntc + 1) % E1000E_NUM_RX_DESC);
+		work++;
+		if (++refill >= 32) {
+			dev->rx_tail = last;
+			e1000e_write(dev, E1000_RDT, last);
+			refill = 0;
+		}
+	}
+	if (refill) {
+		dev->rx_tail = last;
+		e1000e_write(dev, E1000_RDT, last);
+	}
+	return work;
+}
+
+/* Adaptive interrupt moderation from what the last interrupt period moved:
+ * 4000/s below gigabit, 4000..20000/s at gigabit. */
+static void e1000e_update_itr(e1000e_dev_t *dev, uint32_t txp, uint32_t txb)
+{
+	uint32_t target;
+
+	if (dev->link_speed != 1000) {
+		target = NIC_ITR_RATE_BULK;
+	} else {
+		int cls;
+
+		dev->itr_rx_class = nic_itr_classify(dev->itr_rx_class,
+						     dev->itr_rx_packets,
+						     dev->itr_rx_bytes);
+		dev->itr_tx_class =
+			nic_itr_classify(dev->itr_tx_class, txp, txb);
+		cls = dev->itr_rx_class > dev->itr_tx_class ?
+			      dev->itr_rx_class :
+			      dev->itr_tx_class;
+		target = nic_itr_class_rate(cls, 1);
+	}
+	dev->itr_rx_packets = 0;
+	dev->itr_rx_bytes = 0;
+	if (target != dev->itr_rate) {
+		dev->itr_rate = nic_itr_next_rate(dev->itr_rate, target);
+		e1000e_write(dev, E1000_ITR, nic_itr_reg(dev->itr_rate));
+	}
+}
+
+static int e1000e_poll(struct napi_struct *n, int budget)
+{
+	e1000e_dev_t *dev = (e1000e_dev_t *)n->dev->driver_data;
+	uint32_t txp, txb;
+	uint64_t f;
+	int work;
+
+	spin_lock_irqsave(&dev->tx_lock, &f);
+	e1000e_tx_clean_locked(dev);
+	e1000e_tx_maybe_wake_locked(dev);
+	// completions counted under tx_lock move to the poll's own total
+	dev->itr_tx_acc_packets += dev->itr_tx_packets;
+	dev->itr_tx_acc_bytes += dev->itr_tx_bytes;
+	dev->itr_tx_packets = 0;
+	dev->itr_tx_bytes = 0;
+	spin_unlock_irqrestore(&dev->tx_lock, f);
+
+	work = e1000e_rx_clean(dev, budget);
+	if (work < budget) {
+		txp = dev->itr_tx_acc_packets;
+		txb = dev->itr_tx_acc_bytes;
+		dev->itr_tx_acc_packets = 0;
+		dev->itr_tx_acc_bytes = 0;
+		e1000e_update_itr(dev, txp, txb);
+		if (napi_complete_done(n, work))
+			e1000e_write(dev, E1000_IMS, E1000E_IMS_NAPI);
+	}
+	return work;
 }
 
 // Quiesce the NIC ahead of an ACPI S5 transition.  PCH-LAN integrated
@@ -2942,12 +3587,15 @@ static void e1000e_shutdown(net_device_t *ndev)
 // ============================================================================
 // IRQ Handler
 // ============================================================================
-void e1000e_irq_handler(void)
+/* Acknowledge the causes, hand receive and transmit completion work to the
+ * NAPI poll (their causes stay masked until it is done) and link changes
+ * to the watchdog.  Returns 1 when the interrupt was this device's, 0
+ * otherwise, so that on a shared legacy line the dispatcher offers it to
+ * the next handler.  The dispatcher acknowledges the local APIC. */
+int e1000e_irq_handler(void)
 {
-	if (!g_e1000e_initialized) {
-		lapic_eoi();
-		return;
-	}
+	if (!g_e1000e_initialized)
+		return 0;
 
 	{
 		extern void entropy_add_interrupt_timing(uint64_t extra);
@@ -2957,117 +3605,55 @@ void e1000e_irq_handler(void)
 	}
 
 	e1000e_dev_t *dev = &g_e1000e;
-	BUG_ON(dev == NULL);
 	uint32_t icr = e1000e_read(dev, E1000_ICR);
+	int handled;
 
-#if E1000E_DBG
-	// Count every IRQ entry so we can tell from userland (via the tx
-	// diagnostic dump) whether the MAC is asserting interrupts at all.
-	static uint32_t irq_total = 0;
-	static uint32_t irq_with_cause = 0;
-	irq_total++;
-
-	if (icr != 0) {
-		irq_with_cause++;
-		if (irq_with_cause <= 8) {
-			e1000e_dbg("E1000E: IRQ #%u ICR=%08x (total=%u)\n",
-				   irq_with_cause, icr, irq_total);
-		}
+	if (icr == 0xFFFFFFFFu)
+		return 0; // the device is gone from the bus
+	if (dev->msi_vector) {
+		/* An MSI is ours whatever ICR says: a cause may have been
+		 * collected by an earlier read.  The ring is the ground
+		 * truth -- let the poll look. */
+		handled = 1;
+		icr |= E1000_ICR_RXT0;
+	} else {
+		/* Legacy line: ours when the MAC asserted it, or a cause we
+		 * enabled is pending. */
+		handled = (icr & E1000_ICR_INT_ASSERTED) ||
+			  (icr & e1000e_read(dev, E1000_IMS));
 	}
-#endif
-	// NOTE: do not early-return on icr==0.  We still need to scan the
-	// RX ring (DD bit) below in case the MAC posted MSI for a batch
-	// whose descriptor became visible after our ICR read cleared it.
 
 	if (icr & E1000_ICR_LSC) {
-		// Throttle LSC: on some PCH-LAN parts the link can bounce
-		// continuously after init and flood us with LSC interrupts,
-		// starving the CPU.  After a handful of events in quick
-		// succession, mask LSC permanently — link state is also
-		// observable via the link_status callback so userland still
-		// sees the truth.
-		static uint32_t lsc_count = 0;
-		if (++lsc_count > 16) {
-			uint32_t ims = e1000e_read(dev, E1000_IMS);
-			(void)ims;
+		/* Record the change and hand it to the link watchdog
+		 * (e1000e_link_state_poll), which logs it and does the
+		 * link-down / link-up work outside interrupt context.
+		 *
+		 * Storm guard: on some PCH-LAN parts the link can bounce
+		 * continuously after init.  More than 16 LSC interrupts in a
+		 * second mask LSC; the watchdog unmasks it a second later,
+		 * and polls STATUS.LU meanwhile. */
+		uint64_t now = timer_ticks();
+		if (now - dev->lsc_window_tick >= net_ms_to_ticks(1000)) {
+			dev->lsc_window_tick = now;
+			dev->lsc_count = 0;
+		}
+		if (++dev->lsc_count > 16 && !dev->lsc_masked_tick) {
 			e1000e_write(dev, E1000_IMC, E1000_ICR_LSC);
-			e1000e_dbg(
-				"E1000E: LSC interrupt storm — masking LSC\n");
+			dev->lsc_masked_tick = now ? now : 1;
 		}
-		uint32_t status = e1000e_read(dev, E1000_STATUS);
-		int prev_up = dev->link_up;
-		dev->link_up = (status & E1000_STATUS_LU) ? 1 : 0;
-		if (prev_up != dev->link_up) {
-			// Note for the process-context edge handler: on down->up
-			// we must re-clear LPLU/GBE_DIS or TX will silently drop.
-			dev->link_change_pending = 1;
-		}
-		if (lsc_count <= 4) {
-			kprintf("E1000E: Link %s\n",
-				dev->link_up ? "UP" : "DOWN");
-		}
+		dev->link_change_pending = 1;
+		net_housekeeping_kick();
 	}
 
-	// Always drain the RX ring on every IRQ regardless of which ICR
-	// bits survived to the handler.  ICR causes can be lost to read-
-	// to-clear races (any MMIO read of ICR clears it) and to MSI
-	// moderation collapsing several causes into a single edge.  The
-	// DD bit in the descriptor itself is the only ground truth for
-	// "a packet has arrived".  This matches the standard "poll-on-wake"
-	// RX-completion handling pattern.
-	{
-		uint16_t tail = (dev->rx_tail + 1) % E1000E_NUM_RX_DESC;
-		uint16_t last_processed = dev->rx_tail;
-		int processed_any = 0;
-		unsigned drained = 0;
-
-		while (1) {
-			volatile e1000_rx_desc_legacy_t *desc =
-				&dev->rx_descs[tail];
-			if (!(desc->status & E1000_RXD_STAT_DD))
-				break;
-
-			uint16_t len = desc->length;
-			if ((desc->status & E1000_RXD_STAT_EOP) && len > 0 &&
-			    len <= E1000E_RX_BUF_SIZE) {
-				net_rx_packet(&dev->net_dev, dev->rx_bufs[tail],
-					      len);
-			} else {
-				dev->net_dev.rx_errors++;
-			}
-
-			desc->buffer_addr = dev->rx_bufs_phys[tail];
-			desc->status = 0;
-
-			last_processed = tail;
-			processed_any = 1;
-
-			tail = (tail + 1) % E1000E_NUM_RX_DESC;
-			drained++;
-		}
-
-		if (processed_any) {
-			dev->rx_tail = last_processed;
-			e1000e_write(dev, E1000_RDT, last_processed);
-		}
-
-#if E1000E_DBG
-		static uint32_t rx_log = 0;
-		if (drained && rx_log < 8) {
-			rx_log++;
-			e1000e_dbg(
-				"E1000E: RX drained %u pkt(s) (icr=%08x rdt=%u)\n",
-				drained, icr, dev->rx_tail);
-		}
-#else
-		(void)drained;
-		(void)icr;
-#endif
+	/* Receive/transmit work, also when the line turns out not to be
+	 * ours: the read above consumed the cause, and a poll that is
+	 * about to re-enable its interrupts would otherwise never hear of
+	 * the frame behind it. */
+	if (icr & E1000E_IMS_NAPI) {
+		e1000e_write(dev, E1000_IMC, E1000E_IMS_NAPI);
+		napi_schedule(&dev->napi);
 	}
-
-	// TXDW is observed via DD bit in send(); nothing else to do here.
-
-	lapic_eoi();
+	return handled;
 }
 
 // ============================================================================
@@ -3149,6 +3735,11 @@ void e1000e_init(void)
 		e1000e_dev_t *dev = &g_e1000e;
 		dev->pci_dev = &devs[i];
 		dev->device_id = did;
+		dev->buffers_cached = (uint8_t)e1000e_buffers_cacheable(did);
+		// STATUS the KMRN/K1 timing was set for during bring-up
+		uint32_t pch_timing_status = 0;
+		// ICH/PCH LAN MACs have a 32-register multicast table
+		dev->mta_regs = e1000e_is_pch_lan(did) ? 32 : 128;
 
 		pci_enable_busmaster_mem(dev->pci_dev);
 
@@ -3202,8 +3793,27 @@ void e1000e_init(void)
 			     0x00000100u); // 802.3x mc address hi
 		e1000e_write(dev, E1000_FCT, 0x00008808u); // 802.3x ethertype
 		e1000e_write(dev, E1000_FCTTV, 0x0000FFFFu); // pause-time, full
-		e1000e_write(dev, E1000_FCRTL, 0); // RX flow ctrl off
-		e1000e_write(dev, E1000_FCRTH, 0);
+		if (e1000e_mac_gen(did) >= E1000E_MAC_PCH_SPT) {
+			/* SPT and later: full flow control requested.  The
+			 * receive thresholds of the 26 KB packet buffer, the
+			 * refresh timer and the PHY's pause time are set here;
+			 * whether pause frames are honoured or sent is decided
+			 * at link-up from the autonegotiation result
+			 * (e1000e_spt_link_up), until then both stay off. */
+			e1000e_write(dev, E1000_FCRTV_PCH, E1000E_FC_PAUSE_TIME);
+			e1000e_write(dev, E1000_FCRTL,
+				     E1000E_PCH_FC_LOW_WATER | E1000_FCRTL_XONE);
+			e1000e_write(dev, E1000_FCRTH, E1000E_PCH_FC_HIGH_WATER);
+			if (e1000e_acquire_swflag(dev) == 0) {
+				(void)e1000e_phy_write_paged_locked(
+					dev, BM_PORT_CTRL_PAUSE,
+					E1000E_FC_PAUSE_TIME);
+				e1000e_release_swflag(dev);
+			}
+		} else {
+			e1000e_write(dev, E1000_FCRTL, 0); // RX flow ctrl off
+			e1000e_write(dev, E1000_FCRTH, 0);
+		}
 
 		uint32_t ctrl = e1000e_read(dev, E1000_CTRL);
 		ctrl &= ~(E1000_CTRL_FRCSPD | (1u << 12) /* FRCDPLX */
@@ -3269,75 +3879,12 @@ void e1000e_init(void)
 					spd == 1 ? "100Mb/s" :
 					spd == 2 ? "1000Mb/s" :
 						   "reserved");
-				if (spd == 0x2) {
-					e1000e_configure_kmrn_for_1000(dev);
-				} else {
-					e1000e_configure_kmrn_for_10_100(dev);
-				}
-
-				// K1 workaround for PCH-LPT/SPT/CNP+ at 10/100 Mb FD:
-				// Run AFTER link is resolved.  Re-programs K1 + the
-				// PCIe-PLL clock-request gate based on the resolved
-				// speed/duplex.  Without this, on SPT-H @ 100 Mb FD
-				// the MAC's TX scheduler clock domain stays mistuned:
-				// descriptor enters TX FIFO (TDFT advances) but TDH
-				// never advances and no bytes hit the wire.  This is
-				// exactly the dmesg symptom on the P50 — TDFH=0xd00
-				// TDFT=0xd02 (one descriptor cached on-chip), TDH=0,
-				// GPTC=0, TPT=0.
-				//
-				// Logic per the I218/I219 datasheet:
-				//   if link && full-duplex:
-				//     read KMRN K1_CONFIG
-				//     if speed == 1000Mb: set K1_ENABLE
-				//     else (10/100):      clear K1_ENABLE
-				//                          udelay(10..20)
-				//                          FEXTNVM6 |= REQ_PLL_CLK
-				//   else: don't touch
-				if (e1000e_has_10_100_k1_pll_quirk(did) &&
-				    (st_spd & E1000_STATUS_LU) &&
-				    (st_spd & 0x1) /* FD */) {
-					uint16_t k1cfg = 0;
-					e1000e_kmrn_read(
-						dev,
-						E1000_KMRN_K1_CONFIG_OFFSET,
-						&k1cfg);
-#if E1000E_DBG
-					uint16_t k1cfg_before = k1cfg;
-#endif
-					if (spd == 0x2) {
-						k1cfg |= E1000_KMRN_K1_ENABLE;
-						e1000e_kmrn_write(
-							dev,
-							E1000_KMRN_K1_CONFIG_OFFSET,
-							k1cfg);
-					} else {
-						k1cfg &= ~E1000_KMRN_K1_ENABLE;
-						e1000e_kmrn_write(
-							dev,
-							E1000_KMRN_K1_CONFIG_OFFSET,
-							k1cfg);
-						e1000e_delay_us(20);
-						uint32_t fx6_before =
-							e1000e_read(
-								dev,
-								E1000_FEXTNVM6);
-						uint32_t fx6 =
-							fx6_before |
-							E1000_FEXTNVM6_REQ_PLL_CLK;
-						e1000e_write(dev,
-							     E1000_FEXTNVM6,
-							     fx6);
-						e1000e_dbg(
-							"E1000E: k1_workaround_lpt_lp 100Mb FD: "
-							"KMRN[0x07] %04x->%04x FEXTNVM6 %08x->%08x\n",
-							k1cfg_before, k1cfg,
-							fx6_before,
-							e1000e_read(
-								dev,
-								E1000_FEXTNVM6));
-					}
-				}
+				(void)spd;
+				// KMRN timing and the P50 K1 quirk for the speed
+				// the link came up at; the link watchdog redoes
+				// it at every later link-up.
+				e1000e_pch_link_timing(dev, st_spd);
+				pch_timing_status = st_spd;
 			}
 		}
 
@@ -3363,7 +3910,7 @@ void e1000e_init(void)
 		}
 
 		// Clear multicast table
-		for (int m = 0; m < 128; m++)
+		for (int m = 0; m < dev->mta_regs; m++)
 			e1000e_write(dev, E1000_MTA + m * 4, 0);
 
 		uint32_t ral = (uint32_t)dev->mac_addr[0] |
@@ -3497,6 +4044,13 @@ void e1000e_init(void)
 		dev->net_dev.rx_errors = 0;
 		dev->net_dev.tx_errors = 0;
 		dev->net_dev.rx_dropped = 0;
+		dev->net_dev.driver_data = dev;
+		/* The poll exists before the handler can run: on a shared
+		 * legacy line it is called for other devices' interrupts as
+		 * soon as it is marked initialised. */
+		netif_napi_add(&dev->net_dev, &dev->napi, e1000e_poll,
+			       NAPI_POLL_WEIGHT);
+		napi_enable(&dev->napi);
 		g_e1000e_initialized = 1;
 
 		// Wait up to 2 s for link-up.  IMS is still masked here so we
@@ -3514,7 +4068,23 @@ void e1000e_init(void)
 			}
 		}
 		dev->link_up = (status & E1000_STATUS_LU) ? 1 : 0;
-		kprintf("E1000E: Link %s\n", dev->link_up ? "UP" : "DOWN");
+		if (dev->link_up) {
+			dev->link_speed = e1000e_status_speed(status);
+			dev->link_fd = (status & E1000_STATUS_FD) != 0;
+			// TIPG/PHY/LTR/flow control for this link (SPT+)
+			if (e1000e_is_pch_lan(did)) {
+				/* The link came up only after the timing was
+				 * set (for no link): set it for this one. */
+				if (!(pch_timing_status & E1000_STATUS_LU))
+					e1000e_pch_link_timing(dev, status);
+				e1000e_spt_link_up(dev, status);
+			}
+			kprintf("E1000E: Link UP (%u Mb/s, %s duplex)\n",
+				dev->link_speed,
+				dev->link_fd ? "full" : "half");
+		} else {
+			kprintf("E1000E: Link DOWN\n");
+		}
 
 #if E1000E_DBG
 		// One-shot diagnostic dump — printed BEFORE we unmask interrupts
@@ -3531,20 +4101,6 @@ void e1000e_init(void)
 		}
 #endif
 
-		// (Stats dump moved to e1000e_send() so we see counters at the
-		// time DHCP DISCOVER actually goes on the wire, not 2s into
-		// boot when nothing has been transmitted yet.)
-
-		// Unmask RX/TX and LSC.  LSC is required for prompt cable
-		// hot-plug detection.  PCH-LAN parts can bounce link rapidly
-		// during init; the IRQ handler throttles LSC and disables it
-		// after 16 events in quick succession to prevent CPU starvation.
-		// The link_status / send paths poll STATUS.LU directly as a
-		// fall-back so userland still sees the truth even if LSC ends
-		// up disabled.
-		uint32_t ims = E1000_ICR_RXT0 | E1000_ICR_TXDW |
-			       E1000_ICR_RXDMT0 | E1000_ICR_RXO | E1000_ICR_LSC;
-		e1000e_write(dev, E1000_IMS, ims);
 
 		// net_device_t setup
 		dev->net_dev.name = "eth0";
@@ -3555,12 +4111,28 @@ void e1000e_init(void)
 		dev->net_dev.netmask = 0;
 		dev->net_dev.gateway = 0;
 		dev->net_dev.dns_server = 0;
-		dev->net_dev.send = e1000e_send;
+		dev->net_dev.send = NULL;
+		dev->net_dev.xmit = e1000e_xmit;
 		dev->net_dev.link_status = e1000e_link_status;
 		dev->net_dev.shutdown = e1000e_shutdown;
-		dev->net_dev.driver_data = dev;
+		dev->net_dev.watchdog = e1000e_watchdog;
+		dev->net_dev.tx_timeout = e1000e_tx_timeout;
+		dev->net_dev.set_rx_mode = e1000e_set_rx_mode;
+		dev->net_dev.get_stats64 = e1000e_get_stats64;
+		dev->net_dev.features |= NETIF_F_RXCSUM;
+		dev->stats_tick = timer_ticks();
 
 		net_register(&dev->net_dev);
+		if (!dev->link_up)
+			netif_carrier_off(&dev->net_dev);
+
+		// Unmask RX/TX and LSC, now that the device is registered.
+		// LSC is required for prompt cable hot-plug detection.
+		// PCH-LAN parts can bounce link rapidly during init; the IRQ
+		// handler masks LSC for a second after 16 events within one to
+		// prevent CPU starvation, and the link watchdog polls STATUS.LU
+		// as well, so the link state stays right while LSC is masked.
+		e1000e_write(dev, E1000_IMS, E1000E_IMS_ALL);
 
 		kprintf("E1000E: Driver initialized successfully\n");
 		return; // Only handle first matching device

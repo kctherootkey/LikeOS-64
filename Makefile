@@ -601,9 +601,21 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/icmp.o \
 			  $(BUILD_DIR)/udp.o \
 			  $(BUILD_DIR)/tcp.o \
+			  $(BUILD_DIR)/tcp_input.o \
+			  $(BUILD_DIR)/tcp_output.o \
+			  $(BUILD_DIR)/tcp_timer.o \
+			  $(BUILD_DIR)/tcp_ipv4.o \
+			  $(BUILD_DIR)/tcp_minisocks.o \
+			  $(BUILD_DIR)/tcp_sack.o \
+			  $(BUILD_DIR)/tcp_recovery.o \
+			  $(BUILD_DIR)/tcp_rate.o \
+			  $(BUILD_DIR)/tcp_cong.o \
+			  $(BUILD_DIR)/tcp_cubic.o \
+			  $(BUILD_DIR)/net_rbtree.o \
 			  $(BUILD_DIR)/dhcp.o \
 			  $(BUILD_DIR)/socket.o \
 			  $(BUILD_DIR)/poll.o \
+			  $(BUILD_DIR)/eventpoll.o \
 			  $(BUILD_DIR)/random.o \
 			  $(BUILD_DIR)/route.o \
 			  $(BUILD_DIR)/dns.o \
@@ -612,7 +624,20 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/skb.o \
 			  $(BUILD_DIR)/softirq.o \
 			  $(BUILD_DIR)/ratelimit.o \
-			  $(BUILD_DIR)/netstats.o
+			  $(BUILD_DIR)/netstats.o \
+			  $(BUILD_DIR)/net_dev.o \
+			  $(BUILD_DIR)/napi.o \
+			  $(BUILD_DIR)/net_timer.o \
+			  $(BUILD_DIR)/neighbour.o \
+			  $(BUILD_DIR)/fib.o \
+			  $(BUILD_DIR)/dst.o \
+			  $(BUILD_DIR)/ip_input.o \
+			  $(BUILD_DIR)/ip_output.o \
+			  $(BUILD_DIR)/ip_options.o \
+			  $(BUILD_DIR)/ip_fragment.o \
+			  $(BUILD_DIR)/inet_frag.o \
+			  $(BUILD_DIR)/raw.o \
+			  $(BUILD_DIR)/datagram.o
 
 # Intel audio DSP (cAVS/ACE, IPC4 firmware, topology) and SoundWire.
 SOF_OBJS = $(BUILD_DIR)/sof_pci.o \
@@ -1346,6 +1371,39 @@ $(BUILD_DIR)/udp.o: $(KERNEL_DIR)/net/udp.c | $(BUILD_DIR)
 $(BUILD_DIR)/tcp.o: $(KERNEL_DIR)/net/tcp.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/tcp_input.o: $(KERNEL_DIR)/net/tcp_input.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tcp_output.o: $(KERNEL_DIR)/net/tcp_output.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tcp_timer.o: $(KERNEL_DIR)/net/tcp_timer.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tcp_ipv4.o: $(KERNEL_DIR)/net/tcp_ipv4.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tcp_minisocks.o: $(KERNEL_DIR)/net/tcp_minisocks.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tcp_sack.o: $(KERNEL_DIR)/net/tcp_sack.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tcp_recovery.o: $(KERNEL_DIR)/net/tcp_recovery.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tcp_rate.o: $(KERNEL_DIR)/net/tcp_rate.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tcp_cong.o: $(KERNEL_DIR)/net/tcp_cong.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tcp_cubic.o: $(KERNEL_DIR)/net/tcp_cubic.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/net_rbtree.o: $(KERNEL_DIR)/net/rbtree.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/dhcp.o: $(KERNEL_DIR)/net/dhcp.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
@@ -1353,6 +1411,9 @@ $(BUILD_DIR)/socket.o: $(KERNEL_DIR)/net/socket.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/poll.o: $(KERNEL_DIR)/net/poll.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/eventpoll.o: $(KERNEL_DIR)/net/eventpoll.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/random.o: $(KERNEL_DIR)/dev/rand/random.c | $(BUILD_DIR)
@@ -1380,6 +1441,45 @@ $(BUILD_DIR)/ratelimit.o: $(KERNEL_DIR)/net/ratelimit.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/netstats.o: $(KERNEL_DIR)/net/stats.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/net_dev.o: $(KERNEL_DIR)/net/dev.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/napi.o: $(KERNEL_DIR)/net/napi.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/net_timer.o: $(KERNEL_DIR)/net/net_timer.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/neighbour.o: $(KERNEL_DIR)/net/neighbour.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fib.o: $(KERNEL_DIR)/net/fib.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/dst.o: $(KERNEL_DIR)/net/dst.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ip_input.o: $(KERNEL_DIR)/net/ip_input.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ip_output.o: $(KERNEL_DIR)/net/ip_output.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ip_options.o: $(KERNEL_DIR)/net/ip_options.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ip_fragment.o: $(KERNEL_DIR)/net/ip_fragment.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/inet_frag.o: $(KERNEL_DIR)/net/inet_frag.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/raw.o: $(KERNEL_DIR)/net/raw.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/datagram.o: $(KERNEL_DIR)/net/datagram.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/ioapic.o: $(KERNEL_DIR)/hal/ioapic.c | $(BUILD_DIR)

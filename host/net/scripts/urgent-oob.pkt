@@ -1,0 +1,30 @@
+# Urgent data, SO_OOBINLINE off (the default): a read stops at the mark
+# and the urgent byte is not part of the stream; recv(MSG_OOB) returns it
+# (once); SIOCATMARK and POLLPRI tell where it is.
+# Copyright (C) 2026 The LikeOS Project
+0.000 socket s stream
+0.000 bind s 8080
+0.000 listen s 16
+0.100 < S 0:0(0) win 65535 <mss 1460,sackOK,TS val 100 ecr 0,nop,wscale 7>
+0.100 > S. 0:0(0) ack 1 win * <mss 1460,sackOK,TS val * ecr 100,nop,wscale *>
+0.200 < . 1:1(0) ack 1 win 512 <nop,nop,TS val 200 ecr echo>
+0.200 accept s c
+# ten bytes, the urgent pointer just past the tenth
+0.300 < P.U 1:11(10) ack 1 win 512 urg 10 <nop,nop,TS val 300 ecr echo>
+0.300 > . 1:1(0) ack 11 win *
+# readable, urgent data pending, writable
+0.310 poll c = 7
+0.310 atmark c = 0
+0.310 recv c 100 = 9
+0.310 atmark c = 1
+0.310 recv c 1 oob peek = 1
+0.310 recv c 1 oob = 1
+0.310 recv c 1 oob = -EINVAL
+# only the out-of-band byte is left: nothing to read, no POLLIN
+0.310 poll c = 4
+0.310 recv c 100 = -EAGAIN
+0.400 < P. 11:16(5) ack 1 win 512 <nop,nop,TS val 400 ecr echo>
+0.400 > . 1:1(0) ack 16 win *
+0.410 recv c 100 = 5
+0.410 atmark c = 0
+0.410 recv c 1 oob = -EINVAL

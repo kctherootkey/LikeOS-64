@@ -271,10 +271,8 @@ int fdhold(vfs_file_t *entry)
 	}
 	if (unix_sock_is(entry))
 		return unix_sock_lookup_hold((unix_socket_t *)entry) != NULL;
-	if (IS_EPOLL_FD(entry)) {
-		epoll_get(EPOLL_FD_IDX(entry));
-		return 1;
-	}
+	if (IS_EPOLL_FD(entry))
+		return epoll_tryget(EPOLL_FD_IDX(entry));
 	if (pipe_is_end(entry))
 		return pipe_end_hold((pipe_end_t *)entry) ? 1 : 0;
 	vfs_incref(entry);

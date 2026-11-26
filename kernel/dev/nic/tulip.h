@@ -17,6 +17,7 @@
 #include <kernel/uapi/types.h>
 #include <kernel/hal/pci.h>
 #include <kernel/net/net.h>
+#include <kernel/net/netdevice.h>
 #include <kernel/ke/sched.h>
 
 #define TULIP_VENDOR_DEC 0x1011
@@ -53,7 +54,18 @@
 #define TULIP_CSR5_LNF (1u << 12) // Link fail (21041/43)
 #define TULIP_CSR5_LNP (1u << 4) // Link pass / change (varies)
 #define TULIP_CSR5_NIS (1u << 16) // Normal interrupt summary
+#define TULIP_CSR5_TPS (1u << 1) // TX process stopped
+#define TULIP_CSR5_TJT (1u << 3) // TX jabber timeout
+#define TULIP_CSR5_UNF (1u << 5) // TX FIFO underflow
+#define TULIP_CSR5_RPS (1u << 8) // RX process stopped
+#define TULIP_CSR5_RWT (1u << 9) // RX watchdog timeout
+#define TULIP_CSR5_FBE (1u << 13) // Fatal bus error
 #define TULIP_CSR5_AIS (1u << 15) // Abnormal interrupt summary
+/* Every interrupt-status bit of CSR5 (0-16 plus GPI/LC, 26-27).  The
+ * process-state (17-22) and error-bit (23-25) fields are status, not
+ * interrupts, and are nonzero whenever the engines run -- testing all of
+ * CSR5 for zero claimed every interrupt on a shared line. */
+#define TULIP_CSR5_INT_MASK 0x0C01FFFFu
 #define TULIP_CSR5_TS_SHIFT 20 // TX state
 #define TULIP_CSR5_RS_SHIFT 17 // RX state
 
@@ -61,6 +73,9 @@
 #define TULIP_CSR6_HP (1u << 0) // Hash/perfect filtering
 #define TULIP_CSR6_SR (1u << 1) // Start RX
 #define TULIP_CSR6_PR (1u << 6) // Promiscuous
+#define TULIP_CSR6_PM (1u << 7) // Pass all multicast
+#define TULIP_CSR6_PCS (1u << 23) // PCS function (21140 SYM port)
+#define TULIP_CSR6_SCR (1u << 24) // Scrambler mode (21140 SYM port)
 #define TULIP_CSR6_PB (1u << 3) // Pass bad frames
 #define TULIP_CSR6_FD (1u << 9) // Full duplex
 #define TULIP_CSR6_TR_SHIFT 14 // TX threshold
@@ -77,6 +92,7 @@
 #define TULIP_CSR7_AIE (1u << 15)
 #define TULIP_CSR7_LFE (1u << 12) // Link fail interrupt enable
 #define TULIP_CSR7_LPE (1u << 4) // Link pass interrupt enable
+#define TULIP_CSR7_FBE (1u << 13) // Fatal bus error interrupt enable
 
 // CSR12 (SIA Status) bits — link sense
 #define TULIP_CSR12_LS10 (1u << 1) // Link status 10Base-T (active low)
@@ -103,6 +119,15 @@
 #define TULIP_TDES1_TCH (1u << 24) // Second address chained
 #define TULIP_TDES1_SET (1u << 27) // Setup packet
 #define TULIP_TDES1_AC (1u << 26) // Add CRC disable
+#define TULIP_TDES1_FT0 (1u << 22) // Setup frame filter type bit 0 (hash)
+#define TULIP_RDES0_CE (1u << 1) // CRC error
+#define TULIP_RDES0_TL (1u << 7) // frame too long
+#define TULIP_TDES0_UF (1u << 1) // underflow
+#define TULIP_TDES0_EC (1u << 8) // excessive collisions
+#define TULIP_TDES0_LC (1u << 9) // late collision
+#define TULIP_TDES0_NC (1u << 10) // no carrier
+#define TULIP_TDES0_LO (1u << 11) // loss of carrier
+#define TULIP_TDES0_CC_SHIFT 3 // collision count [6:3]
 
 typedef struct __attribute__((packed, aligned(16))) {
 	uint32_t status; // RDES0
@@ -127,29 +152,41 @@ typedef struct {
 	volatile uint8_t *mmio_base;
 	uint64_t mmio_phys;
 	uint16_t io_base;
-
+	// RX ring: rx_cur = next to look at (the NAPI poll's)
 	tulip_desc_t *rx_descs;
 	uint64_t rx_descs_phys;
 	uint8_t *rx_bufs[TULIP_NUM_RX_DESC];
 	uint64_t rx_bufs_phys[TULIP_NUM_RX_DESC];
 	uint16_t rx_cur;
-
+	// TX ring: frames and setup frames, filled at tx_cur, reclaimed at
+	// tx_dirty, under tx_lock; tx_stamp: tick queued (0 = free)
 	tulip_desc_t *tx_descs;
 	uint64_t tx_descs_phys;
 	uint8_t *tx_bufs[TULIP_NUM_TX_DESC];
 	uint64_t tx_bufs_phys[TULIP_NUM_TX_DESC];
+	uint64_t tx_stamp[TULIP_NUM_TX_DESC];
 	uint16_t tx_cur;
-	spinlock_t tx_lock; // Serializes tulip_send() across CPUs
-
+	uint16_t tx_dirty;
+	spinlock_t tx_lock; // the TX ring, CSR1, CSR6
 	uint8_t mac_addr[ETH_ALEN];
 	const pci_device_t *pci_dev;
 	int link_up;
+	int link_seen; // CSR12 has reported a link once
 	uint16_t device_id;
-
+	uint32_t csr6; // operating mode as programmed
+	uint32_t csr6_media; // port bits the SROM's media block asks for
+	int gpr_valid; // 21140: general-purpose port from the SROM
+	uint8_t gpr_dir, gpr_data;
+	struct napi_struct napi;
+	volatile int rx_mode_pending;
+	volatile int reset_pending;
+	volatile int ru_seen; // the receiver ran out of descriptors
+	uint64_t st_rx_crc, st_rx_long, st_missed, st_tx_fifo, st_tx_carrier;
+	uint64_t st_tx_window, st_tx_aborted, st_colls;
 	net_device_t net_dev;
 } tulip_dev_t;
 
 void tulip_init(void);
-void tulip_irq_handler(void);
+int tulip_irq_handler(void);
 
 #endif // _KERNEL_TULIP_H_

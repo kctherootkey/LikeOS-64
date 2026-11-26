@@ -23,6 +23,7 @@
 #include <kernel/uapi/types.h>
 #include <kernel/hal/pci.h>
 #include <kernel/net/net.h>
+#include <kernel/net/netdevice.h>
 #include <kernel/ke/sched.h>
 
 // ============================================================================
@@ -110,6 +111,15 @@ typedef struct __attribute__((packed)) {
 // CB status bits
 #define EEPRO100_STATUS_C 0x8000
 #define EEPRO100_STATUS_OK 0x2000
+// RFD count bits: EOF (the count is final) and F (the buffer was used)
+#define EEPRO100_RFD_EOF 0x8000
+#define EEPRO100_RFD_F 0x4000
+#define EEPRO100_RFD_COUNT_MASK 0x3FFF
+// SCB interrupt mask byte: bit 0 masks every source
+#define EEPRO100_INT_MASK_ALL 0x01
+// Configure bytes the receive filter changes
+#define EEPRO100_CFG15_PROMISC 0x01 // byte 15: promiscuous
+#define EEPRO100_CFG21_MC_ALL 0x08 // byte 21: every multicast frame
 
 // ============================================================================
 // Receive Frame Descriptor (RFD) — 16-byte header, buffer follows inline
@@ -151,34 +161,38 @@ typedef struct {
 	const pci_device_t *pci_dev;
 	uint16_t device_id;
 	const char *model_name;
-
 	// CSR access — either MMIO (preferred) or I/O port fallback
 	volatile uint8_t *mmio_base; // != NULL when using MMIO
 	uint64_t mmio_phys;
 	uint16_t io_base; // != 0 when using I/O ports
 	int use_io;
-
 	uint8_t mac_addr[6];
-
-	// TX command-block ring (single contiguous DMA region)
+	/* TX command-block ring (single contiguous DMA region).  CBs are
+	 * queued at tx_prod and reclaimed at tx_cons, under tx_lock; the
+	 * newest carries the S bit, so the CU suspends there and a new CB is
+	 * started with CU_RESUME (CU_START for the very first one). */
 	uint8_t *tx_blocks; // virt
 	uint64_t tx_blocks_phys; // phys
-	uint16_t tx_prod; // next slot to hand to HW
-	uint16_t tx_cons; // next slot HW will complete
-	spinlock_t tx_lock; // Serializes eepro100_send() across CPUs
-
-	// RX RFD ring (single contiguous DMA region)
+	uint16_t tx_prod; // next slot to fill
+	uint16_t tx_cons; // oldest slot not reclaimed
+	uint64_t tx_stamp[EEPRO100_NUM_TX_DESC]; // tick queued, 0 = free
+	spinlock_t tx_lock; // the CB ring and the SCB command register
+	// RX RFD ring (single contiguous DMA region); the NAPI poll's
 	uint8_t *rx_blocks;
 	uint64_t rx_blocks_phys;
 	uint16_t rx_cur;
-
 	int link_up;
+	int link_seen; // the PHY has reported a link once
 	int cu_started; // first CU_START done, use CU_RESUME
-
+	struct napi_struct napi;
+	volatile int rx_mode_pending;
+	volatile int reset_pending;
+	uint64_t link_poll_tick;
+	uint64_t st_rx_bad, st_rx_long, st_rnr, st_tx_bad;
 	net_device_t net_dev;
 } eepro100_dev_t;
 
 void eepro100_init(void);
-void eepro100_irq_handler(void);
+int eepro100_irq_handler(void);
 
 #endif // _KERNEL_EEPRO100_H_

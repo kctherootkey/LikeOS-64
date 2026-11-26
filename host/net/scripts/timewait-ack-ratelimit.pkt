@@ -1,0 +1,28 @@
+# A TIME_WAIT sock answers rejected segments without data (out of window)
+# at most once per 500 ms; a retransmitted FIN is always answered.
+# Copyright (C) 2026 The LikeOS Project
+0.000 socket s stream
+0.000 bind s 8080
+0.000 listen s 16
+0.100 < S 0:0(0) win 65535 <mss 1460,sackOK,TS val 100 ecr 0,nop,wscale 7>
+0.100 > S. 0:0(0) ack 1 win * <mss 1460,sackOK,TS val * ecr 100,nop,wscale *>
+0.200 < . 1:1(0) ack 1 win 512 <nop,nop,TS val 200 ecr echo>
+0.200 accept s c
+0.300 shutdown c wr
+0.300 > F. 1:1(0) ack 1 win *
+0.300 < . 1:1(0) ack 2 win 512 <nop,nop,TS val 300 ecr echo>
+0.400 < F. 1:1(0) ack 2 win 512 <nop,nop,TS val 400 ecr echo>
+0.400 > . 2:2(0) ack 2 win * <nop,nop,TS val * ecr 400>
+0.410 state c CLOSED
+# out-of-window bare ACKs: the first is answered, the next ones within
+# 500 ms are not
+0.500 < . 5000:5000(0) ack 2 win 512 <nop,nop,TS val 500 ecr echo>
+0.500 > . 2:2(0) ack 2 win * <nop,nop,TS val * ecr 400>
+0.510 < . 5000:5000(0) ack 2 win 512 <nop,nop,TS val 510 ecr echo>
+0.520 < . 5000:5000(0) ack 2 win 512 <nop,nop,TS val 520 ecr echo>
+# the peer's FIN again (our ACK was lost): answered at once
+0.600 < F. 1:1(0) ack 2 win 512 <nop,nop,TS val 600 ecr echo>
+0.600 > . 2:2(0) ack 2 win * <nop,nop,TS val * ecr 400>
+# after the 500 ms an out-of-window segment is answered again
+1.100 < . 5000:5000(0) ack 2 win 512 <nop,nop,TS val 1100 ecr echo>
+1.100 > . 2:2(0) ack 2 win *

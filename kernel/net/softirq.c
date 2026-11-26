@@ -1,21 +1,28 @@
 // LikeOS — Deferred-work (softirq) framework
 //
-// See kernel/net/softirq.h for design rationale.
+// See kernel/net/softirq.h for design rationale and
+// kernel/net/softirq_core.h for the bounded processing loop.
 //
 // Copyright (C) 2026 The LikeOS Project
 
 #include <kernel/net/softirq.h>
+#include <kernel/net/softirq_core.h>
 #include <kernel/ke/percpu.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/smp.h>
 #include <kernel/io/console.h>
 #include <kernel/mm/memory.h>
+#include <kernel/ke/timer.h>
 #include <kernel/uapi/bug.h>
 
 static softirq_fn_t softirq_handlers[NR_SOFTIRQ];
 static volatile uint32_t softirq_pending_mask[MAX_CPUS];
 static volatile int softirq_in_progress[MAX_CPUS];
 static task_t *ksoftirqd_task[MAX_CPUS];
+/* Runs of each vector per CPU, and how often a run was cut short by the
+ * restart/time limit (diagnostics). */
+static uint64_t softirq_counts[MAX_CPUS][NR_SOFTIRQ];
+static uint64_t softirq_limit_hits[MAX_CPUS];
 
 // Before percpu_init() runs, GS base is 0 and this_cpu_id() would fault
 // reading %gs:cpu_id_offset.  IRQs (PS/2 mouse, keyboard, timer) can fire
@@ -107,6 +114,20 @@ int ksoftirqd_state_get(uint32_t cpu)
 	return t ? (int)t->state : -1;
 }
 
+uint64_t softirq_count_get(uint32_t cpu, uint32_t nr)
+{
+	if (cpu >= MAX_CPUS || nr >= NR_SOFTIRQ)
+		return 0;
+	return __atomic_load_n(&softirq_counts[cpu][nr], __ATOMIC_RELAXED);
+}
+
+uint64_t softirq_limit_hits_get(uint32_t cpu)
+{
+	if (cpu >= MAX_CPUS)
+		return 0;
+	return __atomic_load_n(&softirq_limit_hits[cpu], __ATOMIC_RELAXED);
+}
+
 // Returns the previous IF state (1 if IRQs were enabled, 0 otherwise) and
 // disables IRQs.
 static inline uint64_t local_irq_save_raw(void)
@@ -119,6 +140,26 @@ static inline uint64_t local_irq_save_raw(void)
 static inline void local_irq_restore_raw(uint64_t f)
 {
 	__asm__ volatile("pushq %0; popfq" ::"r"(f) : "memory", "cc");
+}
+
+static uint64_t softirq_now_ns(void)
+{
+	return timer_get_precise_ns();
+}
+
+static int softirq_need_resched(void)
+{
+	return sched_need_resched();
+}
+
+static void softirq_irq_on(void)
+{
+	__asm__ volatile("sti" ::: "memory");
+}
+
+static void softirq_irq_off(void)
+{
+	__asm__ volatile("cli" ::: "memory");
 }
 
 void softirq_drain(void)
@@ -161,27 +202,34 @@ void softirq_drain(void)
 		return;
 	}
 
-	softirq_in_progress[cpu] = 1;
 	BUG_ON(cpu >= MAX_CPUS);
+	softirq_in_progress[cpu] = 1;
 
-	for (;;) {
-		uint32_t mask = __atomic_exchange_n(&softirq_pending_mask[cpu],
-						    0, __ATOMIC_ACQ_REL);
-		if (mask == 0)
-			break;
-
-		__asm__ volatile("sti" ::: "memory");
-		for (uint32_t i = 0; i < NR_SOFTIRQ; i++) {
-			if (mask & (1u << i)) {
-				softirq_fn_t h = softirq_handlers[i];
-				if (h)
-					h();
-			}
-		}
-		__asm__ volatile("cli" ::: "memory");
-	}
+	/* Bounded run: MAX_SOFTIRQ_RESTART passes, MAX_SOFTIRQ_TIME_NS, and
+	 * in ksoftirqd also stop when a reschedule is due.  What is left
+	 * stays pending; ksoftirqd yields and comes back for it (see
+	 * ksoftirqd_main), any other caller wakes ksoftirqd. */
+	struct softirq_loop loop = {
+		.pending = &softirq_pending_mask[cpu],
+		.handlers = softirq_handlers,
+		.counts = softirq_counts[cpu],
+		.now_ns = softirq_now_ns,
+		.should_yield = sched_current() == ksoftirqd_task[cpu] ?
+					softirq_need_resched :
+					NULL,
+		.irq_enable = softirq_irq_on,
+		.irq_disable = softirq_irq_off,
+		.time_limit_ns = MAX_SOFTIRQ_TIME_NS,
+		.max_restart = MAX_SOFTIRQ_RESTART,
+	};
+	uint32_t left = softirq_loop_run(&loop);
 
 	softirq_in_progress[cpu] = 0;
+	if (left) {
+		softirq_limit_hits[cpu]++;
+		if (sched_current() != ksoftirqd_task[cpu])
+			softirq_wake_local(cpu);
+	}
 	local_irq_restore_raw(saved);
 }
 
@@ -194,6 +242,15 @@ static void ksoftirqd_main(void *arg)
 
 	for (;;) {
 		softirq_drain();
+
+		/* A run cut short by its limits left work pending: let the
+		 * other runnable tasks of this processor have it first, then
+		 * go on -- instead of parking, which would find the pending
+		 * bits and go straight back to work. */
+		if (softirq_pending_mask[my_cpu] != 0) {
+			sched_yield_in_kernel();
+			continue;
+		}
 
 		// Race-free sleep: mark blocked, then re-check pending, then yield.
 		// If softirq_raise() races in between, it will set the bit; our
@@ -264,7 +321,7 @@ void ksoftirqd_start_all(void)
 	for (uint32_t cpu = 0; cpu < ncpus && cpu < MAX_CPUS; cpu++) {
 		/* Guarded kstack (guard page below): ksoftirqd runs the WHOLE
 		 * network RX path — softirq_drain -> net_rx_softirq -> ipv4_rx
-		 * -> tcp_rx -> ... -> tcp_send/ipv4_send, plus nested hard IRQs
+		 * -> tcp_v4_rcv -> ... -> tcp_transmit_skb, plus nested hard IRQs
 		 * — on this stack, the deepest kernel-thread stack usage in the
 		 * system.  A plain kalloc'd stack has no guard page, so an
 		 * overflow would silently clobber adjacent heap (a task_t, a
