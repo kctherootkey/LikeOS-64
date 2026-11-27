@@ -144,19 +144,20 @@ EndSection
 
 Section "InputDevice"
 	Identifier	"Keyboard0"
-	Driver		"evdev"
+	# libinput, like the touchpads: one input stack for both is what lets
+	# it pause a touchpad while typing (disable-while-typing pairs the
+	# keyboard with the touchpad), which a keyboard on another driver
+	# cannot take part in.
+	Driver		"libinput"
 	Option		"Device"	"/dev/input/event0"
-	# Take an exclusive grab on the device (EVIOCGRAB).
-	#
-	# On a system with virtual terminals the server stops the console
-	# reading the keyboard by putting the VT into raw mode.  There are no
-	# VTs here, so the grab is what does it: while one is held the kernel
-	# stops feeding scancodes to the console tty.
-	#
-	# Without it every keystroke goes to BOTH X and the shell that ran
-	# startx -- the console echoes them over the display, and the line is
-	# waiting to be executed the moment the session ends.
-	Option		"GrabDevice"	"true"
+	# No exclusive grab, so the keyboard is NOT taken away from the
+	# console by this server.  The kernel does that itself: while a
+	# program drives the display (this server, as DRM master or holding
+	# /dev/fb0), keys go only to /dev/input/event0 and never to the
+	# console tty -- otherwise every keystroke would also be typed into
+	# the shell that ran startx, waiting to be executed the moment the
+	# session ends.  When the server exits, or dies, the console has the
+	# keyboard again.
 	# evdev is the rule set that matches the key codes this kernel emits;
 	# the alternative ("base") assumes the older, different numbering.
 	Option		"XkbRules"	"evdev"
@@ -168,12 +169,11 @@ Section "InputDevice"
 	Identifier	"Mouse0"
 	Driver		"evdev"
 	Option		"Device"	"/dev/input/event1"
-	# NOT grabbed, unlike the keyboard.
+	# NOT grabbed, like the keyboard.
 	#
-	# The keyboard needs a grab because the console tty would otherwise
-	# receive every keystroke as well.  The pointer has no such path -- the
-	# console only draws a cursor with it, and that is already suppressed
-	# while another program owns the framebuffer.
+	# The console only draws a cursor with the pointer, and that -- like
+	# its keyboard input -- is already suppressed while another program
+	# owns the display.
 	#
 	# Grabbing it made the pointer stick to the bottom edge and move only
 	# horizontally until it eventually freed itself, so it costs something
@@ -185,4 +185,9 @@ Section "ServerLayout"
 	Screen		0 "Screen0"
 	InputDevice	"Keyboard0"	"CoreKeyboard"
 	InputDevice	"Mouse0"	"CorePointer"
+	# Touchpads join this layout from /etc/X11/xorg.conf.d: on a machine
+	# that has one, likeos-input-devices (started by init) writes an
+	# InputDevice section for each, driven by libinput and marked
+	# "AutoServerLayout".  Mouse0 stays: it is every other pointer (PS/2,
+	# USB, the virtual machine's), merged by the kernel into event1.
 EndSection

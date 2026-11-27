@@ -17,7 +17,6 @@
 #include <kernel/hal/efi.h>
 #include <kernel/ke/percpu.h>
 #include <kernel/ke/smp.h>
-#include <kernel/dev/hid/i2c_hid.h>
 #include <kernel/net/net.h>
 #include <kernel/dev/nic/e1000.h>
 #include <kernel/net/softirq.h>
@@ -96,7 +95,6 @@ static void ps2_drain_output(void)
 
 // ACPI SCI dispatch (from oslikeos.c)
 extern int acpi_sci_dispatch(void);
-#define ACPI_SCI_VECTOR 58
 
 static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_descriptor idt_desc;
@@ -489,17 +487,15 @@ void idt_init()
 	idt_set_entry(48, (uint64_t)irq16, 0x08, 0x8E); // IOAPIC GSI 16
 	idt_set_entry(49, (uint64_t)irq17, 0x08, 0x8E); // IOAPIC GSI 17
 
-	// I2C LPSS interrupt vectors
-	idt_set_entry(50, (uint64_t)irq18, 0x08, 0x8E); // I2C LPSS 0
-	idt_set_entry(51, (uint64_t)irq19, 0x08, 0x8E); // I2C LPSS 1
-	idt_set_entry(52, (uint64_t)irq20, 0x08, 0x8E); // I2C LPSS 2
-	idt_set_entry(53, (uint64_t)irq21, 0x08, 0x8E); // I2C LPSS 3
-
-	// GPIO interrupt vectors for I2C HID
-	idt_set_entry(54, (uint64_t)irq22, 0x08, 0x8E); // GPIO 0
-	idt_set_entry(55, (uint64_t)irq23, 0x08, 0x8E); // GPIO 1
-	idt_set_entry(56, (uint64_t)irq24, 0x08, 0x8E); // GPIO 2
-	idt_set_entry(57, (uint64_t)irq25, 0x08, 0x8E); // GPIO 3
+	// IOAPIC GSI 18-25 (vector = 32 + GSI)
+	idt_set_entry(50, (uint64_t)irq18, 0x08, 0x8E); // IOAPIC GSI 18
+	idt_set_entry(51, (uint64_t)irq19, 0x08, 0x8E); // IOAPIC GSI 19
+	idt_set_entry(52, (uint64_t)irq20, 0x08, 0x8E); // IOAPIC GSI 20
+	idt_set_entry(53, (uint64_t)irq21, 0x08, 0x8E); // IOAPIC GSI 21
+	idt_set_entry(54, (uint64_t)irq22, 0x08, 0x8E); // IOAPIC GSI 22
+	idt_set_entry(55, (uint64_t)irq23, 0x08, 0x8E); // IOAPIC GSI 23
+	idt_set_entry(56, (uint64_t)irq24, 0x08, 0x8E); // IOAPIC GSI 24
+	idt_set_entry(57, (uint64_t)irq25, 0x08, 0x8E); // IOAPIC GSI 25
 	idt_set_entry(58, (uint64_t)irq26, 0x08, 0x8E); // ACPI SCI
 	idt_set_entry(59, (uint64_t)irq27, 0x08, 0x8E); // MSI: E1000 NIC
 	idt_set_entry(60, (uint64_t)irq28, 0x08,
@@ -2155,8 +2151,8 @@ static int irq_handler_body(uint64_t *regs)
 	// available, e.g. VirtualBox).  These MUST be checked BEFORE any
 	// fixed-vector branches below, because the IOAPIC may map the NIC's
 	// PCI INTA pin to a GSI whose vector one of the fixed arms below
-	// also answers (e.g. GSI 18..21 -> vectors 50..53, the I2C LPSS
-	// vectors).  The level-triggered NIC line would otherwise be ACK'd by
+	// also answers (e.g. a GSI whose vector a fixed arm below also
+	// claims).  The level-triggered NIC line would otherwise be ACK'd by
 	// the wrong handler and assert forever, hanging the system in an IRQ
 	// storm.
 	//
@@ -2263,20 +2259,6 @@ static int irq_handler_body(uint64_t *regs)
 	}
 
 	// (Legacy NIC dispatch was moved above — see top of irq_handler.)
-
-	// MSI/IOAPIC vectors for I2C LPSS controllers (vectors 50-53)
-	if (int_no >= 50 && int_no <= 53) {
-		i2c_hid_irq_handler((uint8_t)int_no);
-		// i2c_hid_irq_handler calls lapic_eoi() internally
-		goto exit;
-	}
-
-	// GPIO interrupt vectors for I2C HID devices (vectors 54-57)
-	if (int_no >= 54 && int_no <= 57) {
-		i2c_hid_gpio_irq_handler((uint8_t)int_no);
-		// i2c_hid_gpio_irq_handler calls lapic_eoi() internally
-		goto exit;
-	}
 
 	// ACPI SCI interrupt (vector 58) — level-triggered via IOAPIC
 	if (int_no == ACPI_SCI_VECTOR) {

@@ -40,7 +40,9 @@ int devfs_is_zero(vfs_file_t *f);
 struct shm_object *devfs_shm_object(vfs_file_t *f);
 /* memfd seals: add==0 reads into *out, add!=0 ORs seals in. */
 int devfs_shm_seals(vfs_file_t *f, int add, unsigned seals, unsigned *out);
-int devfs_evdev_unit(vfs_file_t *f); // event-device unit or -1
+struct evdev_client;
+/* The event queue (client) of a /dev/input/eventN handle, or NULL. */
+struct evdev_client *devfs_evdev_client(vfs_file_t *f);
 /* Registered device nodes / anonymous device files (kernel/fs/device.h):
  * poll dispatch (returns -1 if `f' is not one) and the mmap hook. */
 struct poll_table;

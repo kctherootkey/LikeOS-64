@@ -85,7 +85,8 @@ static void hid_memcpy(void *dst, const void *src, size_t n)
 		*d++ = *s++;
 }
 
-static void hid_delay_ms(uint32_t ms)
+/* Not called at present (kept for bring-up debugging). */
+static __attribute__((unused)) void hid_delay_ms(uint32_t ms)
 {
 	for (uint32_t i = 0; i < ms * 100000; i++) {
 		__asm__ volatile("pause");
@@ -1072,7 +1073,9 @@ static int hid_set_idle(xhci_controller_t *ctrl, usb_device_t *dev,
 // Configure an interrupt IN endpoint for a HID device via xHCI.
 // This sets up the Endpoint Context in the device's output context
 // with the proper type (Interrupt IN) and interval.
-static int hid_configure_interrupt_ep(usbhid_device_t *hdev)
+/* Not called at present (kept for a later use). */
+static __attribute__((unused)) int
+hid_configure_interrupt_ep(usbhid_device_t *hdev)
 {
 	xhci_controller_t *ctrl = hdev->ctrl;
 	usb_device_t *dev = hdev->usb_dev;

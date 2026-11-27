@@ -11,12 +11,16 @@
 //               terminal: characters in the loaded layout as UTF-8,
 //               function key strings, cursor sequences.
 //
-// While a display server holds the keyboard grab, the console side is
-// bypassed entirely, as it always was.
+// While another program has the keyboard -- it switched the console's
+// keyboard off (KDSKBMODE K_OFF), or it holds the exclusive grab on event0
+// -- the console side is bypassed entirely (see "Who has the keyboard"
+// below).
 //
-// The keymap, the keyboard mode and the lock LEDs are the console's KD*
-// ioctls (<kernel/uapi/kd.h>), answered by keyboard_kd_ioctl() for the
-// console terminal.
+// The keymap, the keyboard mode, the display mode and the lock LEDs are the
+// console's KD* ioctls (<kernel/uapi/kd.h>), answered by keyboard_kd_ioctl()
+// for the console terminal.  The program that switched the console off gets
+// it back automatically when its last descriptor closes ("The console's
+// modes and who set them").
 //
 // Copyright (C) 2026 The LikeOS Project
 
@@ -32,6 +36,7 @@
 #include <kernel/mm/memory.h>
 #include <kernel/dev/rand/random.h>
 #include <kernel/dev/input/evdev.h>
+#include <kernel/dev/video/fbdev.h>
 #include <kernel/uapi/bug.h>
 
 // The console's keymap engine state, and the lock that serialises it: the
@@ -57,6 +62,12 @@ static uint8_t led_hw = 0xFF; // what the PS/2 keyboard shows (0xFF unknown)
 static uint8_t led_sending;
 static volatile uint8_t led_want;
 static uint64_t led_cmd_tick;
+
+// Who has the keyboard (kb_lock): 1 while the console side is bypassed.
+static uint8_t kb_console_off;
+// The lock LEDs the client of event0 last asked for (EV_LED), in the
+// console's LED_* bits; shown while the console is bypassed (kb_lock).
+static uint8_t led_client;
 
 static void ps2_write_data(uint8_t b)
 {
@@ -115,10 +126,11 @@ static int ps2_led_answer(uint8_t sc)
 	return 1;
 }
 
-// Re-read the LEDs the keymap wants.  Caller holds kb_lock.
+// Re-read the LEDs to show: the keymap's, or while the console is bypassed
+// the ones the client of event0 set.  Caller holds kb_lock.
 static void keyboard_leds_update_locked(void)
 {
-	led_want = (uint8_t)keymap_leds(&g_km);
+	led_want = kb_console_off ? led_client : (uint8_t)keymap_leds(&g_km);
 	ps2_led_kick();
 }
 
@@ -219,10 +231,167 @@ static void keyboard_run_hotkey(int hk)
 	}
 }
 
-// Whether the console side was bypassed for the previous byte (keyboard
-// grabbed).  Keys pressed or released while grabbed never reached the
-// engine, so its record of held keys is dropped when the grab ends.
-static uint8_t kb_was_grabbed;
+// ---------------------------------------------------------------------------
+// Who has the keyboard
+// ---------------------------------------------------------------------------
+//
+// The console terminal gets the keyboard only while nobody else has it, and
+// two things take it away:
+//
+//   - the keyboard mode is K_OFF.  A display server sets it when it opens
+//     the console (and KD_GRAPHICS with it): it reads event0 without a grab
+//     -- its input stack pairs the keyboard with the touchpad to pause the
+//     touchpad while typing -- so without this every keystroke would also be
+//     typed into the shell that started it, unseen, and that line would run
+//     the moment the session ended;
+//   - a client holds the exclusive grab on event0 (EVIOCGRAB).
+//
+// Meanwhile the scancodes still reach evdev, and nothing of the console's
+// runs: no characters, no raw bytes, no keymap actions (Break, Show_Memory,
+// Show_State, scrollback) and no Ctrl+D / Ctrl+N hotkeys -- exactly as under
+// the grab.  There are no virtual terminals and no other console keys to
+// keep.  K_RAW and K_MEDIUMRAW are not "off": the console terminal gets the
+// scancodes or key codes as before.
+//
+// Which program draws on the screen does not matter here: a program that
+// maps /dev/fb0 (fbtest, the test suite) keeps the keyboard.
+//
+// Keys pressed or released meanwhile never reached the keymap engine, so
+// its record of held keys and modifiers (and a half-read 0xE0/0xE1
+// sequence) is dropped when the console gets the keyboard back: a Shift
+// released inside the session must not stay held on the console.  Its lock
+// state -- Caps, Num, Scroll Lock -- is its own and is kept.  The LEDs
+// follow whoever has the keyboard.
+//
+// Checked for every byte, under kb_lock, so a key never reaches the console
+// while it is off; a mode change also re-evaluates at once, so the LEDs
+// switch without waiting for a key.
+
+// Re-evaluate who has the keyboard; nonzero while it is not the console.
+// Caller holds kb_lock.
+static int keyboard_owner_update_locked(int grabbed)
+{
+	uint8_t off = (grabbed || g_km.kbdmode == K_OFF) ? 1 : 0;
+
+	if (off != kb_console_off) {
+		kb_console_off = off;
+		if (!off)
+			keymap_reset_keys(&g_km);
+		keyboard_leds_update_locked();
+	}
+	return off;
+}
+
+void keyboard_client_leds(int num, int caps, int scroll)
+{
+	uint64_t flags;
+
+	spin_lock_irqsave(&kb_lock, &flags);
+	led_client = (uint8_t)((num ? LED_NUM : 0) | (caps ? LED_CAP : 0) |
+			       (scroll ? LED_SCR : 0));
+	if (kb_console_off)
+		keyboard_leds_update_locked();
+	spin_unlock_irqrestore(&kb_lock, flags);
+}
+
+// ---------------------------------------------------------------------------
+// The console's modes and who set them
+// ---------------------------------------------------------------------------
+//
+// The keyboard mode (KDSKBMODE) and the display mode (KDSETMODE) are global
+// state of the one console, and a display server that dies without putting
+// them back would leave the machine without a keyboard: K_OFF stays, and
+// KD_GRAPHICS keeps the console's pointer dead.  So the kernel remembers
+// which open file of the console last switched it away from its normal
+// state -- KD_GRAPHICS, or K_OFF -- and when that file is finally closed
+// (the program exited, crashed or was killed: the descriptor table goes
+// either way) the console gets KD_TEXT and the keyboard mode from before
+// back, with no key left held, its own LEDs and a full redraw.
+//
+// Only the LAST file to change a mode owns the restore: another file that
+// sets a mode afterwards takes it over (inheriting the mode to go back to),
+// and the earlier file's close then changes nothing.  A file that puts both
+// modes back to normal itself leaves nothing to restore.
+//
+// Files are told apart by a token handed out at open (never reused), not by
+// address: a closed file's memory can be the next open's.  Token 0 is a
+// request that came without a file (a console descriptor of a task's stdio
+// markers); it owns nothing.
+//
+// The owner may also always change the modes back, even when it would no
+// longer pass kd_permitted(): the display server opens the console as root
+// and drops its privileges before it exits.
+
+static uint64_t kd_owner; // token of the owning file, 0 none (kb_lock)
+static uint8_t kd_saved_kbdmode = K_UNICODE; // to go back to (kb_lock)
+static uint64_t kd_next_token = 1;
+
+uint64_t keyboard_console_file_token(void)
+{
+	return __atomic_fetch_add(&kd_next_token, 1, __ATOMIC_RELAXED);
+}
+
+int keyboard_kd_graphics(void)
+{
+	return __atomic_load_n(&g_km.kdmode, __ATOMIC_ACQUIRE) == KD_GRAPHICS;
+}
+
+// Both modes as the console normally has them.  Caller holds kb_lock.
+static int kd_state_normal(void)
+{
+	return g_km.kdmode == KD_TEXT && g_km.kbdmode != K_OFF;
+}
+
+// Record who changed a mode, after the change.  was_normal and prev_kbdmode
+// describe the state before it.  Caller holds kb_lock.
+static void kd_note_change_locked(uint64_t token, int was_normal,
+				  uint8_t prev_kbdmode)
+{
+	if (kd_state_normal()) {
+		kd_owner = 0;
+		return;
+	}
+	// Leaving the normal state: what to come back to is the mode in
+	// effect now -- never K_OFF, which is not normal.  Otherwise the
+	// earlier owner's saved mode is kept.
+	if (was_normal)
+		kd_saved_kbdmode = prev_kbdmode;
+	WARN_ON(kd_saved_kbdmode == K_OFF);
+	kd_owner = token;
+}
+
+void keyboard_console_file_closed(uint64_t token)
+{
+	int grabbed;
+	uint64_t flags;
+	int restored = 0;
+	int change = 0;
+
+	if (!token)
+		return;
+	grabbed = evdev_kbd_grabbed();
+	spin_lock_irqsave(&kb_lock, &flags);
+	if (kd_owner == token) {
+		kd_owner = 0;
+		(void)keymap_set_kbdmode(&g_km, kd_saved_kbdmode);
+		__atomic_store_n(&g_km.kdmode, (uint8_t)KD_TEXT,
+				 __ATOMIC_SEQ_CST);
+		change = console_display_kd_note(0);
+		// Whatever was held when the owner went is not held now.
+		keymap_reset_keys(&g_km);
+		(void)keyboard_owner_update_locked(grabbed);
+		keyboard_leds_update_locked();
+		restored = 1;
+	}
+	spin_unlock_irqrestore(&kb_lock, flags);
+	if (!restored)
+		return;
+	kprintf("console: keyboard and display modes restored (their owner closed the console)\n");
+	// The screen: whatever that program left on it goes -- if this ended
+	// the display's ownership.  While a DRM master still holds it, its
+	// drop repaints instead.
+	console_display_settle(change);
+}
 
 // One byte of the stream, console side.
 static void keyboard_process(uint8_t sc, int grabbed)
@@ -234,14 +403,9 @@ static void keyboard_process(uint8_t sc, int grabbed)
 	uint64_t flags;
 
 	spin_lock_irqsave(&kb_lock, &flags);
-	if (grabbed) {
-		kb_was_grabbed = 1;
+	if (keyboard_owner_update_locked(grabbed)) {
 		spin_unlock_irqrestore(&kb_lock, flags);
 		return;
-	}
-	if (kb_was_grabbed) {
-		kb_was_grabbed = 0;
-		keymap_reset_keys(&g_km);
 	}
 	o.len = 0;
 	o.actions = 0;
@@ -321,7 +485,7 @@ uint8_t keyboard_read_scan_code(void)
 
 // Producers other than the PS/2 keyboard (USB HID): one byte of the set-1
 // stream.  evdev sees it first, exactly as it comes; the console side
-// follows unless the keyboard is grabbed.
+// follows unless another program has the keyboard.
 void keyboard_buffer_add(uint8_t scan_code)
 {
 	int grabbed = evdev_feed_keyboard(scan_code);
@@ -358,8 +522,8 @@ void keyboard_irq_handler(void)
 
 	// evdev tap: the raw set-1 stream (0xE0 prefixes included) becomes
 	// input events on /dev/input/event0 in parallel with the cooked tty
-	// path.  While a client holds a grab, the tty path (and thus SIGINT
-	// generation) is suppressed -- the grabber owns the console.
+	// path.  While a client holds a grab or another program drives the
+	// display, the tty path (and thus SIGINT generation) is suppressed.
 	grabbed = evdev_feed_keyboard(scan_code);
 	keyboard_process(scan_code, grabbed);
 }
@@ -575,7 +739,50 @@ static int kd_set_func(void *argp)
 	return 0;
 }
 
-int keyboard_kd_ioctl(unsigned long req, void *argp, task_t *cur)
+// KDSKBMODE (kbdmode >= 0) and KDSETMODE (kdmode >= 0), with the record of
+// who changed them ("The console's modes and who set them").
+static int kd_set_modes(task_t *cur, uint64_t token, int kbdmode, int kdmode)
+{
+	int grabbed = evdev_kbd_grabbed();
+	int was_normal, change = 0, r = 0;
+	uint8_t prev_kbdmode;
+	uint64_t flags;
+
+	spin_lock_irqsave(&kb_lock, &flags);
+	// Permission is checked under the lock: whether the caller owns the
+	// modes can change under it.
+	if (!kd_permitted(cur) && !(token && token == kd_owner)) {
+		spin_unlock_irqrestore(&kb_lock, flags);
+		return -EPERM;
+	}
+	was_normal = kd_state_normal();
+	prev_kbdmode = g_km.kbdmode;
+	if (kbdmode >= 0)
+		r = keymap_set_kbdmode(&g_km, (unsigned)kbdmode);
+	if (!r && kdmode >= 0) {
+		__atomic_store_n(&g_km.kdmode, (uint8_t)kdmode,
+				 __ATOMIC_SEQ_CST);
+		// The console's output gate follows the display mode in the
+		// order the modes are set: noted here, under kb_lock.
+		change = console_display_kd_note(kdmode == KD_GRAPHICS);
+	}
+	if (!r) {
+		kd_note_change_locked(token, was_normal, prev_kbdmode);
+		(void)keyboard_owner_update_locked(grabbed);
+	}
+	spin_unlock_irqrestore(&kb_lock, flags);
+
+	// KD_GRAPHICS: the console stops painting (and its hardware cursor
+	// goes) -- if this took the display.  Back to text: the console's
+	// pointer works again and what the graphics program left is
+	// repainted -- if this ended the display's ownership; while a DRM
+	// master still holds it, its drop repaints instead.
+	console_display_settle(change);
+	return r;
+}
+
+int keyboard_kd_ioctl(unsigned long req, void *argp, task_t *cur,
+		      uint64_t token)
 {
 	uintptr_t arg = (uintptr_t)argp;
 	uint64_t flags;
@@ -610,14 +817,9 @@ int keyboard_kd_ioctl(unsigned long req, void *argp, task_t *cur)
 	case KDGKBMODE:
 		return put_user_int(argp, g_km.kbdmode);
 	case KDSKBMODE:
-		if (!kd_permitted(cur))
-			return -EPERM;
 		if (arg > K_OFF)
 			return -EINVAL;
-		spin_lock_irqsave(&kb_lock, &flags);
-		r = keymap_set_kbdmode(&g_km, (unsigned)arg);
-		spin_unlock_irqrestore(&kb_lock, flags);
-		return r;
+		return kd_set_modes(cur, token, (int)arg, -1);
 
 	case KDGKBMETA:
 		return put_user_int(argp, g_km.metamode);
@@ -634,12 +836,9 @@ int keyboard_kd_ioctl(unsigned long req, void *argp, task_t *cur)
 	case KDGETMODE:
 		return put_user_int(argp, g_km.kdmode);
 	case KDSETMODE:
-		if (!kd_permitted(cur))
-			return -EPERM;
 		if (arg != KD_TEXT && arg != KD_GRAPHICS)
 			return -EINVAL;
-		g_km.kdmode = (uint8_t)arg;
-		return 0;
+		return kd_set_modes(cur, token, -1, (int)arg);
 
 	case KDGKBENT: {
 		struct kbentry ke;

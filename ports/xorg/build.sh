@@ -252,7 +252,7 @@ pkg_opts() {
 		      --with-sha1=libcrypto --with-default-xkb-rules=evdev \
 		      --disable-vgahw"
 		;;
-	xf86-input-evdev | xf86-video-fbdev)
+	xf86-input-evdev | xf86-input-libinput | xf86-video-fbdev)
 		# Install directories must be given as TARGET paths.  Left to
 		# themselves these packages read them back with
 		# `pkg-config --variable=sdkdir xorg-server`, and pkg-config --
@@ -737,6 +737,23 @@ meson_opts() {
 		      -Denable-bash-completion=false"
 		;;
 	libpciaccess) echo "-Dzlib=disabled" ;;
+	libinput)
+		# The library, its quirks database (model-specific fixes for
+		# Elan, Synaptics, Dell, HP, ... touchpads, installed to
+		# /usr/share/libinput) and the command-line tools that work
+		# without a GUI -- `libinput list-devices' and `libinput
+		# debug-events' are how a touchpad is diagnosed on the machine.
+		#
+		# Off: libwacom (tablet database; no tablets supported here),
+		# the GTK debug viewer, the test suite (target programs; needs
+		# the check framework), documentation (Doxygen and Sphinx),
+		# zsh completion and Lua plugins.  mtdev stays on, for
+		# multitouch devices of the older protocol.
+		echo "-Dlibwacom=false -Ddebug-gui=false -Dtests=false \
+		      -Dinstall-tests=false -Ddocumentation=false \
+		      -Dzshcompletiondir=no -Dlua-plugins=disabled \
+		      -Dmtdev=true"
+		;;
 	# libxshmfence: futexes through this libc (patches/libxshmfence), the
 	# fence files in /dev/shm.
 	libxshmfence) echo "--enable-futex --with-shared-memory-dir=/dev/shm" ;;

@@ -119,6 +119,42 @@ for b in startx xinit xauth xsetroot xterm uxterm resize ctwm \
 done
 
 # ---------------------------------------------------------------------------
+# libinput: the touchpad stack behind the X server's libinput driver.
+#
+# The library and the driver module come with the libraries and modules
+# above.  What else it needs at run time is its quirks database -- the
+# model-specific corrections (touchpad sizes, pressure and palm thresholds,
+# clickpad and pointing-stick fixes for Elan, Synaptics, Dell, HP, Lenovo
+# ...), which it reads from /usr/share/libinput on every start.  Without it
+# the library still works, with defaults that are wrong for exactly the
+# devices the quirks exist for.
+#
+# The command-line tools are how a touchpad is looked at on the machine
+# itself: `libinput list-devices' shows what libinput makes of each device
+# and its settings, `libinput debug-events' every event it produces, `libinput
+# quirks list /dev/input/eventN' which quirks apply, `libinput record' a
+# recording to attach to a bug report.  `libinput' dispatches to the
+# programs in /usr/libexec/libinput.  The tools written in Python (measure,
+# analyze, replay) are left out: there is no Python here.
+# ---------------------------------------------------------------------------
+if [ -d "$SYSROOT/usr/share/libinput" ]; then
+	rm -rf "$DEST/usr/share/libinput"
+	mkdir -p "$DEST/usr/share"
+	cp -a "$SYSROOT/usr/share/libinput" "$DEST/usr/share/libinput"
+fi
+if [ -f "$SYSROOT/usr/bin/libinput" ]; then
+	cp "$SYSROOT/usr/bin/libinput" "$DEST/usr/bin/libinput"
+	mkdir -p "$DEST/usr/libexec/libinput"
+	for t in libinput-list-devices libinput-debug-events \
+		 libinput-debug-tablet libinput-debug-tablet-pad \
+		 libinput-quirks libinput-record; do
+		[ -f "$SYSROOT/usr/libexec/libinput/$t" ] &&
+			cp "$SYSROOT/usr/libexec/libinput/$t" \
+				"$DEST/usr/libexec/libinput/$t"
+	done
+fi
+
+# ---------------------------------------------------------------------------
 # Desktop entries for the X programs that install none of their own.
 #
 # A .desktop file is the only place the system records that a program exists,
@@ -285,6 +321,12 @@ fi
 # ---------------------------------------------------------------------------
 cp "$root/res/xorg/xorg.conf" "$DEST/etc/X11/xorg.conf"
 
+# The configuration directory the server reads before the files above.
+# Shipped empty: likeos-input-devices (started by init) puts the touchpads'
+# InputDevice sections there on machines that have one.
+mkdir -p "$DEST/etc/X11/xorg.conf.d"
+chmod 0755 "$DEST/etc/X11/xorg.conf.d"
+
 # The second configuration: the display-manager one, picked by xserverrc when
 # /dev/dri/card0 exists.  Both are always installed -- which one runs is a
 # question about the machine that booted the image, not about the image.
@@ -311,7 +353,9 @@ cp "$root/res/xorg/xorg.conf.modesetting-vmwgfx-3d" "$DEST/etc/X11/xorg.conf.mod
 # Set NO_STRIP=1 to keep it, matching the kernel build.
 # ---------------------------------------------------------------------------
 if [ "${NO_STRIP:-0}" != "1" ]; then
-	find "$DEST/lib" "$DEST/usr/lib/xorg" "$DEST/usr/bin" -type f \
+	find "$DEST/lib" "$DEST/usr/lib/xorg" "$DEST/usr/bin" \
+		$( [ -d "$DEST/usr/libexec/libinput" ] && echo "$DEST/usr/libexec/libinput" ) \
+		-type f \
 		\( -name '*.so*' -o -perm -u+x \) \
 		-exec strip --strip-debug {} + 2>/dev/null || true
 fi

@@ -1172,10 +1172,9 @@ void e1000_init(void)
 		// The IRQ dispatcher (kernel/ke/interrupt.c) only routes the legacy
 		// IRQ to e1000_irq_handler() when g_e1000_initialized != 0; if the
 		// device fires an interrupt (LSC, etc.) before this flag is set the
-		// dispatcher falls through to other handlers (e.g. the I2C LPSS
-		// range covers vectors 50-53, which is exactly where GSI 19 lands
-		// on VirtualBox ICH9), causing them to access non-existent
-		// hardware and lock up the system in a level-triggered IRQ storm.
+		// dispatcher falls through to the other handlers and nothing
+		// acknowledges the device, locking up the system in a
+		// level-triggered IRQ storm.
 		// We populate the minimum state e1000_irq_handler() touches.
 		dev->net_dev.lock = (spinlock_t)SPINLOCK_INIT("e1000");
 		dev->tx_lock = (spinlock_t)SPINLOCK_INIT("e1000_tx");

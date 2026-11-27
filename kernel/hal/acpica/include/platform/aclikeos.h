@@ -15,8 +15,11 @@
 /* No system C library — ACPICA provides internal implementations */
 /* Do NOT define ACPI_USE_SYSTEM_CLIBRARY or ACPI_USE_STANDARD_HEADERS */
 
-/* Single-threaded — no preemption in kernel ACPI calls */
-#define ACPI_SINGLE_THREADED
+/* Multi-threaded: AML runs in many tasks and the SCI handler on any CPU.
+ * The OS layer (kernel/hal/acpica/oslikeos_sync.c) provides real
+ * mutexes (functions of their own, binary semaphores underneath),
+ * counting semaphores and interrupt-safe spinlocks. */
+#define ACPI_MUTEX_TYPE             ACPI_OSL_MUTEX
 
 /* We provide the RSDP address ourselves */
 #define ACPI_USE_NATIVE_RSDP_POINTER

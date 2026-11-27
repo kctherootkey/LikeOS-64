@@ -176,6 +176,7 @@ static void drm_release(vfs_file_t *file)
 int drm_master_set(struct drm_device *dev, struct drm_file *fp)
 {
 	uint64_t fl;
+	int change;
 
 	spin_lock_irqsave(&dev->lock, &fl);
 	if (dev->master && dev->master != fp) {
@@ -186,35 +187,40 @@ int drm_master_set(struct drm_device *dev, struct drm_file *fp)
 		/* Already the master: a display server asks again (SET_MASTER
 		 * on entering its VT) after having become master by opening
 		 * the node.  Nothing changes hands, so nothing below runs
-		 * again -- the hand-over below is counted (fbdev_opened), and
-		 * a second count with one release on exit left the console
-		 * neither painting nor listening after X had gone. */
+		 * again -- the hand-over below is counted (the display's
+		 * owners), and a second count with one release on exit left
+		 * the console neither painting nor listening after X had
+		 * gone. */
 		spin_unlock_irqrestore(&dev->lock, fl);
 		return 0;
 	}
 	dev->master = fp;
 	fp->is_master = 1;
 	fp->authenticated = 1;
+	/* ...and owns the display (console_display_owned) until it drops it:
+	 * the console paints nothing and draws no pointer over the session --
+	 * whatever the console is drawing into, the master scans out of its
+	 * own buffers now.  Said here, for every driver, rather than by one
+	 * driver's hook.  One count per device, changed under the lock that
+	 * changes dev->master, so a set and a drop racing on two processors
+	 * can never count in the wrong order.  Whether the console's keyboard
+	 * and pointer LISTEN is the display server's KD_GRAPHICS / K_OFF
+	 * (keyboard.c). */
+	change = console_display_master_note(1);
 	spin_unlock_irqrestore(&dev->lock, fl);
 	/* The screen belongs to the master now; the console stops pushing. */
 	drm_console_suspend(dev);
 	if (dev->drv->master_set)
 		dev->drv->master_set(dev, fp);
-	/* ...and stops LISTENING.  The console's output is silenced above,
-	 * but its input -- the pointer driving the scrollbar, the scrollback
-	 * and the terminal's mouse reporting -- is gated on the display being
-	 * owned (fbdev_display_owned), which a display manager on this node
-	 * never signals by itself: it opens /dev/dri/cardN, not /dev/fb0.
-	 * Said here, for every driver, rather than by one driver's hook: with
-	 * the Intel driver every scroll in an X window was also scrolling the
-	 * console underneath, unseen until X exited. */
-	fbdev_opened();
+	/* The hardware cursor down, if this took the display. */
+	console_display_settle(change);
 	return 0;
 }
 
 void drm_master_drop(struct drm_device *dev, struct drm_file *fp)
 {
 	uint64_t fl;
+	int change;
 
 	spin_lock_irqsave(&dev->lock, &fl);
 	if (dev->master != fp) {
@@ -223,14 +229,18 @@ void drm_master_drop(struct drm_device *dev, struct drm_file *fp)
 	}
 	dev->master = NULL;
 	fp->is_master = 0;
+	change = console_display_master_note(0);
 	spin_unlock_irqrestore(&dev->lock, fl);
 	if (dev->drv->master_drop)
 		dev->drv->master_drop(dev, fp);
-	/* The display is the console's again: input is forwarded to it once
-	 * more and its screen and pointer are repainted in full (see
-	 * fbdev_closed) -- after the driver has handed the hardware back and
-	 * before the console's mode is set again below. */
-	fbdev_closed();
+	/* The display is the console's again -- unless the console is still
+	 * in KD_GRAPHICS (a display server drops its master before it puts
+	 * KD_TEXT back; that restore repaints then) or another device has a
+	 * master.  If this was the last owner, the console's screen and
+	 * pointer are repainted in full -- after the driver has handed the
+	 * hardware back and before the console's mode is set again below, so
+	 * the buffer that mode set shows is already the current one. */
+	console_display_settle(change);
 	/* ...and back, which means setting the mode again: the CRTC is on a
 	 * framebuffer that is going away with the client that made it. */
 	drm_console_resume(dev);

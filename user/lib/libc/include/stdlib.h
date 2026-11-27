@@ -48,6 +48,13 @@ unsigned long long strtoull(const char* nptr, char** endptr, int base);
 double strtod(const char* nptr, char** endptr);
 float strtof(const char* nptr, char** endptr);
 long double strtold(const char* nptr, char** endptr);
+/* The same in a given locale (<locale.h>'s locale_t, spelled as the struct
+ * so this header need not pull <locale.h> in).  Every locale here has '.'
+ * as its radix character. */
+struct __locale_struct;
+double strtod_l(const char* nptr, char** endptr, struct __locale_struct* loc);
+float strtof_l(const char* nptr, char** endptr, struct __locale_struct* loc);
+long double strtold_l(const char* nptr, char** endptr, struct __locale_struct* loc);
 double atof(const char* nptr);
 
 // Process control

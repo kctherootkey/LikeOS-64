@@ -6,6 +6,12 @@
 // the read/write/lseek file interface, then mmap the framebuffer, paint the
 // whole screen blue, and finally unmap, restore the mode and close.
 //
+// Opening /dev/fb0 does not stop the console from painting.  For the blue
+// screen the display is taken the way X.org's console code takes it: the
+// console in KD_GRAPHICS, put back to KD_TEXT afterwards (and the console
+// repaints).  That needs root; without it the console may draw over the
+// fill.  Under a display server (already KD_GRAPHICS) nothing is changed.
+//
 // Copyright (C) 2026 The LikeOS Project
 
 #include <stdio.h>
@@ -18,6 +24,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/fb.h>
+#include <sys/kd.h>
 
 static int failures = 0;
 
@@ -29,6 +36,30 @@ static void step(const char *name, int ok)
 		failures++;
 	}
 	printf("\n");
+}
+
+// The console in KD_GRAPHICS: the descriptor to put KD_TEXT back through,
+// or -1 when nothing was changed (already graphics, or not permitted).
+static int take_display(void)
+{
+	int fd = open("/dev/tty0", O_RDWR | O_NOCTTY | O_CLOEXEC), mode = -1;
+
+	if (fd < 0)
+		return -1;
+	if ((ioctl(fd, KDGETMODE, &mode) == 0 && mode == KD_GRAPHICS) ||
+	    ioctl(fd, KDSETMODE, KD_GRAPHICS) != 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static void give_back_display(int tty)
+{
+	if (tty < 0)
+		return;
+	(void)ioctl(tty, KDSETMODE, KD_TEXT);
+	close(tty);
 }
 
 int main(void)
@@ -115,6 +146,8 @@ int main(void)
 	step("mmap framebuffer MAP_SHARED", fb != MAP_FAILED);
 
 	if (fb != MAP_FAILED) {
+		int tty = take_display();
+
 		// Fill the visible screen blue, honoring the pitch.
 		for (uint32_t y = 0; y < var.yres; y++) {
 			unsigned char *line =
@@ -129,10 +162,12 @@ int main(void)
 					px[x] = 0x001F; // RGB565 blue
 			}
 		}
-		// Hold the blue frame BEFORE printing anything: console output
-		// scrolls, and a scroll repaints the full frame from the
-		// console's backing store, wiping the fill instantly.
+		// Hold the blue frame BEFORE printing anything: without the
+		// display taken, console output scrolls, and a scroll repaints
+		// the full frame from the console's backing store, wiping the
+		// fill instantly.
 		sleep(3);
+		give_back_display(tty);
 		step("fill screen blue via mapping", 1);
 
 		r = munmap(fb, maplen);
@@ -149,6 +184,6 @@ int main(void)
 	printf("fbtest: %s (%d failure%s)\n",
 	       failures ? "FAILED" : "all tests passed", failures,
 	       failures == 1 ? "" : "s");
-	printf("fbtest: note: console text reappears on the next redraw\n");
+	printf("fbtest: note: without root the console may have drawn over the fill\n");
 	return failures;
 }

@@ -141,8 +141,15 @@ void mouse_show_cursor_noflush(int show); // Back-buffer only, no VRAM flush
 void mouse_apply_cursor(void); // Apply loaded cursor from cursor.h
 
 // Inject a USB HID mouse movement/button/scroll event.
-// Called by the USB HID driver to feed events into the mouse subsystem.
+// Called by the USB HID driver to feed events into the mouse subsystem,
+// and by the console pointer bridge (mousedev.c) for touchpads and HID
+// mice nobody in user space reads.  Any context.
 void mouse_inject_usb_movement(int dx, int dy, uint8_t buttons, int8_t wheel);
+// An I2C touchpad (mousedev_is_i2c_touchpad) reported a frame; `contact':
+// a finger on it or its button down.  Drives the PS/2 preference: its
+// first real report disables the i8042 auxiliary port when the PS/2 device
+// there is not a TrackPoint (see struct mousedev_ps2_pref).  Any context.
+void mouse_i2c_touchpad_report(const char *name, int contact);
 // From the device-poll loop: reports the VMware absolute pointer queued
 // (see mouse.c).
 void mouse_poll(void);

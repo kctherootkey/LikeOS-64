@@ -115,10 +115,10 @@ struct input_id {
 #define INPUT_PROP_MAX 0x1f
 #define INPUT_PROP_CNT (INPUT_PROP_MAX + 1)
 
-// Absolute axes (EV_ABS).  The mouse reports ABS_X and ABS_Y where an
-// absolute pointing device drives it (VMware's); the other codes exist so a
-// driver can ask about them and be told "not supported" rather than having
-// the query rejected outright.
+// Absolute axes (EV_ABS): the absolute pointer (VMware's), multitouch
+// touchpads (ABS_MT_* per contact slot, ABS_X/ABS_Y for the oldest contact),
+// and every other code so a driver can ask about any axis and be told
+// whether the device has it.
 #define ABS_X 0x00
 #define ABS_Y 0x01
 #define ABS_Z 0x02
@@ -228,8 +228,8 @@ struct input_id {
 #define REP_MAX 0x01
 #define REP_CNT (REP_MAX+1)
 
-// Force feedback (EV_FF).  No device here produces it; as with the absolute
-// axes above, the codes exist so that asking is answered rather than rejected.
+// Force feedback (EV_FF).  No device here plays effects; the codes exist so
+// that asking is answered rather than rejected.
 #define FF_HAPTIC 0x4f
 #define FF_RUMBLE 0x50
 #define FF_PERIODIC 0x51
@@ -958,6 +958,98 @@ struct input_absinfo {
 	int32_t resolution; // units per mm (or per radian for rotations)
 };
 
+// Keymap entry for EVIOCGKEYCODE_V2 / EVIOCSKEYCODE_V2: look a key up by its
+// scancode (`scancode', `len' bytes of it) or by its index in the device's
+// table (INPUT_KEYMAP_BY_INDEX in `flags').
+#define INPUT_KEYMAP_BY_INDEX (1 << 0)
+struct input_keymap_entry {
+	uint8_t flags;
+	uint8_t len;
+	uint16_t index;
+	uint32_t keycode;
+	uint8_t scancode[32];
+};
+
+// Per-descriptor event mask, EVIOCGMASK / EVIOCSMASK: `type' 0 selects the
+// event types themselves, any other type that type's codes.  `codes_ptr' is
+// a user pointer to a bitmap of `codes_size' bytes.
+struct input_mask {
+	uint32_t type;
+	uint32_t codes_size;
+	uint64_t codes_ptr;
+};
+
+// Force-feedback effect description (EVIOCSFF).  The layout is part of the
+// ioctl encoding (its size is), so it is spelled out in full even though no
+// device here plays effects.
+struct ff_replay {
+	uint16_t length; // duration, ms
+	uint16_t delay; // before starting, ms
+};
+
+struct ff_trigger {
+	uint16_t button;
+	uint16_t interval; // ms between re-triggers
+};
+
+struct ff_envelope {
+	uint16_t attack_length;
+	uint16_t attack_level;
+	uint16_t fade_length;
+	uint16_t fade_level;
+};
+
+struct ff_constant_effect {
+	int16_t level;
+	struct ff_envelope envelope;
+};
+
+struct ff_ramp_effect {
+	int16_t start_level;
+	int16_t end_level;
+	struct ff_envelope envelope;
+};
+
+struct ff_condition_effect {
+	uint16_t right_saturation;
+	uint16_t left_saturation;
+	int16_t right_coeff;
+	int16_t left_coeff;
+	uint16_t deadband;
+	int16_t center;
+};
+
+struct ff_periodic_effect {
+	uint16_t waveform;
+	uint16_t period;
+	int16_t magnitude;
+	int16_t offset;
+	uint16_t phase;
+	struct ff_envelope envelope;
+	uint32_t custom_len;
+	int16_t *custom_data; // user pointer
+};
+
+struct ff_rumble_effect {
+	uint16_t strong_magnitude;
+	uint16_t weak_magnitude;
+};
+
+struct ff_effect {
+	uint16_t type;
+	int16_t id;
+	uint16_t direction;
+	struct ff_trigger trigger;
+	struct ff_replay replay;
+	union {
+		struct ff_constant_effect constant;
+		struct ff_ramp_effect ramp;
+		struct ff_periodic_effect periodic;
+		struct ff_condition_effect condition[2]; // one per axis
+		struct ff_rumble_effect rumble;
+	} u;
+};
+
 // ioctl encoding (standard dir/size/type/nr layout).  Local names are used
 // to avoid clashing with any host toolchain definitions.
 #define _INPUT_IOC_NRBITS 8
@@ -969,6 +1061,11 @@ struct input_absinfo {
 #define _INPUT_IOC_TYPESHIFT 8
 #define _INPUT_IOC_SIZESHIFT 16
 #define _INPUT_IOC_DIRSHIFT 30
+
+#define _INPUT_IOC_NRMASK ((1U << _INPUT_IOC_NRBITS) - 1)
+#define _INPUT_IOC_TYPEMASK ((1U << _INPUT_IOC_TYPEBITS) - 1)
+#define _INPUT_IOC_SIZEMASK ((1U << _INPUT_IOC_SIZEBITS) - 1)
+#define _INPUT_IOC_DIRMASK ((1U << _INPUT_IOC_DIRBITS) - 1)
 
 #define _INPUT_IOC_NONE 0U
 #define _INPUT_IOC_WRITE 1U
@@ -984,40 +1081,57 @@ struct input_absinfo {
 #define _INPUT_IOW(type, nr, argtype) \
 	_INPUT_IOC(_INPUT_IOC_WRITE, (type), (nr), sizeof(argtype))
 
-// evdev ioctls
+// evdev ioctls.  The variable-length ones (a `len' argument) copy at most
+// len bytes and return how many they copied.
 #define EVIOCGVERSION _INPUT_IOR('E', 0x01, int) // get driver version
 #define EVIOCGID _INPUT_IOR('E', 0x02, struct input_id) // get device ID
+#define EVIOCGREP _INPUT_IOR('E', 0x03, unsigned int[2]) // autorepeat delay/period
+#define EVIOCSREP _INPUT_IOW('E', 0x03, unsigned int[2]) // set autorepeat
+#define EVIOCGKEYCODE _INPUT_IOR('E', 0x04, unsigned int[2]) // keymap lookup
+#define EVIOCGKEYCODE_V2 _INPUT_IOR('E', 0x04, struct input_keymap_entry)
+#define EVIOCSKEYCODE _INPUT_IOW('E', 0x04, unsigned int[2]) // keymap change
+#define EVIOCSKEYCODE_V2 _INPUT_IOW('E', 0x04, struct input_keymap_entry)
 #define EVIOCGNAME(len) \
 	_INPUT_IOC(_INPUT_IOC_READ, 'E', 0x06, (len)) // get device name
-#define EVIOCGKEY(len) \
-	_INPUT_IOC(_INPUT_IOC_READ, 'E', 0x18, (len)) // get key state bitmap
-#define EVIOCGBIT(ev, len) \
-	_INPUT_IOC(_INPUT_IOC_READ, 'E', 0x20 + (ev), (len)) // get event bits
 #define EVIOCGPHYS(len) \
 	_INPUT_IOC(_INPUT_IOC_READ, 'E', 0x07, (len)) // physical location
 #define EVIOCGUNIQ(len) \
 	_INPUT_IOC(_INPUT_IOC_READ, 'E', 0x08, (len)) // unique identifier
 #define EVIOCGPROP(len) \
 	_INPUT_IOC(_INPUT_IOC_READ, 'E', 0x09, (len)) // device properties
+// Multitouch slot state: the buffer starts with the ABS_MT_* code to read
+// (in), followed by one value per slot (out).  Declare such a buffer with
+// INPUT_MT_REQUEST_LAYOUT(name, slots) below.
+#define EVIOCGMTSLOTS(len) \
+	_INPUT_IOC(_INPUT_IOC_READ, 'E', 0x0a, (len))
+#define EVIOCGKEY(len) \
+	_INPUT_IOC(_INPUT_IOC_READ, 'E', 0x18, (len)) // key state bitmap
 #define EVIOCGLED(len) \
 	_INPUT_IOC(_INPUT_IOC_READ, 'E', 0x19, (len)) // LED state bitmap
 #define EVIOCGSND(len) \
 	_INPUT_IOC(_INPUT_IOC_READ, 'E', 0x1a, (len)) // sound state bitmap
 #define EVIOCGSW(len) \
 	_INPUT_IOC(_INPUT_IOC_READ, 'E', 0x1b, (len)) // switch state bitmap
+#define EVIOCGBIT(ev, len) \
+	_INPUT_IOC(_INPUT_IOC_READ, 'E', 0x20 + (ev), (len)) // event bits
 #define EVIOCGABS(abs) \
 	_INPUT_IOR('E', 0x40 + (abs), struct input_absinfo) // axis parameters
-#define EVIOCSCLOCKID _INPUT_IOW('E', 0xa0, int) // select event timestamp clock
-#define EVIOCGRAB _INPUT_IOW('E', 0x90, int) // grab/release device
-
-// Not implemented by any driver here: the kernel answers EINVAL, which is what
-// a caller expects for a device that does not support them.  Declared because
-// libevdev probes all three during device setup, and a missing declaration is
-// a build failure rather than the runtime "not supported" it is asking for.
-#define EVIOCGREP _INPUT_IOR('E', 0x03, unsigned int[2]) // autorepeat settings
 #define EVIOCSABS(abs) \
 	_INPUT_IOW('E', 0xc0 + (abs), struct input_absinfo) // set axis params
-#define EVIOCGMTSLOTS(len) \
-	_INPUT_IOC(_INPUT_IOC_READ, 'E', 0x0a, (len)) // multitouch slot state
+#define EVIOCSFF _INPUT_IOW('E', 0x80, struct ff_effect) // upload effect
+#define EVIOCRMFF _INPUT_IOW('E', 0x81, int) // erase effect
+#define EVIOCGEFFECTS _INPUT_IOR('E', 0x84, int) // effects playable at once
+#define EVIOCGRAB _INPUT_IOW('E', 0x90, int) // grab/release device
+#define EVIOCREVOKE _INPUT_IOW('E', 0x91, int) // revoke this descriptor
+#define EVIOCGMASK _INPUT_IOR('E', 0x92, struct input_mask) // event mask
+#define EVIOCSMASK _INPUT_IOW('E', 0x93, struct input_mask) // set mask
+#define EVIOCSCLOCKID _INPUT_IOW('E', 0xa0, int) // event timestamp clock
+
+// A buffer for EVIOCGMTSLOTS: `code' and `values[num_slots]'.
+#define INPUT_MT_REQUEST_LAYOUT(name, num_slots) \
+	struct name {                            \
+		uint32_t code;                   \
+		int32_t values[num_slots];       \
+	}
 
 #endif // _KERNEL_UAPI_INPUT_H_

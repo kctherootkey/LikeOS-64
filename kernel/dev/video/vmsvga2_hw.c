@@ -254,10 +254,10 @@ void vmsvga2_hw_geometry(struct vmsvga2_hw_geometry *g)
 }
 
 /* Display ownership hand-over, the part of it that is this device's: the
- * generic side -- the console neither painting nor listening while a
- * master holds the screen, and its full redraw on release -- is done by
- * drm_master_set()/drm_master_drop() for every driver (fbdev_opened /
- * fbdev_closed), so it is not repeated here. */
+ * generic side -- the console not painting while a master holds the
+ * screen, and its full redraw on release -- is done by
+ * drm_master_set()/drm_master_drop() for every driver (the console's
+ * output gate, console_display_owned), so it is not repeated here. */
 static int g_hw_display_taken;
 
 void vmsvga2_hw_display_take(void)

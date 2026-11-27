@@ -139,7 +139,7 @@ void irq_matrix_free_system(struct irq_matrix *m, unsigned int bit)
 	if (WARN_ON_ONCE(!bm_test(m->system_map, bit)))
 		return;
 	/* An I/O APIC line routed to the same vector keeps it taken: the
-	 * line is never unrouted (its vector is fixed, 32 + GSI). */
+	 * line is never unrouted (a line keeps its vector, irq_gsi.c). */
 	if (bm_test(m->legacy_map, bit))
 		return;
 	bm_clear(m->system_map, bit);

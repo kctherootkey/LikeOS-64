@@ -63,7 +63,7 @@ struct keymap_state {
 	// Modes.
 	uint8_t kbdmode; // K_RAW .. K_OFF
 	uint8_t metamode; // K_METABIT / K_ESCPREFIX
-	uint8_t kdmode; // KD_TEXT / KD_GRAPHICS (recorded only)
+	uint8_t kdmode; // KD_TEXT / KD_GRAPHICS (console output and pointer off)
 	uint8_t ledflags; // K_SCROLLLOCK | K_NUMLOCK | K_CAPSLOCK
 	uint8_t default_ledflags;
 	int16_t led_override; // -1: LEDs show the lock flags; else LED_* bits

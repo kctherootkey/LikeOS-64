@@ -1524,7 +1524,7 @@ static void hda_setup_irq(struct hda_priv *p)
 		rc = irq_request_gsi(gsi, hda_irq, p, "hda", 1, 1);
 		if (rc == 0) {
 			c->irq_gsi = gsi;
-			c->irq_vector = 32 + gsi;
+			c->irq_vector = irq_gsi_vector(gsi);
 			p->irq_mode = 2;
 			p->irq_registered = 1;
 			return;

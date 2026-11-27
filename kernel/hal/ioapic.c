@@ -31,6 +31,7 @@
 // IOAPIC base pointer - initialized on first use via direct map
 static volatile uint32_t *ioapic_base = NULL;
 static int g_ioapic_present = 0;
+static uint32_t g_ioapic_max_redir; // highest redirection entry, from VER
 
 static inline volatile uint32_t *get_ioapic_base(void)
 {
@@ -53,7 +54,10 @@ static inline volatile uint32_t *get_ioapic_base(void)
 
 static inline void ioapic_write(uint8_t reg, uint32_t value)
 {
-	WARN_ON(reg > 0x3F); /* IOAPIC register index out of valid range */
+	/* Past the last redirection entry this IOAPIC has (VER bits 16-23;
+	 * 24 entries on older chipsets, up to 120 on current ones). */
+	WARN_ON(g_ioapic_present &&
+		reg > IOAPIC_REG_REDIR(g_ioapic_max_redir) + 1);
 	volatile uint32_t *base = get_ioapic_base();
 	base[0] = reg;
 	base[4] = value; // data register at base+0x10 (index 4 of 32-bit array)
@@ -74,6 +78,7 @@ int ioapic_detect(void)
 		kprintf("IOAPIC: not detected (ver=0x%08x)\n", ver);
 		return -1;
 	}
+	g_ioapic_max_redir = max_redir;
 	g_ioapic_present = 1;
 	kprintf("IOAPIC: detected (ver=0x%08x, max_redir=%u)\n", ver,
 		max_redir);
@@ -139,6 +144,8 @@ int ioapic_configure_legacy_irq(uint8_t gsi, uint8_t vector, uint8_t polarity,
 	// Program high then low (Intel recommendation: write high first then low)
 	ioapic_write(IOAPIC_REG_REDIR(gsi) + 1, high);
 	ioapic_write(IOAPIC_REG_REDIR(gsi), low);
+	/* One vector per line: later users of the GSI share this one. */
+	irq_note_gsi_route(gsi, vector);
 	kprintf("IOAPIC: GSI %u -> vector 0x%02x (polarity=%s, trigger=%s, %s)\n",
 		gsi, vector, (polarity == IOAPIC_POLARITY_LOW) ? "low" : "high",
 		(trigger_mode == IOAPIC_TRIGGER_LEVEL) ? "level" : "edge",

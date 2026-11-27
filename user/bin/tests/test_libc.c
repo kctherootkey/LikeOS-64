@@ -67,6 +67,14 @@
 #include <sys/audio.h>
 #include <sys/soundcard.h>
 #include <sys/input.h>
+#include <sys/kd.h>
+/* The same interface at the include path input libraries use. */
+#include <linux/input.h>
+#include <linux/input-event-codes.h>
+#include <linux/i2c.h>
+#include <linux/i2c-dev.h>
+/* The libudev API (user/lib/libudev). */
+#include <libudev.h>
 /* Block devices: the BLK* requests (<sys/mount.h>), the ATA disk requests,
  * the SCSI pass-through and the SCSI command set -- the storage section. */
 #include <sys/mount.h>
@@ -2260,7 +2268,49 @@ static void test_drm_i915(void)
 
 // ============================================================================
 // Framebuffer device: geometry ioctls + user mmap of the framebuffer
+//
+// Opening /dev/fb0 does not stop the console from painting: a program that
+// writes pixels and reads them back takes the display first, as a display
+// server does -- KD_GRAPHICS on the console -- and puts KD_TEXT back after.
+// That needs root (the console is 0620 root:tty); without it the readback is
+// skipped.  Under a running display server (the console is already in
+// KD_GRAPHICS) the modes are left alone: the console paints nothing anyway,
+// and putting KD_TEXT back would have it paint over the session.
 // ============================================================================
+
+/* 1 when the console paints nothing until fb_display_give_back(*tty): the
+ * console was put in KD_GRAPHICS through *tty, or already was (*tty = -1).
+ * 0 when the display could not be taken. */
+static int fb_display_take(int *tty)
+{
+	int fd, mode = -1;
+
+	*tty = -1;
+	fd = open("/dev/tty0", O_RDWR | O_NOCTTY | O_CLOEXEC);
+	if (fd < 0)
+		return 0;
+	if (ioctl(fd, KDGETMODE, &mode) == 0 && mode == KD_GRAPHICS) {
+		close(fd);
+		return 1;
+	}
+	if (ioctl(fd, KDSETMODE, KD_GRAPHICS) != 0) {
+		close(fd);
+		return 0;
+	}
+	*tty = fd;
+	return 1;
+}
+
+/* KD_TEXT again (the console repaints itself); the kernel would also put it
+ * back when the descriptor closes. */
+static void fb_display_give_back(int tty)
+{
+	if (tty < 0)
+		return;
+	(void)ioctl(tty, KDSETMODE, KD_TEXT);
+	close(tty);
+}
+
 static void test_fbdev(void)
 {
 	printf("\n--- Framebuffer Device Tests (/dev/fb0) ---\n");
@@ -2298,11 +2348,23 @@ static void test_fbdev(void)
 	test_result("mmap(/dev/fb0) succeeds", fb != MAP_FAILED);
 	if (fb != MAP_FAILED) {
 		volatile unsigned int *px = (volatile unsigned int *)fb;
-		unsigned int saved = px[0];
-		px[0] = 0x00FF00FF;
-		test_result("framebuffer mmap write/readback",
-			    px[0] == 0x00FF00FF);
-		px[0] = saved;
+		int tty;
+
+		/* The console must not repaint the pixel between the write
+		 * and the read: the display is taken for that. */
+		if (fb_display_take(&tty)) {
+			unsigned int saved = px[0];
+			int ok;
+
+			px[0] = 0x00FF00FF;
+			ok = px[0] == 0x00FF00FF;
+			px[0] = saved;
+			fb_display_give_back(tty);
+			test_result("framebuffer mmap write/readback", ok);
+		} else {
+			printf("  (console KD_GRAPHICS not permitted: "
+			       "framebuffer readback skipped)\n");
+		}
 		test_result("munmap(framebuffer)", munmap(fb, maplen) == 0);
 	}
 	close(fd);
@@ -4162,9 +4224,1092 @@ static void test_audio(void)
 	au_test_permissions();
 }
 
+
+// ---- event devices: the generic node table and the full request set ----
+
+/* The units listed in /dev/input, as a bitmap (bit N: eventN); the count
+ * of entries that are not eventN names goes to *other. */
+static unsigned long long evdev_listed_units(int *count, int *other)
+{
+	unsigned long long units = 0;
+	DIR *d = opendir("/dev/input");
+	struct dirent *de;
+
+	*count = 0;
+	*other = 0;
+	if (!d)
+		return 0;
+	while ((de = readdir(d)) != NULL) {
+		char *end;
+		long n;
+
+		if (strncmp(de->d_name, "event", 5) != 0) {
+			if (strcmp(de->d_name, ".") && strcmp(de->d_name, ".."))
+				(*other)++;
+			continue;
+		}
+		n = strtol(de->d_name + 5, &end, 10);
+		if (*end || n < 0 || n > 63 || end == de->d_name + 5) {
+			(*other)++;
+			continue;
+		}
+		if (units & (1ULL << n))
+			(*other)++; /* listed twice */
+		units |= 1ULL << n;
+		(*count)++;
+	}
+	closedir(d);
+	return units;
+}
+
+static void evdev_test_nodes(void)
+{
+	int count = 0, other = 0, all_open = 1, all_stat = 1, missing = -1;
+	unsigned long long units = evdev_listed_units(&count, &other);
+	char path[64];
+	struct stat st;
+
+	test_result("/dev/input lists event0 and event1",
+		    (units & 3ULL) == 3ULL);
+	test_result("/dev/input lists only distinct eventN nodes",
+		    other == 0 && count >= 2 && count <= 32);
+	for (int n = 0; n < 64; n++) {
+		if (!(units & (1ULL << n))) {
+			if (missing < 0)
+				missing = n;
+			continue;
+		}
+		snprintf(path, sizeof(path), "/dev/input/event%d", n);
+		int fd = open(path, O_RDONLY | O_NONBLOCK);
+		if (fd < 0)
+			all_open = 0;
+		else
+			close(fd);
+		if (stat(path, &st) != 0 || !S_ISCHR(st.st_mode) ||
+		    major(st.st_rdev) != 13 ||
+		    minor(st.st_rdev) != (unsigned)(64 + n))
+			all_stat = 0;
+	}
+	test_result("every listed event node opens", all_open);
+	test_result("every listed event node is char 13:64+N", all_stat);
+
+	/* A node that is not listed does not exist, by any name. */
+	snprintf(path, sizeof(path), "/dev/input/event%d", missing);
+	errno = 0;
+	test_result("open of an unlisted eventN -> ENOENT",
+		    open(path, O_RDONLY) < 0 && errno == ENOENT);
+	errno = 0;
+	test_result("stat of an unlisted eventN -> ENOENT",
+		    stat(path, &st) != 0 && errno == ENOENT);
+	errno = 0;
+	test_result("open(/dev/input/event99) -> ENOENT",
+		    open("/dev/input/event99", O_RDONLY) < 0 &&
+			    errno == ENOENT);
+	errno = 0;
+	test_result("open(/dev/input/eventX) -> ENOENT",
+		    open("/dev/input/eventX", O_RDONLY) < 0 && errno == ENOENT);
+
+	int fd = open("/dev/input/event1", O_RDONLY);
+	if (fd >= 0) {
+		test_result("fstat(event1) is char 13:65",
+			    fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) &&
+				    major(st.st_rdev) == 13 &&
+				    minor(st.st_rdev) == 65);
+		close(fd);
+	}
+}
+
+static void evdev_test_requests(void)
+{
+	int fd = open("/dev/input/event0", O_RDWR | O_NONBLOCK);
+	unsigned char big[200];
+	int v;
+
+	test_result("open(event0, O_RDWR)", fd >= 0);
+	if (fd < 0)
+		return;
+	/* EVIOCGBIT copies whole words of the bitmap and says how many
+	 * bytes; a larger buffer's tail is left alone. */
+	memset(big, 0x7e, sizeof(big));
+	test_result("EVIOCGBIT(0) is one 8-byte word",
+		    ioctl(fd, EVIOCGBIT(0, sizeof(big)), big) == 8 &&
+			    big[8] == 0x7e);
+	memset(big, 0x7e, sizeof(big));
+	test_result("EVIOCGBIT(EV_KEY) is 96 bytes, tail untouched",
+		    ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(big)), big) == 96 &&
+			    big[96] == 0x7e && big[199] == 0x7e);
+	memset(big, 0x7e, sizeof(big));
+	test_result("EVIOCGBIT cut to the buffer length",
+		    ioctl(fd, EVIOCGBIT(EV_KEY, 5), big) == 5 &&
+			    big[5] == 0x7e);
+	test_result("EVIOCGBIT(EV_KEY, 0) copies nothing",
+		    ioctl(fd, EVIOCGBIT(EV_KEY, 0), big) == 0);
+	memset(big, 0xff, sizeof(big));
+	test_result("EVIOCGBIT(EV_MSC) on the keyboard: empty",
+		    ioctl(fd, EVIOCGBIT(EV_MSC, sizeof(big)), big) == 8 &&
+			    big[0] == 0);
+	memset(big, 0xff, sizeof(big));
+	test_result("EVIOCGBIT(EV_SW) on the keyboard: empty",
+		    ioctl(fd, EVIOCGBIT(EV_SW, sizeof(big)), big) == 8 &&
+			    big[0] == 0 && big[2] == 0);
+	test_result("EVIOCGBIT(EV_FF) is 16 bytes",
+		    ioctl(fd, EVIOCGBIT(EV_FF, sizeof(big)), big) == 16);
+	errno = 0;
+	test_result("EVIOCGBIT(EV_REP) -> EINVAL",
+		    ioctl(fd, EVIOCGBIT(EV_REP, 8), big) == -1 &&
+			    errno == EINVAL);
+	errno = 0;
+	test_result("EVIOCGBIT to a bad pointer -> EFAULT",
+		    ioctl(fd, EVIOCGBIT(EV_KEY, 96), (void *)8) == -1 &&
+			    errno == EFAULT);
+	errno = 0;
+	test_result("EVIOCGNAME to a bad pointer -> EFAULT",
+		    ioctl(fd, EVIOCGNAME(32), (void *)8) == -1 &&
+			    errno == EFAULT);
+	memset(big, 0x7e, sizeof(big));
+	test_result("EVIOCGNAME cut to 4 bytes",
+		    ioctl(fd, EVIOCGNAME(4), big) == 4 &&
+			    memcmp(big, "Like", 4) == 0 && big[4] == 0x7e);
+
+	/* Multitouch slots: the keyboard has none. */
+	{
+		INPUT_MT_REQUEST_LAYOUT(mtreq, 4) r;
+
+		memset(&r, 0, sizeof(r));
+		r.code = ABS_MT_POSITION_X;
+		errno = 0;
+		test_result("EVIOCGMTSLOTS on a device without slots -> EINVAL",
+			    ioctl(fd, EVIOCGMTSLOTS(sizeof(r)), &r) == -1 &&
+				    errno == EINVAL);
+		errno = 0;
+		test_result("EVIOCGMTSLOTS shorter than its code -> EINVAL",
+			    ioctl(fd, EVIOCGMTSLOTS(2), &r) == -1 &&
+				    errno == EINVAL);
+		errno = 0;
+		test_result("EVIOCGMTSLOTS from a bad pointer -> EFAULT",
+			    ioctl(fd, EVIOCGMTSLOTS(sizeof(r)), (void *)8) ==
+					    -1 &&
+				    errno == EFAULT);
+	}
+
+	/* What the keyboard does not do. */
+	{
+		unsigned int rep[2];
+		int effects = -1;
+		unsigned int kc[2] = { 0x1e, 0 };
+
+		errno = 0;
+		test_result("EVIOCGREP without autorepeat -> ENOSYS",
+			    ioctl(fd, EVIOCGREP, rep) == -1 && errno == ENOSYS);
+		test_result("EVIOCGEFFECTS -> 0",
+			    ioctl(fd, EVIOCGEFFECTS, &effects) == 0 &&
+				    effects == 0);
+		errno = 0;
+		test_result("EVIOCGKEYCODE without a keymap -> EINVAL",
+			    ioctl(fd, EVIOCGKEYCODE, kc) == -1 &&
+				    errno == EINVAL);
+		errno = 0;
+		test_result("unknown 'E' request -> EINVAL",
+			    ioctl(fd, _INPUT_IOC(_INPUT_IOC_READ, 'E', 0x0f, 4),
+				  &v) == -1 &&
+				    errno == EINVAL);
+		errno = 0;
+		test_result("EVIOCREVOKE with an argument -> EINVAL",
+			    ioctl(fd, EVIOCREVOKE, (void *)1) == -1 &&
+				    errno == EINVAL);
+	}
+
+	/* Clocks: CLOCK_BOOTTIME is accepted as well. */
+	v = CLOCK_BOOTTIME;
+	test_result("EVIOCSCLOCKID accepts CLOCK_BOOTTIME",
+		    ioctl(fd, EVIOCSCLOCKID, &v) == 0);
+	v = CLOCK_REALTIME;
+	ioctl(fd, EVIOCSCLOCKID, &v);
+
+	/* Event masks: set, read back, unknown types. */
+	{
+		unsigned long leds = 1UL << LED_CAPSL, got[2] = { 7, 7 };
+		unsigned long keys = 0;
+		struct input_mask m;
+
+		m.type = EV_LED;
+		m.codes_size = sizeof(leds);
+		m.codes_ptr = (uint64_t)(uintptr_t)&leds;
+		test_result("EVIOCSMASK(EV_LED)", ioctl(fd, EVIOCSMASK, &m) == 0);
+		m.codes_size = sizeof(got);
+		m.codes_ptr = (uint64_t)(uintptr_t)got;
+		test_result("EVIOCGMASK reads it back, tail zeroed",
+			    ioctl(fd, EVIOCGMASK, &m) == 0 &&
+				    got[0] == (1UL << LED_CAPSL) && got[1] == 0);
+		m.type = EV_KEY;
+		m.codes_size = sizeof(keys);
+		m.codes_ptr = (uint64_t)(uintptr_t)&keys;
+		test_result("EVIOCGMASK of an unmasked type: everything",
+			    ioctl(fd, EVIOCGMASK, &m) == 0 && keys == ~0UL);
+		m.type = EV_REP;
+		test_result("EVIOCSMASK of a type without codes: accepted, ignored",
+			    ioctl(fd, EVIOCSMASK, &m) == 0);
+		m.type = EV_KEY;
+		m.codes_size = 4;
+		errno = 0;
+		test_result("EVIOCSMASK of a part of a word -> EINVAL",
+			    ioctl(fd, EVIOCSMASK, &m) == -1 && errno == EINVAL);
+		errno = 0;
+		test_result("EVIOCGMASK from a bad pointer -> EFAULT",
+			    ioctl(fd, EVIOCGMASK, (void *)8) == -1 &&
+				    errno == EFAULT);
+	}
+
+	/* Reads and writes: whole records only, user pointers checked. */
+	{
+		struct input_event ev[2];
+		struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+
+		test_result("zero-length read returns 0",
+			    read(fd, ev, 0) == 0 ||
+				    (errno == EAGAIN));
+		errno = 0;
+		test_result("write of a partial record -> EINVAL",
+			    write(fd, ev, sizeof(ev[0]) - 1) == -1 &&
+				    errno == EINVAL);
+		errno = 0;
+		test_result("write from a bad pointer -> EFAULT",
+			    write(fd, (void *)8, sizeof(ev[0])) == -1 &&
+				    errno == EFAULT);
+		test_result("poll: an event node is writable",
+			    poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLOUT));
+	}
+	close(fd);
+}
+
+/* EVIOCREVOKE: this descriptor is dead from now on, others are not. */
+static void console_test_kd_modes(void);
+
+static void evdev_test_revoke(void)
+{
+	int a = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
+	int b = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
+	struct input_event ev;
+	struct pollfd pfd;
+	int v = 0;
+
+	test_result("two descriptors on event1", a >= 0 && b >= 0);
+	if (a < 0 || b < 0) {
+		if (a >= 0)
+			close(a);
+		if (b >= 0)
+			close(b);
+		return;
+	}
+	test_result("EVIOCREVOKE", ioctl(a, EVIOCREVOKE, NULL) == 0);
+	errno = 0;
+	test_result("revoked: read -> ENODEV",
+		    read(a, &ev, sizeof(ev)) == -1 && errno == ENODEV);
+	errno = 0;
+	test_result("revoked: ioctl -> ENODEV",
+		    ioctl(a, EVIOCGVERSION, &v) == -1 && errno == ENODEV);
+	pfd.fd = a;
+	pfd.events = POLLIN;
+	pfd.revents = 0;
+	test_result("revoked: poll reports POLLHUP|POLLERR",
+		    poll(&pfd, 1, 0) == 1 &&
+			    (pfd.revents & (POLLHUP | POLLERR)) ==
+				    (POLLHUP | POLLERR));
+	test_result("the other descriptor still works",
+		    ioctl(b, EVIOCGVERSION, &v) == 0 && v == EV_VERSION);
+	close(a);
+	close(b);
+}
+
+/* Every descriptor has its own queue: an LED change written to the
+ * keyboard reaches both readers.  The scroll-lock LED is toggled and put
+ * back; a client's LEDs light up only while the console does not have the
+ * keyboard (a display server is running), and then only for a moment.
+ * Skipped while somebody holds the keyboard grab, because then only the
+ * grabber hears the device. */
+static void evdev_test_two_readers(void)
+{
+	int w = open("/dev/input/event0", O_RDWR | O_NONBLOCK);
+	int r1 = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
+	int r2 = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
+	unsigned long leds = 0;
+	struct input_event out[2], in[64];
+	int lit, seen1 = 0, seen2 = 0;
+	ssize_t n;
+
+	if (w < 0 || r1 < 0 || r2 < 0) {
+		test_result("three descriptors on event0", 0);
+		goto done;
+	}
+	if (ioctl(r1, EVIOCGRAB, (void *)1) != 0) {
+		printf("  (event0 is grabbed by another program: two-reader "
+		       "check skipped)\n");
+		goto done;
+	}
+	ioctl(r1, EVIOCGRAB, (void *)0);
+	/* Drain what is queued, then make the change. */
+	while (read(r1, in, sizeof(in)) > 0)
+		;
+	while (read(r2, in, sizeof(in)) > 0)
+		;
+	ioctl(w, EVIOCGLED(sizeof(leds)), &leds);
+	lit = !(leds & (1UL << LED_SCROLLL));
+	memset(out, 0, sizeof(out));
+	out[0].type = EV_LED;
+	out[0].code = LED_SCROLLL;
+	out[0].value = lit;
+	out[1].type = EV_SYN;
+	out[1].code = SYN_REPORT;
+	test_result("LED write accepted",
+		    write(w, out, sizeof(out)) == (ssize_t)sizeof(out));
+	while ((n = read(r1, in, sizeof(in))) > 0)
+		for (int i = 0; i < n / (ssize_t)sizeof(in[0]); i++)
+			if (in[i].type == EV_LED && in[i].code == LED_SCROLLL &&
+			    in[i].value == lit)
+				seen1 = 1;
+	while ((n = read(r2, in, sizeof(in))) > 0)
+		for (int i = 0; i < n / (ssize_t)sizeof(in[0]); i++)
+			if (in[i].type == EV_LED && in[i].code == LED_SCROLLL &&
+			    in[i].value == lit)
+				seen2 = 1;
+	test_result("both readers receive the LED change", seen1 && seen2);
+	ioctl(w, EVIOCGLED(sizeof(leds)), &leds);
+	test_result("EVIOCGLED shows the change",
+		    !!(leds & (1UL << LED_SCROLLL)) == lit);
+	/* Put it back. */
+	out[0].value = !lit;
+	write(w, out, sizeof(out));
+done:
+	if (w >= 0)
+		close(w);
+	if (r1 >= 0)
+		close(r1);
+	if (r2 >= 0)
+		close(r2);
+}
+
+/* "B: NAME=w_hi ... w_0" of a bitmap read with EVIOCGBIT. */
+static void evdev_format_bitmap(char *out, size_t cap, const unsigned long *w,
+				int nwords)
+{
+	int i = nwords - 1;
+	size_t pos = 0;
+
+	while (i > 0 && !w[i])
+		i--;
+	out[0] = 0;
+	for (; i >= 0 && pos < cap; i--)
+		pos += (size_t)snprintf(out + pos, cap - pos, "%lx%s", w[i],
+					i > 0 ? " " : "");
+}
+
+/* /proc/bus/input/devices: one block per event node, in the established
+ * text format, agreeing with what the nodes report. */
+static void evdev_test_proc_devices(void)
+{
+	static char text[65536];
+	int fd = open("/proc/bus/input/devices", O_RDONLY);
+	ssize_t len = 0, n;
+	int count = 0, other = 0, blocks = 0, well_formed = 1;
+	unsigned long long units = evdev_listed_units(&count, &other);
+	unsigned long long seen = 0;
+	char *p;
+
+	test_result("open(/proc/bus/input/devices)", fd >= 0);
+	if (fd < 0)
+		return;
+	while (len < (ssize_t)sizeof(text) - 1 &&
+	       (n = read(fd, text + len, sizeof(text) - 1 - (size_t)len)) > 0)
+		len += n;
+	close(fd);
+	text[len] = 0;
+	{
+		static const char head[] =
+			"I: Bus=0011 Vendor=0001 Product=0001 Version=0100\n"
+			"N: Name=\"LikeOS Keyboard\"\n"
+			"P: Phys=isa0060/serio0/input0\n";
+
+		test_result("/proc/bus/input/devices starts with the keyboard",
+			    strncmp(text, head, strlen(head)) == 0);
+	}
+	for (p = text; *p;) {
+		char *end = strstr(p, "\n\n");
+		char *h;
+		int unit;
+
+		if (!end)
+			break;
+		*end = 0;
+		blocks++;
+		if (strncmp(p, "I: Bus=", 7) != 0 || !strstr(p, "\nN: Name=\"") ||
+		    !strstr(p, "\nP: Phys=") || !strstr(p, "\nS: Sysfs=") ||
+		    !strstr(p, "\nU: Uniq=") || !strstr(p, "\nB: PROP=") ||
+		    !strstr(p, "\nB: EV="))
+			well_formed = 0;
+		h = strstr(p, "\nH: Handlers=");
+		if (!h || !(h = strstr(h, "event")) ||
+		    sscanf(h, "event%d ", &unit) != 1 || unit < 0 || unit > 63)
+			well_formed = 0;
+		else
+			seen |= 1ULL << unit;
+		p = end + 2;
+	}
+	test_result("every block is well formed", well_formed && blocks > 0);
+	test_result("one block per event node", blocks == count && seen == units);
+
+	/* The keyboard's KEY line is its EVIOCGBIT(EV_KEY) bitmap. */
+	{
+		unsigned long keys[12];
+		char want[400], line[420];
+		int kfd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
+
+		memset(keys, 0, sizeof(keys));
+		if (kfd >= 0) {
+			ioctl(kfd, EVIOCGBIT(EV_KEY, sizeof(keys)), keys);
+			close(kfd);
+		}
+		evdev_format_bitmap(want, sizeof(want), keys, 12);
+		snprintf(line, sizeof(line), "B: KEY=%s\n", want);
+		test_result("keyboard KEY line matches EVIOCGBIT",
+			    strstr(text, line) != NULL);
+	}
+}
+
+/* A touchpad, where there is one: properties, slots, slot state. */
+static void evdev_test_touchpads(void)
+{
+	int found = 0;
+
+	for (int n = 2; n < 32; n++) {
+		char path[64], name[128] = "";
+		unsigned long prop = 0, ev = 0, abs = 0;
+		struct input_absinfo slot;
+		int fd;
+
+		snprintf(path, sizeof(path), "/dev/input/event%d", n);
+		fd = open(path, O_RDONLY | O_NONBLOCK);
+		if (fd < 0)
+			continue;
+		ioctl(fd, EVIOCGNAME(sizeof(name)), name);
+		ioctl(fd, EVIOCGPROP(sizeof(prop)), &prop);
+		ioctl(fd, EVIOCGBIT(0, sizeof(ev)), &ev);
+		ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abs)), &abs);
+		if (!(prop & (1UL << INPUT_PROP_POINTER)) ||
+		    !(abs & (1UL << ABS_MT_SLOT))) {
+			close(fd);
+			continue;
+		}
+		found++;
+		printf("  (touchpad event%d: %s)\n", n, name);
+		test_result("touchpad: EV_SYN, EV_KEY and EV_ABS",
+			    (ev & 0xb) == 0xb);
+		test_result("touchpad: has the multitouch position axes",
+			    (abs & (1UL << ABS_MT_POSITION_X)) &&
+				    (abs & (1UL << ABS_MT_POSITION_Y)) &&
+				    (abs & (1UL << ABS_MT_TRACKING_ID)));
+		test_result("touchpad: slot count from EVIOCGABS(ABS_MT_SLOT)",
+			    ioctl(fd, EVIOCGABS(ABS_MT_SLOT), &slot) == 0 &&
+				    slot.minimum == 0 && slot.maximum >= 1 &&
+				    slot.maximum < 64);
+		{
+			INPUT_MT_REQUEST_LAYOUT(mtreq, 64) r;
+			int ok = 1;
+
+			r.code = ABS_MT_TRACKING_ID;
+			test_result("touchpad: EVIOCGMTSLOTS(ABS_MT_TRACKING_ID)",
+				    ioctl(fd, EVIOCGMTSLOTS(sizeof(r)), &r) == 0);
+			for (int i = 0; i <= slot.maximum && i < 64; i++)
+				if (r.values[i] < -1)
+					ok = 0;
+			test_result("touchpad: tracking ids are -1 or an id", ok);
+			errno = 0;
+			r.code = ABS_MT_SLOT;
+			test_result("touchpad: EVIOCGMTSLOTS(ABS_MT_SLOT) -> EINVAL",
+				    ioctl(fd, EVIOCGMTSLOTS(sizeof(r)), &r) ==
+						    -1 &&
+					    errno == EINVAL);
+		}
+		close(fd);
+	}
+	if (!found)
+		printf("  (no touchpad on this machine: touchpad checks skipped)\n");
+}
+
+/* An I2C-HID touchpad, where there is one: its /proc/bus/input/devices
+ * block (bus 0018, a clickpad: PROP has POINTER and BUTTONPAD) names an
+ * event node that has the multitouch slots, finger tools and slot state a
+ * precision touchpad gives, and a device path below its I2C client. */
+static void evdev_test_i2c_touchpad(void)
+{
+	static char text[65536];
+	int fd = open("/proc/bus/input/devices", O_RDONLY);
+	ssize_t len = 0, n;
+	int found = 0;
+	char *p;
+
+	if (fd < 0) {
+		printf("  (no /proc/bus/input/devices: I2C touchpad checks skipped)\n");
+		return;
+	}
+	while (len < (ssize_t)sizeof(text) - 1 &&
+	       (n = read(fd, text + len, sizeof(text) - 1 - (size_t)len)) > 0)
+		len += n;
+	close(fd);
+	text[len] = 0;
+	for (p = text; *p;) {
+		char *end = strstr(p, "\n\n");
+		char *h, *prop, *sysfs, path[64];
+		unsigned long pv = 0, keys[12], abs = 0, ev = 0;
+		struct input_absinfo slot;
+		int unit = -1, efd;
+
+		if (!end)
+			break;
+		*end = 0;
+		prop = strstr(p, "\nB: PROP=");
+		h = strstr(p, "\nH: Handlers=");
+		sysfs = strstr(p, "\nS: Sysfs=");
+		if (strncmp(p, "I: Bus=0018 ", 12) != 0 || !prop ||
+		    sscanf(prop, "\nB: PROP=%lx", &pv) != 1 ||
+		    (pv & ((1UL << INPUT_PROP_POINTER) |
+			   (1UL << INPUT_PROP_BUTTONPAD))) !=
+			    ((1UL << INPUT_PROP_POINTER) |
+			     (1UL << INPUT_PROP_BUTTONPAD)) ||
+		    !h || !(h = strstr(h, "event")) ||
+		    sscanf(h, "event%d", &unit) != 1) {
+			p = end + 2;
+			continue;
+		}
+		found++;
+		printf("  (I2C touchpad on event%d)\n", unit);
+		test_result("I2C touchpad: device path below its I2C client",
+			    sysfs && strstr(sysfs, "/i2c-") &&
+				    strstr(sysfs, "/0018:"));
+		snprintf(path, sizeof(path), "/dev/input/event%d", unit);
+		efd = open(path, O_RDONLY | O_NONBLOCK);
+		test_result("I2C touchpad: its event node opens", efd >= 0);
+		if (efd < 0) {
+			p = end + 2;
+			continue;
+		}
+		memset(keys, 0, sizeof(keys));
+		ioctl(efd, EVIOCGBIT(0, sizeof(ev)), &ev);
+		ioctl(efd, EVIOCGBIT(EV_ABS, sizeof(abs)), &abs);
+		ioctl(efd, EVIOCGBIT(EV_KEY, sizeof(keys)), keys);
+		test_result("I2C touchpad: ABS_MT_SLOT and ABS_MT_TRACKING_ID",
+			    (abs & (1UL << ABS_MT_SLOT)) &&
+				    (abs & (1UL << ABS_MT_TRACKING_ID)));
+		test_result("I2C touchpad: BTN_TOOL_FINGER and BTN_LEFT",
+			    (keys[BTN_TOOL_FINGER / 64] >>
+			     (BTN_TOOL_FINGER % 64)) & 1 &&
+				    (keys[BTN_LEFT / 64] >> (BTN_LEFT % 64)) &
+					    1);
+		test_result("I2C touchpad: MSC_TIMESTAMP events",
+			    (ev & (1UL << EV_MSC)) != 0);
+		{
+			INPUT_MT_REQUEST_LAYOUT(mtreq, 64) r;
+
+			test_result("I2C touchpad: EVIOCGABS(ABS_MT_SLOT)",
+				    ioctl(efd, EVIOCGABS(ABS_MT_SLOT), &slot) ==
+						    0 &&
+					    slot.maximum >= 1);
+			r.code = ABS_MT_TRACKING_ID;
+			test_result("I2C touchpad: EVIOCGMTSLOTS works",
+				    ioctl(efd, EVIOCGMTSLOTS(sizeof(r)), &r) ==
+					    0);
+		}
+		close(efd);
+		p = end + 2;
+	}
+	if (!found)
+		printf("  (no I2C touchpad on this machine: I2C touchpad checks skipped)\n");
+}
+
+// ============================================================================
+// I2C bus devices (/dev/i2c-N): the nodes, adapter functionality, and the
+// argument checks of the ioctls.  Nothing here puts a byte on a bus (every
+// request is refused before a transfer would start), so the touchpad on the
+// bus is never disturbed.  Machines and VMs without an I2C adapter skip it.
+// ============================================================================
+static int i2c_dev_is_designware(int nr)
+{
+	char line[256], want[16];
+	int found = 0;
+	FILE *f = fopen("/proc/bus/i2c", "r");
+
+	if (!f)
+		return 0;
+	snprintf(want, sizeof(want), "i2c-%d\t", nr);
+	while (fgets(line, sizeof(line), f))
+		if (!strncmp(line, want, strlen(want)) &&
+		    (strstr(line, "DesignWare") || strstr(line, "designware")))
+			found = 1;
+	fclose(f);
+	return found;
+}
+
+static void test_i2c_dev_one(int nr)
+{
+	char path[32];
+	struct stat st;
+	unsigned long funcs = 0;
+	struct i2c_rdwr_ioctl_data rd;
+	struct i2c_smbus_ioctl_data sm;
+	union i2c_smbus_data data;
+	struct i2c_msg msgs[2];
+	unsigned char buf[64];
+	int fd, dw = i2c_dev_is_designware(nr);
+
+	snprintf(path, sizeof(path), "/dev/i2c-%d", nr);
+	printf("  (%s%s)\n", path, dw ? ": DesignWare" : "");
+	test_result("i2c: node is a character device, major 89, minor = bus",
+		    stat(path, &st) == 0 && S_ISCHR(st.st_mode) &&
+			    major(st.st_rdev) == 89 &&
+			    minor(st.st_rdev) == (unsigned int)nr);
+	test_result("i2c: node is 0600 root",
+		    (st.st_mode & 0777) == 0600 && st.st_uid == 0);
+	fd = open(path, O_RDWR);
+	test_result("i2c: open as root", fd >= 0);
+	if (fd < 0)
+		return;
+
+	test_result("i2c: I2C_FUNCS reports plain I2C",
+		    ioctl(fd, I2C_FUNCS, &funcs) == 0 &&
+			    (funcs & I2C_FUNC_I2C));
+	if (dw)
+		test_result("i2c: DesignWare: 10-bit, SMBus block, no quick",
+			    (funcs & I2C_FUNC_10BIT_ADDR) &&
+				    (funcs & I2C_FUNC_SMBUS_BLOCK_DATA) &&
+				    (funcs & I2C_FUNC_SMBUS_I2C_BLOCK) &&
+				    !(funcs & I2C_FUNC_SMBUS_QUICK));
+	errno = 0;
+	test_result("i2c: I2C_FUNCS to a bad pointer -> EFAULT",
+		    ioctl(fd, I2C_FUNCS, (void *)8) == -1 && errno == EFAULT);
+
+	/* addresses */
+	errno = 0;
+	test_result("i2c: I2C_SLAVE 0x80 (7-bit) -> EINVAL",
+		    ioctl(fd, I2C_SLAVE, 0x80) == -1 && errno == EINVAL);
+	errno = 0;
+	test_result("i2c: I2C_SLAVE_FORCE 0x3ff without I2C_TENBIT -> EINVAL",
+		    ioctl(fd, I2C_SLAVE_FORCE, 0x3ff) == -1 &&
+			    errno == EINVAL);
+	test_result("i2c: I2C_TENBIT on, 0x3ff accepted, off again",
+		    ioctl(fd, I2C_TENBIT, 1) == 0 &&
+			    ioctl(fd, I2C_SLAVE_FORCE, 0x3ff) == 0 &&
+			    ioctl(fd, I2C_TENBIT, 0) == 0);
+	errno = 0;
+	test_result("i2c: I2C_SLAVE 0x400 -> EINVAL",
+		    ioctl(fd, I2C_SLAVE, 0x400) == -1 && errno == EINVAL);
+	test_result("i2c: I2C_SLAVE_FORCE 0x50", ioctl(fd, I2C_SLAVE_FORCE,
+							0x50) == 0);
+
+	/* I2C_RDWR argument checks */
+	memset(msgs, 0, sizeof(msgs));
+	rd.msgs = msgs;
+	rd.nmsgs = 0;
+	errno = 0;
+	test_result("i2c: I2C_RDWR with no messages -> EINVAL",
+		    ioctl(fd, I2C_RDWR, &rd) == -1 && errno == EINVAL);
+	rd.nmsgs = I2C_RDWR_IOCTL_MAX_MSGS + 1;
+	errno = 0;
+	test_result("i2c: I2C_RDWR with 43 messages -> EINVAL",
+		    ioctl(fd, I2C_RDWR, &rd) == -1 && errno == EINVAL);
+	rd.msgs = NULL;
+	rd.nmsgs = 1;
+	errno = 0;
+	test_result("i2c: I2C_RDWR with a NULL message array -> EINVAL",
+		    ioctl(fd, I2C_RDWR, &rd) == -1 && errno == EINVAL);
+	errno = 0;
+	test_result("i2c: I2C_RDWR argument at a bad pointer -> EFAULT",
+		    ioctl(fd, I2C_RDWR, (void *)8) == -1 && errno == EFAULT);
+	rd.msgs = (struct i2c_msg *)16;
+	errno = 0;
+	test_result("i2c: I2C_RDWR messages at a bad pointer -> EFAULT",
+		    ioctl(fd, I2C_RDWR, &rd) == -1 && errno == EFAULT);
+	rd.msgs = msgs;
+	msgs[0].addr = 0x50;
+	msgs[0].flags = I2C_M_RD;
+	msgs[0].len = 8193;
+	msgs[0].buf = buf;
+	errno = 0;
+	test_result("i2c: I2C_RDWR message of 8193 bytes -> EINVAL",
+		    ioctl(fd, I2C_RDWR, &rd) == -1 && errno == EINVAL);
+	msgs[0].len = 4;
+	msgs[0].buf = (unsigned char *)24;
+	errno = 0;
+	test_result("i2c: I2C_RDWR message buffer at a bad pointer -> EFAULT",
+		    ioctl(fd, I2C_RDWR, &rd) == -1 && errno == EFAULT);
+	msgs[0].buf = buf;
+	msgs[0].flags = I2C_M_RECV_LEN; /* a write cannot receive a length */
+	msgs[0].len = 40;
+	buf[0] = 1;
+	errno = 0;
+	test_result("i2c: I2C_RDWR received length on a write -> EINVAL",
+		    ioctl(fd, I2C_RDWR, &rd) == -1 && errno == EINVAL);
+	msgs[0].flags = I2C_M_RD | I2C_M_RECV_LEN;
+	msgs[0].len = 20; /* no room for a 32-byte block */
+	errno = 0;
+	test_result("i2c: I2C_RDWR received length, buffer too small -> EINVAL",
+		    ioctl(fd, I2C_RDWR, &rd) == -1 && errno == EINVAL);
+	if (dw) {
+		msgs[0].flags = 0;
+		msgs[0].len = 0;
+		errno = 0;
+		test_result("i2c: DesignWare: zero-length message -> EOPNOTSUPP",
+			    ioctl(fd, I2C_RDWR, &rd) == -1 &&
+				    errno == EOPNOTSUPP);
+	}
+
+	/* I2C_SMBUS argument checks */
+	memset(&sm, 0, sizeof(sm));
+	sm.read_write = I2C_SMBUS_READ;
+	sm.size = 42;
+	sm.data = &data;
+	errno = 0;
+	test_result("i2c: I2C_SMBUS with an unknown size -> EINVAL",
+		    ioctl(fd, I2C_SMBUS, &sm) == -1 && errno == EINVAL);
+	sm.size = I2C_SMBUS_BYTE_DATA;
+	sm.read_write = 5;
+	errno = 0;
+	test_result("i2c: I2C_SMBUS with a bad direction -> EINVAL",
+		    ioctl(fd, I2C_SMBUS, &sm) == -1 && errno == EINVAL);
+	sm.read_write = I2C_SMBUS_READ;
+	sm.data = NULL;
+	errno = 0;
+	test_result("i2c: I2C_SMBUS byte data without data -> EINVAL",
+		    ioctl(fd, I2C_SMBUS, &sm) == -1 && errno == EINVAL);
+	sm.read_write = I2C_SMBUS_WRITE;
+	sm.data = (union i2c_smbus_data *)32;
+	errno = 0;
+	test_result("i2c: I2C_SMBUS write data at a bad pointer -> EFAULT",
+		    ioctl(fd, I2C_SMBUS, &sm) == -1 && errno == EFAULT);
+	errno = 0;
+	test_result("i2c: I2C_SMBUS argument at a bad pointer -> EFAULT",
+		    ioctl(fd, I2C_SMBUS, (void *)8) == -1 && errno == EFAULT);
+	errno = 0;
+	test_result("i2c: unknown request -> ENOTTY",
+		    ioctl(fd, 0x0799, 0) == -1 && errno == ENOTTY);
+	/* the adapter defaults again (1 s, 3 retries on DesignWare) */
+	test_result("i2c: I2C_TIMEOUT / I2C_RETRIES accepted",
+		    ioctl(fd, I2C_TIMEOUT, 100) == 0 &&
+			    ioctl(fd, I2C_RETRIES, dw ? 3 : 0) == 0);
+	close(fd);
+
+	/* the node is root's only */
+	if (geteuid() == 0) {
+		pid_t pid = fork();
+
+		if (pid == 0) {
+			if (setgid(65534) < 0 || setuid(65534) < 0)
+				_exit(2);
+			int f = open(path, O_RDWR);
+			_exit(f < 0 && (errno == EACCES || errno == EPERM) ? 0 :
+									      1);
+		}
+		int status = -1;
+		waitpid(pid, &status, 0);
+		test_result("i2c: unprivileged open -> EACCES",
+			    WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	}
+}
+
+static void test_i2c_dev(void)
+{
+	int nrs[16], n = 0;
+	DIR *d;
+	struct dirent *de;
+	FILE *f;
+
+	printf("\n--- I2C Bus Device Tests (/dev/i2c-*) ---\n");
+	f = fopen("/proc/i2c", "r");
+	test_result("i2c: /proc/i2c readable", f != NULL);
+	if (f)
+		fclose(f);
+	d = opendir("/dev");
+	if (d) {
+		while ((de = readdir(d)) && n < 16) {
+			int nr;
+			char rest;
+
+			if (sscanf(de->d_name, "i2c-%d%c", &nr, &rest) == 1 &&
+			    nr >= 0)
+				nrs[n++] = nr;
+		}
+		closedir(d);
+	}
+	if (!n) {
+		printf("  (no I2C adapters on this machine: I2C checks skipped)\n");
+		return;
+	}
+	for (int i = 0; i < n; i++)
+		test_i2c_dev_one(nrs[i]);
+}
+
+// ============================================================================
+// Platform identification (SMBIOS) in sysfs: /sys/devices/virtual/dmi/id
+// ============================================================================
+
+static void test_dmi_sysfs(void)
+{
+	char buf[1024], buf2[1024];
+	struct stat st;
+	ssize_t n;
+	int fd;
+
+	printf("\n--- DMI identification (/sys/devices/virtual/dmi/id) ---\n");
+	if (stat("/sys/devices/virtual/dmi/id", &st) != 0) {
+		printf("  (no SMBIOS on this machine: DMI checks skipped)\n");
+		return;
+	}
+	test_result("dmi: /sys/class/dmi/id leads to the same directory",
+		    stat("/sys/class/dmi/id/uevent", &st) == 0);
+	fd = open("/sys/devices/virtual/dmi/id/uevent", O_RDONLY);
+	n = fd >= 0 ? read(fd, buf, sizeof(buf) - 1) : -1;
+	if (fd >= 0)
+		close(fd);
+	if (n < 0)
+		n = 0;
+	buf[n] = 0;
+	test_result("dmi: uevent is one MODALIAS=dmi:...: line",
+		    !strncmp(buf, "MODALIAS=dmi:", 13) && n > 14 &&
+			    buf[n - 1] == '\n' && buf[n - 2] == ':' &&
+			    !strchr(buf, ' '));
+	fd = open("/sys/devices/virtual/dmi/id/modalias", O_RDONLY);
+	n = fd >= 0 ? read(fd, buf2, sizeof(buf2) - 1) : -1;
+	if (fd >= 0)
+		close(fd);
+	if (n < 0)
+		n = 0;
+	buf2[n] = 0;
+	test_result("dmi: modalias matches the uevent's MODALIAS",
+		    n > 4 && !strcmp(buf2, buf + 9));
+	fd = open("/sys/devices/virtual/dmi/id/sys_vendor", O_RDONLY);
+	n = fd >= 0 ? read(fd, buf, sizeof(buf) - 1) : -1;
+	if (fd >= 0)
+		close(fd);
+	test_result("dmi: sys_vendor readable, one line", n > 0 &&
+							       buf[n - 1] == '\n');
+	if (n > 0) {
+		char want[300];
+
+		buf[n - 1] = 0;
+		/* the modalias carries the vendor with blanks and colons
+		 * left out */
+		snprintf(want, sizeof(want), ":svn");
+		for (ssize_t i = 0, k = 4; i < n - 1 && k < 298; i++)
+			if (buf[i] > ' ' && buf[i] < 127 && buf[i] != ':') {
+				want[k++] = buf[i];
+				want[k] = 0;
+			}
+		test_result("dmi: modalias holds :svn<sys_vendor>",
+			    strstr(buf2, want) != NULL);
+	}
+	test_result("dmi: product_serial is 0400 root",
+		    stat("/sys/devices/virtual/dmi/id/product_serial", &st) !=
+				    0 ||
+			    ((st.st_mode & 0777) == 0400 && st.st_uid == 0));
+	test_result("dmi: files are read-only",
+		    open("/sys/devices/virtual/dmi/id/sys_vendor", O_WRONLY) <
+			    0);
+	if (geteuid() == 0 &&
+	    stat("/sys/devices/virtual/dmi/id/product_serial", &st) == 0) {
+		pid_t pid = fork();
+
+		if (pid == 0) {
+			int f;
+
+			if (setgid(65534) < 0 || setuid(65534) < 0)
+				_exit(2);
+			f = open("/sys/devices/virtual/dmi/id/product_serial",
+				 O_RDONLY);
+			if (f >= 0 || errno != EACCES)
+				_exit(1);
+			f = open("/sys/devices/virtual/dmi/id/sys_vendor",
+				 O_RDONLY);
+			_exit(f >= 0 ? 0 : 3);
+		}
+		int status = -1;
+		waitpid(pid, &status, 0);
+		test_result("dmi: unprivileged: product_serial -> EACCES, sys_vendor readable",
+			    WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	}
+}
+
 // ============================================================================
 // Event devices: capability ioctls, nonblocking reads, poll, exclusive grab
 // ============================================================================
+/* strtod_l and friends: number parsing in a given locale.  Every locale here
+ * uses '.' as the radix character, so they agree with strtod; what is checked
+ * is that they exist, take a newlocale() object, and stop where strtod does.
+ * program_invocation_short_name is reached through <errno.h> alone, where
+ * GNU software expects it. */
+static void test_locale_numbers(void)
+{
+	printf("\n[TEST] strtod_l / strtof_l / strtold_l, program name in <errno.h>\n");
+
+	locale_t c = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+	char *end = NULL;
+
+	test_result("newlocale(LC_NUMERIC_MASK, \"C\") gives a locale",
+		    c != (locale_t)0);
+	test_result("strtod_l parses with '.' and stops at the rest",
+		    strtod_l("1.5e2xyz", &end, c) == 150.0 &&
+			    strcmp(end, "xyz") == 0);
+	test_result("strtod_l agrees with strtod",
+		    strtod_l("-0.125", NULL, c) == strtod("-0.125", NULL));
+	test_result("strtof_l", strtof_l("2.5", &end, c) == 2.5f && *end == '\0');
+	test_result("strtold_l", strtold_l("0.75", &end, c) == 0.75L && *end == '\0');
+	test_result("strtod_l without digits: 0, end at the start",
+		    strtod_l("abc", &end, c) == 0.0 && strcmp(end, "abc") == 0);
+	test_result("strtod_l: a comma is not the radix",
+		    strtod_l("1,5", &end, c) == 1.0 && *end == ',');
+	freelocale(c);
+	test_result("program_invocation_short_name (via <errno.h>) is a base name",
+		    program_invocation_short_name &&
+			    program_invocation_short_name[0] &&
+			    strchr(program_invocation_short_name, '/') == NULL);
+}
+
+/* libudev (user/lib/libudev): what libinput and likeos-input-devices learn
+ * about the built-in keyboard and mouse.  The classification itself is
+ * covered on the build machine against real device descriptions
+ * (make -C user/lib/libudev host-test); here it is the system's own
+ * /proc/bus/input/devices and /dev/input nodes that are read. */
+static void test_libudev(void)
+{
+	printf("\n--- libudev (input devices) ---\n");
+
+	struct udev *u = udev_new();
+	struct udev_device *d, *p;
+	struct stat st;
+
+	test_result("udev_new", u != NULL);
+	if (!u)
+		return;
+
+	if (stat("/dev/input/event0", &st) == 0) {
+		d = udev_device_new_from_devnum(u, 'c', st.st_rdev);
+		test_result("udev_device_new_from_devnum(event0)", d != NULL);
+		if (d) {
+			const char *v;
+
+			test_result("event0: sysname, subsystem, node",
+				    strcmp(udev_device_get_sysname(d), "event0") == 0 &&
+					    strcmp(udev_device_get_subsystem(d), "input") == 0 &&
+					    strcmp(udev_device_get_devnode(d),
+						   "/dev/input/event0") == 0);
+			test_result("event0: devnum is the node's",
+				    udev_device_get_devnum(d) == st.st_rdev);
+			v = udev_device_get_property_value(d, "ID_INPUT_KEYBOARD");
+			test_result("event0 is ID_INPUT_KEYBOARD", v && strcmp(v, "1") == 0);
+			test_result("event0 is not a touchpad",
+				    udev_device_get_property_value(d, "ID_INPUT_TOUCHPAD") == NULL);
+			test_result("event0 is initialized",
+				    udev_device_get_is_initialized(d) == 1);
+			p = udev_device_get_parent(d);
+			test_result("event0 has its input device as parent",
+				    p && strncmp(udev_device_get_sysname(p), "input", 5) == 0);
+			if (p) {
+				v = udev_device_get_property_value(p, "NAME");
+				test_result("parent NAME is quoted",
+					    v && v[0] == '"' && v[strlen(v) - 1] == '"');
+				v = udev_device_get_sysattr_value(p, "id/bustype");
+				test_result("parent id/bustype is i8042 (0011)",
+					    v && strcmp(v, "0011") == 0);
+				v = udev_device_get_sysattr_value(p, "capabilities/ev");
+				test_result("parent capabilities/ev present", v && v[0]);
+			}
+			/* The same device again by its system path. */
+			{
+				struct udev_device *again = udev_device_new_from_syspath(
+					u, udev_device_get_syspath(d));
+
+				test_result("udev_device_new_from_syspath round trip",
+					    again && strcmp(udev_device_get_sysname(again),
+							    "event0") == 0);
+				udev_device_unref(again);
+			}
+			udev_device_unref(d);
+		}
+	}
+
+	if (stat("/dev/input/event1", &st) == 0) {
+		const char *v;
+
+		d = udev_device_new_from_devnum(u, 'c', st.st_rdev);
+		v = d ? udev_device_get_property_value(d, "ID_INPUT_MOUSE") : NULL;
+		test_result("event1 is ID_INPUT_MOUSE", v && strcmp(v, "1") == 0);
+		udev_device_unref(d);
+	}
+
+	/* Enumeration: every event node, each one resolvable. */
+	{
+		struct udev_enumerate *e = udev_enumerate_new(u);
+		struct udev_list_entry *l;
+		int n = 0, ok = 1, has0 = 0, has1 = 0;
+
+		udev_enumerate_add_match_subsystem(e, "input");
+		udev_enumerate_add_match_sysname(e, "event*");
+		test_result("udev_enumerate_scan_devices", udev_enumerate_scan_devices(e) == 0);
+		udev_list_entry_foreach(l, udev_enumerate_get_list_entry(e)) {
+			struct udev_device *x = udev_device_new_from_syspath(
+				u, udev_list_entry_get_name(l));
+
+			n++;
+			if (!x) {
+				ok = 0;
+				continue;
+			}
+			if (strcmp(udev_device_get_sysname(x), "event0") == 0)
+				has0 = 1;
+			if (strcmp(udev_device_get_sysname(x), "event1") == 0)
+				has1 = 1;
+			udev_device_unref(x);
+		}
+		test_result("enumeration lists event0 and event1", n >= 2 && has0 && has1);
+		test_result("every enumerated node resolves", ok);
+		udev_enumerate_unref(e);
+	}
+
+	/* Negative cases. */
+	test_result("devnum of a non-input node -> NULL",
+		    udev_device_new_from_devnum(u, 'c', makedev(1, 3)) == NULL);
+	test_result("syspath outside /sys -> NULL, EINVAL",
+		    udev_device_new_from_syspath(u, "/etc/passwd") == NULL && errno == EINVAL);
+	test_result("syspath with .. -> NULL",
+		    udev_device_new_from_syspath(u, "/sys/class/../../etc") == NULL);
+	test_result("missing event node -> NULL",
+		    udev_device_new_from_subsystem_sysname(u, "input", "event999") == NULL);
+	test_result("property of NULL device -> NULL",
+		    udev_device_get_property_value(NULL, "ID_INPUT") == NULL);
+
+	/* The monitor: a pollable descriptor; nothing pending is EAGAIN. */
+	{
+		struct udev_monitor *m = udev_monitor_new_from_netlink(u, "udev");
+
+		test_result("udev_monitor_new_from_netlink", m != NULL);
+		if (m) {
+			struct pollfd pfd = { .fd = udev_monitor_get_fd(m), .events = POLLIN };
+			struct udev_device *x;
+			int drained = 0;
+
+			test_result("monitor filter + enable",
+				    udev_monitor_filter_add_match_subsystem_devtype(m, "input",
+										    NULL) == 0 &&
+					    udev_monitor_enable_receiving(m) == 0);
+			test_result("monitor fd polls", poll(&pfd, 1, 0) >= 0);
+			while ((x = udev_monitor_receive_device(m)) != NULL && drained < 64) {
+				udev_device_unref(x);
+				drained++;
+			}
+			test_result("monitor drains to EAGAIN", x == NULL && errno == EAGAIN);
+			udev_monitor_unref(m);
+		}
+	}
+	udev_unref(u);
+}
+
 static void test_evdev(void)
 {
 	printf("\n--- Input Device Tests (/dev/input/event*) ---\n");
@@ -4245,12 +5390,18 @@ static void test_evdev(void)
 			    ioctl(fd, EVIOCGUNIQ(sizeof(uniq)), uniq) == -1 &&
 				    errno == ENOENT);
 
+		/* A device without absolute axes has no axis parameters to
+		 * ask about: the request itself is invalid there. */
 		struct input_absinfo ai;
 		memset(&ai, 0xFF, sizeof(ai));
-		test_result("EVIOCGABS succeeds on a relative-only device",
-			    ioctl(fd, EVIOCGABS(ABS_X), &ai) == 0);
-		test_result("EVIOCGABS reports an empty range",
-			    ai.minimum == 0 && ai.maximum == 0);
+		errno = 0;
+		test_result("EVIOCGABS on a device without absolute axes -> EINVAL",
+			    ioctl(fd, EVIOCGABS(ABS_X), &ai) == -1 &&
+				    errno == EINVAL);
+		errno = 0;
+		test_result("EVIOCSABS on a device without absolute axes -> EINVAL",
+			    ioctl(fd, EVIOCSABS(ABS_X), &ai) == -1 &&
+				    errno == EINVAL);
 
 		unsigned char leds[(LED_MAX + 7) / 8];
 		memset(leds, 0xFF, sizeof(leds));
@@ -4357,8 +5508,168 @@ static void test_evdev(void)
 		close(fd);
 	}
 
-	test_result("open(/dev/input/event7) fails",
-		    open("/dev/input/event7", O_RDONLY) < 0);
+	evdev_test_nodes();
+	evdev_test_requests();
+	evdev_test_revoke();
+	evdev_test_two_readers();
+	evdev_test_proc_devices();
+	evdev_test_touchpads();
+	evdev_test_i2c_touchpad();
+	console_test_kd_modes();
+}
+
+/* The console's KD modes: KDGKBMODE/KDSKBMODE and KDGETMODE/KDSETMODE.
+ *
+ * Everything that switches the console away from KD_TEXT or to K_OFF is done
+ * in a forked child that then exits WITHOUT putting it back: the kernel must
+ * restore both modes when the file that set them is closed, so the test
+ * runner never loses its keyboard.  Skipped while a display server has the
+ * console (it is in KD_GRAPHICS or K_OFF): taking the modes over would hand
+ * the keyboard back to the console under the running session.  Needs root
+ * (the console is 0620 root:tty). */
+static int kd_child_exit(pid_t pid)
+{
+	int st = 0;
+
+	if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
+		return -1;
+	return WEXITSTATUS(st);
+}
+
+static int kd_modes(int fd, int *kbd, int *disp)
+{
+	return ioctl(fd, KDGKBMODE, kbd) == 0 && ioctl(fd, KDGETMODE, disp) == 0;
+}
+
+static void console_test_kd_modes(void)
+{
+	int fd, kbd0 = -1, disp0 = -1, kbd = -1, disp = -1, rc;
+	int pipefd[2];
+	pid_t pid;
+
+	if (geteuid() != 0) {
+		printf("  (not root: console KD mode checks skipped)\n");
+		return;
+	}
+	fd = open("/dev/tty0", O_RDWR | O_NOCTTY | O_CLOEXEC);
+	test_result("console: open /dev/tty0", fd >= 0);
+	if (fd < 0)
+		return;
+	test_result("console: KDGKBMODE / KDGETMODE", kd_modes(fd, &kbd0, &disp0));
+	if (disp0 != KD_TEXT || kbd0 == K_OFF) {
+		printf("  (a display server has the console: KD mode checks "
+		       "skipped)\n");
+		close(fd);
+		return;
+	}
+	errno = 0;
+	test_result("console: KDSKBMODE 5 -> EINVAL",
+		    ioctl(fd, KDSKBMODE, 5) == -1 && errno == EINVAL);
+	errno = 0;
+	test_result("console: KDSETMODE KD_TEXT0 -> EINVAL",
+		    ioctl(fd, KDSETMODE, KD_TEXT0) == -1 && errno == EINVAL);
+
+	/* A child sets KD_GRAPHICS and K_OFF through its own file, checks
+	 * them, and exits without putting them back. */
+	pid = fork();
+	if (pid == 0) {
+		int c = open("/dev/console", O_RDWR | O_NOCTTY), k = -1, d = -1;
+
+		if (c < 0)
+			_exit(10);
+		if (ioctl(c, KDSETMODE, KD_GRAPHICS) != 0)
+			_exit(11);
+		if (ioctl(c, KDSKBMODE, K_OFF) != 0)
+			_exit(12);
+		if (!kd_modes(c, &k, &d) || k != K_OFF || d != KD_GRAPHICS)
+			_exit(13);
+		_exit(0); /* the descriptor closes with the process */
+	}
+	rc = kd_child_exit(pid);
+	test_result("console: child sets KD_GRAPHICS + K_OFF", rc == 0);
+	if (rc != 0)
+		printf("    (child exit %d)\n", rc);
+	test_result("console: modes restored when the child's file closed",
+		    kd_modes(fd, &kbd, &disp) && disp == KD_TEXT && kbd == kbd0);
+
+	/* A child keeps K_OFF set while the test closes another descriptor
+	 * of the console: that close changes nothing; the child's does. */
+	if (pipe(pipefd) == 0) {
+		pid = fork();
+		if (pid == 0) {
+			int c = open("/dev/console", O_RDWR | O_NOCTTY);
+			char b;
+
+			close(pipefd[1]);
+			if (c < 0 || ioctl(c, KDSKBMODE, K_OFF) != 0)
+				_exit(20);
+			(void)read(pipefd[0], &b, 1); /* until told */
+			_exit(0);
+		}
+		close(pipefd[0]);
+		/* Wait for the child's K_OFF (bounded). */
+		for (int i = 0; i < 200; i++) {
+			if (kd_modes(fd, &kbd, &disp) && kbd == K_OFF)
+				break;
+			usleep(10000);
+		}
+		test_result("console: the child's K_OFF is in effect", kbd == K_OFF);
+		{
+			int o = open("/dev/tty0", O_RDWR | O_NOCTTY);
+
+			if (o >= 0)
+				close(o);
+		}
+		test_result("console: another file's close keeps K_OFF",
+			    kd_modes(fd, &kbd, &disp) && kbd == K_OFF);
+		close(pipefd[1]); /* the child reads EOF and exits */
+		rc = kd_child_exit(pid);
+		test_result("console: K_OFF holder exits",
+			    rc == 0 || rc == 20);
+		test_result("console: restored after the holder exited",
+			    kd_modes(fd, &kbd, &disp) && disp == KD_TEXT &&
+				    kbd == kbd0);
+	}
+
+	/* An unprivileged task outside the console's session: may read the
+	 * modes, may not change them. */
+	pid = fork();
+	if (pid == 0) {
+		int k = -1, d = -1;
+
+		setsid();
+		if (setgid(65534) != 0 || setuid(65534) != 0)
+			_exit(30);
+		if (!kd_modes(fd, &k, &d))
+			_exit(31);
+		errno = 0;
+		if (ioctl(fd, KDSKBMODE, K_OFF) != -1 || errno != EPERM)
+			_exit(32);
+		errno = 0;
+		if (ioctl(fd, KDSETMODE, KD_GRAPHICS) != -1 || errno != EPERM)
+			_exit(33);
+		_exit(0);
+	}
+	rc = kd_child_exit(pid);
+	test_result("console: unprivileged, other session: read ok, set -> EPERM",
+		    rc == 0);
+	if (rc != 0)
+		printf("    (child exit %d)\n", rc);
+	test_result("console: modes unchanged after the refused requests",
+		    kd_modes(fd, &kbd, &disp) && disp == KD_TEXT && kbd == kbd0);
+
+	/* The round trip through the test's own descriptor, put back at once. */
+	test_result("console: KDSETMODE KD_GRAPHICS, then KD_TEXT",
+		    ioctl(fd, KDSETMODE, KD_GRAPHICS) == 0 &&
+			    kd_modes(fd, &kbd, &disp) && disp == KD_GRAPHICS &&
+			    ioctl(fd, KDSETMODE, KD_TEXT) == 0);
+	test_result("console: KDSKBMODE K_RAW, then back",
+		    ioctl(fd, KDSKBMODE, K_RAW) == 0 &&
+			    kd_modes(fd, &kbd, &disp) && kbd == K_RAW &&
+			    ioctl(fd, KDSKBMODE, kbd0) == 0);
+	test_result("console: modes as they were",
+		    kd_modes(fd, &kbd, &disp) && disp == KD_TEXT && kbd == kbd0);
+	close(fd);
 }
 
 static void test_credentials(void)
@@ -24004,6 +25315,8 @@ int main(int argc, char **argv)
 	 *                        designated target (partition likeos-test* on a
 	 *                        namespace, or TESTLIBC_NVME) */
 	int nvme_only = (argc > 1 && strcmp(argv[1], "nvme") == 0);
+	/*   testlibc i2c      -- run only the I2C bus device section */
+	int i2c_only = (argc > 1 && strcmp(argv[1], "i2c") == 0);
 	int skip_network =
 		(argc < 2 || strcmp(argv[1], "all") != 0) && !net_only;
 
@@ -24013,6 +25326,7 @@ int main(int argc, char **argv)
 					       audio_only   ? " (audio only)" :
 					       storage_only ? " (storage only)" :
 					       nvme_only    ? " (NVMe only)" :
+					       i2c_only     ? " (I2C only)" :
 					       skip_network ? " (no network)" :
 							      " (all)",
 	       g_stress ? " [--stress: no screen drawing or mode changes]" : "");
@@ -24078,6 +25392,8 @@ int main(int argc, char **argv)
 		goto storage_section;
 	if (nvme_only)
 		goto nvme_section;
+	if (i2c_only)
+		goto i2c_section;
 
 	// ========================================
 	// Test: malloc/free
@@ -31680,6 +32996,10 @@ int main(int argc, char **argv)
 	test_audio();
 	test_storage(0);
 	test_evdev();
+	test_libudev();
+	test_locale_numbers();
+	test_i2c_dev();
+	test_dmi_sysfs();
 	test_shebang();
 	test_devfd();
 	test_poll_signal_eintr();
@@ -41065,6 +42385,12 @@ storage_section:
 nvme_section:
 	if (nvme_only)
 		test_nvme(1);
+
+	/* Reached only by `testlibc i2c'; a full run covers it in the
+	 * device-node section above. */
+i2c_section:
+	if (i2c_only)
+		test_i2c_dev();
 
 	// ========================================
 	// Summary

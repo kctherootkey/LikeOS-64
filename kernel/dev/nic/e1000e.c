@@ -4032,9 +4032,9 @@ void e1000e_init(void)
 
 		// Mark the driver initialised before unmasking IMS — the IRQ
 		// dispatcher only routes to e1000e_irq_handler() when this flag
-		// is set; otherwise the vector may collide with the I2C LPSS
-		// dispatch range and lock up the system in a level-triggered
-		// IRQ storm (same problem we hit with the e1000 driver).
+		// is set; otherwise nothing acknowledges the device and the
+		// system locks up in a level-triggered IRQ storm (same problem
+		// we hit with the e1000 driver).
 		dev->net_dev.lock = (spinlock_t)SPINLOCK_INIT("e1000e");
 		dev->tx_lock = (spinlock_t)SPINLOCK_INIT("e1000e_tx");
 		dev->net_dev.rx_packets = 0;

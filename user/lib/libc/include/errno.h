@@ -18,6 +18,12 @@ extern "C" {
 int *__errno_location(void);
 #define errno (*__errno_location())
 
+/* argv[0] as the program was started, and its last path component; set by
+ * the C runtime before main().  Declared here as well as in <err.h>, because
+ * this is where GNU software looks for them (with _GNU_SOURCE). */
+extern char *program_invocation_name;
+extern char *program_invocation_short_name;
+
 // Error codes
 #define EPERM           1  /* Operation not permitted */
 #define ENOENT          2  /* No such file or directory */

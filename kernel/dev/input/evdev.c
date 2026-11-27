@@ -1,102 +1,1555 @@
-// LikeOS evdev input core - implementation
+// LikeOS evdev - event devices of the input core
 //
-// Ring-buffered input events with the standard event-device semantics:
-// whole input_event records via read(), EV_SYN frame terminators, drop-
-// oldest overflow with SYN_DROPPED notification, capability bitmap ioctls,
-// and single-holder exclusive grabs.
+// One node per registered input device (struct evdev), one client per open
+// descriptor (struct evdev_client).  The input core hands every complete
+// packet to evdev_pass_values(), which copies it into the queue of every
+// client -- or only the grabbing client's while a grab is held -- stamped
+// with the client's chosen clock.
 //
-// Locking: one spinlock per device guards the ring, key-state bitmap and
-// grab holder.  Producers run in interrupt context (spin_lock_irqsave, no
-// prints, no sleeping); readers park with the established wait_channel/
-// BLOCKED protocol.
+// Client queues.  A power-of-two ring of input_event records with three
+// indices: head (where the next event goes), tail (the next to read) and
+// packet_head (the end of the last complete packet).  Readers only ever get
+// whole packets, up to packet_head.  When the ring fills up, everything
+// unread is dropped: the queue is left holding a SYN_DROPPED record and the
+// newest event, and the client is expected to re-read the device state
+// (EVIOCGKEY, EVIOCGABS, EVIOCGMTSLOTS ...) at the next SYN_REPORT.  Reading
+// a state bitmap (EVIOCGKEY/LED/SND/SW) also removes the queued events of
+// that type, so the snapshot and the queue never disagree.  The ring size
+// follows the device's events-per-packet estimate (8 packets, at least 64
+// events, rounded up to a power of two); the built-in keyboard and mouse
+// keep the 256 events they always had.
+//
+// A grab makes the device the grabbing client's alone: the other clients
+// and the in-kernel handles (input.c) get nothing until it is released.
+//
+// Locking:
+//   g_evdev_table_lock   the node table (minor -> node)
+//   dev->event_lock      (input core) packets reach evdev_pass_values()
+//                        under it; the node link dev->evdev changes under it
+//   evdev->client_lock   client list, every client queue, the grab
+//   evdev->mutex         ioctl / write / open / close against disconnect;
+//                        `exist' and `open' change under it
+// Order: evdev->mutex -> dev->mutex; dev->event_lock -> evdev->client_lock.
+//
+// Producers run in interrupt context (spin_lock_irqsave, no prints, no
+// sleeping); readers park with the established wait_channel/BLOCKED
+// protocol on the node's wait channel.
 //
 // Copyright (C) 2026 The LikeOS Project
+// Portions Copyright (C) 1999-2002 Vojtech Pavlik
 
 #include <kernel/ke/waitq.h>
 #include <kernel/dev/input/evdev.h>
+#include <kernel/dev/input/input.h>
+#include <kernel/dev/input/input-mt.h>
+#include <kernel/dev/input/keyboard.h>
 #include <kernel/uapi/input.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/ke/sched.h>
 #include <kernel/ke/signal.h>
-#include <kernel/ke/syscall.h>
+#include <kernel/ke/syscall.h> /* errno values */
 #include <kernel/ke/timer.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/uaccess_range.h>
 
-// Wake pollers sleeping in poll()/select() (kernel/net/poll.c)
-extern void poll_notify_io_ready(void);
+// Wake the pollers registered on one queue (kernel/net/poll.c); `key' names
+// the POLL* bits that changed.
+extern void poll_notify_wq_key(struct wait_queue_head *h, unsigned key);
 
-#define EVDEV_RING_SIZE 256 // events; power of two not required
-#define EVDEV_MAX_READ_BURST 32 // events copied per read() pass
+/* The standard poll bits (the full set lives in kernel/net/net.h). */
+#define EVDEV_POLLIN 0x0001
+#define EVDEV_POLLOUT 0x0004
+#define EVDEV_POLLERR 0x0008
+#define EVDEV_POLLHUP 0x0010
+#define EVDEV_POLLRDNORM 0x0040
+#define EVDEV_POLLWRNORM 0x0100
 
-typedef struct {
-	spinlock_t lock;
-	struct input_event ring[EVDEV_RING_SIZE];
-	unsigned head; // producer index
-	unsigned tail; // consumer index
-	unsigned count;
-	uint32_t dropped; // ring overflows (reported once per overflow)
-	int64_t grab_task; // task id holding the grab, 0 = none
-	/* The descriptor the grab was taken through.
-	 *
-	 * The task id alone is not enough to release it: the release happens
-	 * when the descriptor is closed, and a descriptor is not always closed
-	 * by the task that opened it -- process teardown, a shared descriptor
-	 * table, or a reaper can all do it.  When the ids did not match the grab
-	 * was simply left in place, and with it every pointer event stayed
-	 * suppressed: after an X session ended the console cursor was drawn but
-	 * would not move, forever.
-	 *
-	 * Keyed on the handle, the release is exact and does not care who is
-	 * doing the closing. */
-	void *grab_owner;
-	uint8_t key_state[KEY_CNT / 8]; // current down/up bitmap
-	struct input_id id;
-	const char *name;
-	const char *phys; // physical location, e.g. "isa0060/serio0/input0"
-	uint8_t evbits[EV_CNT / 8];
-	uint8_t keybits[KEY_CNT / 8];
-	uint8_t relbits[REL_CNT / 8];
-	uint8_t absbits[ABS_CNT / 8];
-	/* Absolute axes (evdev_mouse_set_absolute()): ABS_X and ABS_Y, their
-	 * range, and where the pointer is on them. */
-	struct input_absinfo abs[2];
-	/* Screen size the relative motion of another source is scaled by
-	 * while the axes are absolute. */
-	int abs_screen_w, abs_screen_h;
-	uint8_t propbits[INPUT_PROP_CNT / 8]; // device properties (EVIOCGPROP)
-	uint8_t ledbits[LED_CNT / 8]; // LEDs this device has
-	uint8_t led_state[LED_CNT / 8]; // which of them are lit
-	/* Clock used for event timestamps.  Display servers set this to
-	 * CLOCK_MONOTONIC so input timing is immune to the wall clock being
-	 * stepped; the default stays CLOCK_REALTIME for compatibility. */
-	int clock_id;
-	int wq; // wait-channel key for blocked readers
-	/* Who is polling this device.  Separate from `wq' above, which is the
-	 * channel a BLOCKING read parks on -- a poller waits for readiness,
-	 * a reader waits for a byte, and they are woken from the same place
-	 * but tracked apart. */
+#define EVDEV_MIN_BUFFER_SIZE 64u // events
+#define EVDEV_BUF_PACKETS 8u // packets a queue holds at the estimate
+/* Allocation bound per descriptor (192 KB of events): only devices with
+ * more than about a hundred slots would ask for more. */
+#define EVDEV_MAX_BUFFER_SIZE 8192u
+#define EVDEV_BUILTIN_BUFFER 256u // keyboard and mouse, as always
+#define EVDEV_READ_BURST 32 // events copied to user space per pass
+#define EVDEV_BUILTIN_VALS 16 // packet buffer of a built-in device
+/* Bytes one write() injects at most (170 events): the node's mutex is not
+ * held for long. */
+#define EVDEV_WRITE_MAX 4096
+#define EVDEV_MT_CHUNK 64 // EVIOCGMTSLOTS values copied per pass
+
+/* Clocks a client can have its events stamped with (EVIOCSCLOCKID). */
+enum { EVDEV_CLK_REAL = 0, EVDEV_CLK_MONO, EVDEV_CLK_BOOT };
+
+struct evdev_client {
+	struct evdev *evdev;
+	struct evdev_client *next; // on evdev->clients
+	struct input_event *buffer;
+	unsigned int bufsize; // power of two
+	unsigned int head, tail, packet_head;
+	int clk_type;
+	int revoked; // EVIOCREVOKE: dead descriptor from now on
+	/* EVIOCSMASK: per-type code masks, [0] masks the types themselves.
+	 * NULL lets everything of that type through. */
+	unsigned long *evmasks[EV_CNT];
+};
+
+struct evdev {
+	int minor;
+	int is_static; // a built-in node, never freed
+	volatile int exist; // registered; cleared at disconnect (mutex)
+	int open; // clients that opened the device (mutex)
+	refcount_t refcount; // the node table's + one per client
+	struct input_dev *dev;
+	spinlock_t client_lock;
+	struct evdev_client *clients;
+	struct evdev_client *grab;
+	struct mutex mutex;
+	/* Blocked readers park on this channel; pollers on poll_wq.  Both
+	 * belong to the node, which every client keeps alive, so a wake from
+	 * the event path can never reach freed memory. */
+	int wait_key;
 	struct wait_queue_head poll_wq;
-} evdev_dev_t;
+};
 
-static evdev_dev_t g_evdev[EVDEV_NUM_UNITS];
-static int g_evdev_initialized;
+static spinlock_t g_evdev_table_lock = SPINLOCK_INIT("evdev_table");
+static struct evdev *g_evdev_table[EVDEV_MINORS];
 
-static inline void bit_set(uint8_t *map, unsigned bit)
+// ---------------------------------------------------------------------------
+// The built-in devices
+// ---------------------------------------------------------------------------
+
+static struct input_dev g_kbd_dev;
+static struct input_dev g_mouse_dev;
+static struct input_value g_kbd_vals[EVDEV_BUILTIN_VALS];
+static struct input_value g_mouse_vals[EVDEV_BUILTIN_VALS];
+static struct evdev g_builtin_nodes[EVDEV_BUILTIN_UNITS];
+static spinlock_t g_builtin_lock = SPINLOCK_INIT("evdev_builtin");
+static int g_builtin_done;
+/* Screen size the relative motion of another source is scaled by while the
+ * mouse axes are absolute (the mouse's event lock). */
+static int g_abs_screen_w, g_abs_screen_h;
+
+/* What a client writes to the keyboard node, for the keyboard itself: the
+ * lock LEDs go to the keyboard driver, which drives the PS/2 and USB
+ * keyboards' LEDs from them while the console does not have the keyboard.
+ * The core has already recorded the new state in dev->led (event lock). */
+static int evdev_kbd_event(struct input_dev *dev, unsigned int type,
+			   unsigned int code, int value)
 {
-	map[bit >> 3] |= (uint8_t)(1u << (bit & 7));
+	(void)code;
+	(void)value;
+	if (type == EV_LED)
+		keyboard_client_leds(input_test_bit(LED_NUML, dev->led),
+				     input_test_bit(LED_CAPSL, dev->led),
+				     input_test_bit(LED_SCROLLL, dev->led));
+	return 0;
 }
 
-static inline void bit_clear(uint8_t *map, unsigned bit)
+static void evdev_setup_keyboard(struct input_dev *kbd)
 {
-	map[bit >> 3] &= (uint8_t)~(1u << (bit & 7));
+	unsigned int i;
+
+	kbd->name = "LikeOS Keyboard";
+	/* Physical path in the conventional serio form; a display server uses
+	 * it to tell devices apart and to match configuration rules. */
+	kbd->phys = "isa0060/serio0/input0";
+	kbd->devpath = "/devices/platform/i8042/serio0";
+	kbd->id.bustype = BUS_I8042;
+	kbd->id.vendor = 0x0001;
+	kbd->id.product = 0x0001;
+	kbd->id.version = 0x0100;
+	/* The keyboard reports the three standard lock LEDs.  A display
+	 * server writes their state, and the keyboards show it
+	 * (evdev_kbd_event). */
+	kbd->event = evdev_kbd_event;
+	input_set_bit(EV_LED, kbd->evbit);
+	input_set_bit(LED_NUML, kbd->ledbit);
+	input_set_bit(LED_CAPSL, kbd->ledbit);
+	input_set_bit(LED_SCROLLL, kbd->ledbit);
+	input_set_bit(EV_SYN, kbd->evbit);
+	input_set_bit(EV_KEY, kbd->evbit);
+	// Base set-1 make codes map 1:1 onto key codes 1..88, plus the
+	// extended navigation/modifier block.
+	for (i = KEY_ESC; i <= KEY_F12; i++)
+		input_set_bit(i, kbd->keybit);
+	for (i = KEY_KPENTER; i <= KEY_DELETE; i++)
+		input_set_bit(i, kbd->keybit);
+	input_set_bit(KEY_KPEQUAL, kbd->keybit);
+	input_set_bit(KEY_PAUSE, kbd->keybit);
+	input_set_bit(KEY_RO, kbd->keybit);
+	input_set_bit(KEY_HENKAN, kbd->keybit);
+	input_set_bit(KEY_KATAKANAHIRAGANA, kbd->keybit);
+	input_set_bit(KEY_MUHENKAN, kbd->keybit);
+	input_set_bit(KEY_KPCOMMA, kbd->keybit);
+	input_set_bit(KEY_HANGEUL, kbd->keybit);
+	input_set_bit(KEY_HANJA, kbd->keybit);
+	input_set_bit(KEY_YEN, kbd->keybit);
+	input_set_bit(KEY_LEFTMETA, kbd->keybit);
+	input_set_bit(KEY_RIGHTMETA, kbd->keybit);
+	input_set_bit(KEY_COMPOSE, kbd->keybit);
+	kbd->vals = g_kbd_vals;
+	kbd->max_vals = EVDEV_BUILTIN_VALS;
 }
 
-static inline int bit_test(const uint8_t *map, unsigned bit)
+static void evdev_setup_mouse(struct input_dev *mou)
 {
-	return (map[bit >> 3] >> (bit & 7)) & 1;
+	mou->name = "LikeOS Mouse";
+	mou->phys = "isa0060/serio1/input0";
+	mou->devpath = "/devices/platform/i8042/serio1";
+	/* INPUT_PROP_POINTER: motion is relative and drives a cursor, rather
+	 * than mapping onto screen coordinates the way a touchscreen does. */
+	input_set_bit(INPUT_PROP_POINTER, mou->propbit);
+	mou->id.bustype = BUS_I8042;
+	mou->id.vendor = 0x0001;
+	mou->id.product = 0x0002;
+	mou->id.version = 0x0100;
+	input_set_bit(EV_SYN, mou->evbit);
+	input_set_bit(EV_KEY, mou->evbit);
+	input_set_bit(EV_REL, mou->evbit);
+	input_set_bit(BTN_LEFT, mou->keybit);
+	input_set_bit(BTN_RIGHT, mou->keybit);
+	input_set_bit(BTN_MIDDLE, mou->keybit);
+	input_set_bit(BTN_SIDE, mou->keybit);
+	input_set_bit(BTN_EXTRA, mou->keybit);
+	input_set_bit(REL_X, mou->relbit);
+	input_set_bit(REL_Y, mou->relbit);
+	input_set_bit(REL_WHEEL, mou->relbit);
+	input_set_bit(REL_HWHEEL, mou->relbit);
+	mou->vals = g_mouse_vals;
+	mou->max_vals = EVDEV_BUILTIN_VALS;
 }
+
+void evdev_builtin_init(void)
+{
+	uint64_t f;
+
+	if (__atomic_load_n(&g_builtin_done, __ATOMIC_ACQUIRE))
+		return;
+	/* Any context, including the interrupt that reports the first key:
+	 * the registration of a built-in device takes spinlocks only. */
+	spin_lock_irqsave(&g_builtin_lock, &f);
+	if (!g_builtin_done) {
+		evdev_setup_keyboard(&g_kbd_dev);
+		evdev_setup_mouse(&g_mouse_dev);
+		WARN_ON(input_register_builtin_device(
+			&g_kbd_dev, &g_builtin_nodes[EVDEV_UNIT_KEYBOARD],
+			EVDEV_UNIT_KEYBOARD));
+		WARN_ON(input_register_builtin_device(
+			&g_mouse_dev, &g_builtin_nodes[EVDEV_UNIT_MOUSE],
+			EVDEV_UNIT_MOUSE));
+		__atomic_store_n(&g_builtin_done, 1, __ATOMIC_RELEASE);
+	}
+	spin_unlock_irqrestore(&g_builtin_lock, f);
+}
+
+// ---------------------------------------------------------------------------
+// Nodes
+// ---------------------------------------------------------------------------
+
+static void evdev_node_init(struct evdev *e, struct input_dev *dev, int minor,
+			    int is_static)
+{
+	e->minor = minor;
+	e->is_static = is_static;
+	e->exist = 1;
+	e->open = 0;
+	refcount_set(&e->refcount, 1); // the node table's
+	e->dev = dev;
+	spinlock_init(&e->client_lock, "evdev_clients");
+	e->clients = NULL;
+	e->grab = NULL;
+	mutex_init(&e->mutex, "evdev");
+	wq_head_init(&e->poll_wq, "evdev-poll");
+}
+
+static void evdev_put(struct evdev *e)
+{
+	if (!refcount_dec_and_test(&e->refcount))
+		return;
+	if (WARN_ON(e->is_static))
+		return;
+	WARN_ON(e->clients != NULL);
+	input_put_device(e->dev);
+	kfree(e);
+}
+
+/* Link the node into its device: from now on packets reach it. */
+static void evdev_link(struct input_dev *dev, struct evdev *e)
+{
+	uint64_t f;
+
+	spin_lock_irqsave(&dev->event_lock, &f);
+	dev->evdev = e;
+	spin_unlock_irqrestore(&dev->event_lock, f);
+}
+
+int evdev_connect_builtin(struct input_dev *dev, struct evdev *node,
+			  int minor)
+{
+	uint64_t f;
+	int rc = 0;
+
+	if (!dev || !node || minor < 0 || minor >= EVDEV_BUILTIN_UNITS)
+		return -EINVAL;
+	evdev_node_init(node, dev, minor, 1);
+	spin_lock_irqsave(&g_evdev_table_lock, &f);
+	if (g_evdev_table[minor])
+		rc = -EBUSY;
+	else
+		g_evdev_table[minor] = node;
+	spin_unlock_irqrestore(&g_evdev_table_lock, f);
+	if (!rc)
+		evdev_link(dev, node);
+	return rc;
+}
+
+int evdev_connect(struct input_dev *dev)
+{
+	struct evdev *e;
+	uint64_t f;
+	int minor;
+
+	might_sleep();
+	e = (struct evdev *)kcalloc(1, sizeof(*e));
+	if (!e)
+		return -ENOMEM;
+	spin_lock_irqsave(&g_evdev_table_lock, &f);
+	/* Lowest free number above the built-in ones, so a device that
+	 * comes back after being unplugged gets its old name again. */
+	for (minor = EVDEV_BUILTIN_UNITS; minor < EVDEV_MINORS; minor++)
+		if (!g_evdev_table[minor])
+			break;
+	if (minor == EVDEV_MINORS) {
+		spin_unlock_irqrestore(&g_evdev_table_lock, f);
+		kfree(e);
+		return -ENFILE;
+	}
+	input_get_device(dev); // the node keeps its device
+	evdev_node_init(e, dev, minor, 0);
+	g_evdev_table[minor] = e;
+	spin_unlock_irqrestore(&g_evdev_table_lock, f);
+	evdev_link(dev, e);
+	return 0;
+}
+
+int evdev_minor_of(const struct evdev *evdev)
+{
+	return evdev ? evdev->minor : -1;
+}
+
+static void evdev_wake(struct evdev *e, unsigned int key)
+{
+	sched_wake_channel((void *)&e->wait_key);
+	poll_notify_wq_key(&e->poll_wq, key);
+}
+
+void evdev_disconnect(struct input_dev *dev)
+{
+	struct evdev *e;
+	uint64_t f;
+
+	might_sleep();
+	spin_lock_irqsave(&dev->event_lock, &f);
+	e = dev->evdev;
+	spin_unlock_irqrestore(&dev->event_lock, f);
+	if (!e || WARN_ON(e->is_static))
+		return;
+
+	/* No ioctl, write or open is in flight past this point, and none
+	 * starts: they all check `exist' under the mutex. */
+	mutex_lock(&e->mutex);
+	__atomic_store_n(&e->exist, 0, __ATOMIC_SEQ_CST);
+	mutex_unlock(&e->mutex);
+
+	spin_lock_irqsave(&g_evdev_table_lock, &f);
+	if (g_evdev_table[e->minor] == e)
+		g_evdev_table[e->minor] = NULL;
+	spin_unlock_irqrestore(&g_evdev_table_lock, f);
+
+	/* No more packets: after this the event path never sees the node. */
+	evdev_link(dev, NULL);
+
+	/* Hang up: readers and pollers wake to ENODEV / POLLHUP|POLLERR. */
+	spin_lock_irqsave(&e->client_lock, &f);
+	e->grab = NULL;
+	spin_unlock_irqrestore(&e->client_lock, f);
+	evdev_wake(e, EVDEV_POLLHUP | EVDEV_POLLERR);
+
+	/* The device is closed for its users now; their descriptors stay
+	 * valid but dead until they are closed. */
+	mutex_lock(&e->mutex);
+	if (e->open) {
+		e->open = 0;
+		input_close_device(dev);
+	}
+	mutex_unlock(&e->mutex);
+
+	evdev_put(e); // the node table's reference
+}
+
+int evdev_unit_exists(int unit)
+{
+	uint64_t f;
+	int r;
+
+	if (unit < 0 || unit >= EVDEV_MINORS)
+		return 0;
+	evdev_builtin_init();
+	spin_lock_irqsave(&g_evdev_table_lock, &f);
+	r = g_evdev_table[unit] &&
+	    __atomic_load_n(&g_evdev_table[unit]->exist, __ATOMIC_ACQUIRE);
+	spin_unlock_irqrestore(&g_evdev_table_lock, f);
+	return r;
+}
+
+int evdev_next_unit(int from)
+{
+	for (int u = from < 0 ? 0 : from; u < EVDEV_MINORS; u++)
+		if (evdev_unit_exists(u))
+			return u;
+	return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Client queues (client_lock held)
+// ---------------------------------------------------------------------------
+
+static void evdev_set_time(struct input_event *ev, uint64_t ns)
+{
+	ev->time.tv_sec = (int64_t)(ns / 1000000000ULL);
+	ev->time.tv_usec = (int64_t)((ns % 1000000000ULL) / 1000ULL);
+}
+
+/* Clocks: CLOCK_MONOTONIC (and BOOTTIME, the same here: the machine never
+ * suspends) is time since boot; REALTIME adds the wall clock's offset.  Both
+ * come from one counter, so events stay ordered whichever a client picks. */
+
+static void evdev_queue_event(struct evdev_client *c,
+			      const struct input_event *ev)
+{
+	unsigned int mask = c->bufsize - 1;
+
+	c->buffer[c->head] = *ev;
+	c->head = (c->head + 1) & mask;
+	if (unlikely(c->head == c->tail)) {
+		/* Full: drop everything unread.  What is left is a
+		 * SYN_DROPPED record and the event just queued; the client
+		 * resynchronises at the next SYN_REPORT. */
+		c->tail = (c->head - 2) & mask;
+		c->buffer[c->tail].time = ev->time;
+		c->buffer[c->tail].type = EV_SYN;
+		c->buffer[c->tail].code = SYN_DROPPED;
+		c->buffer[c->tail].value = 0;
+		c->packet_head = c->tail;
+	}
+	if (ev->type == EV_SYN && ev->code == SYN_REPORT)
+		c->packet_head = c->head;
+}
+
+/* The time a SYN_DROPPED record carries on the client's clock: the time of
+ * the device's packet in progress if it has one, else now.  Takes the
+ * device's event lock: not under the client lock. */
+static uint64_t evdev_syn_dropped_ns(const struct evdev_client *c, int clk)
+{
+	struct input_dev *dev = c->evdev->dev;
+	uint64_t mono, f;
+
+	spin_lock_irqsave(&dev->event_lock, &f);
+	mono = dev->timestamp_set ? dev->timestamp_ns : timer_get_precise_ns();
+	spin_unlock_irqrestore(&dev->event_lock, f);
+	if (clk == EVDEV_CLK_REAL)
+		mono += timer_realtime_offset_ns(mono);
+	return mono;
+}
+
+/* A SYN_DROPPED record at the end of the queue: the client's view of the
+ * device state is no longer complete. */
+static void evdev_queue_syn_dropped_locked(struct evdev_client *c,
+					   uint64_t ns)
+{
+	unsigned int mask = c->bufsize - 1;
+	struct input_event *ev = &c->buffer[c->head];
+
+	evdev_set_time(ev, ns);
+	ev->type = EV_SYN;
+	ev->code = SYN_DROPPED;
+	ev->value = 0;
+	c->head = (c->head + 1) & mask;
+	if (unlikely(c->head == c->tail)) {
+		/* Drop the queue but keep the SYN_DROPPED record. */
+		c->tail = (c->head - 1) & mask;
+		c->packet_head = c->tail;
+	}
+}
+
+/* Remove every queued event of `type', and the SYN_REPORTs of packets
+ * that become empty that way.  Used when the client reads that type's
+ * state, so the snapshot and the queue agree. */
+static void evdev_flush_type_locked(struct evdev_client *c, unsigned int type)
+{
+	unsigned int mask = c->bufsize - 1;
+	unsigned int rd, wr = c->tail;
+	/* Events kept since the last kept SYN_REPORT.  Starting at 1 keeps a
+	 * SYN_REPORT at the very front, which ends a packet read before. */
+	unsigned int kept = 1;
+
+	c->packet_head = c->tail;
+	for (rd = c->tail; rd != c->head; rd = (rd + 1) & mask) {
+		const struct input_event *ev = &c->buffer[rd];
+		int report = ev->type == EV_SYN && ev->code == SYN_REPORT;
+
+		if (ev->type == type)
+			continue;
+		if (report && kept == 0)
+			continue;
+		if (wr != rd)
+			c->buffer[wr] = *ev;
+		wr = (wr + 1) & mask;
+		kept++;
+		if (report) {
+			kept = 0;
+			c->packet_head = wr;
+		}
+	}
+	c->head = wr;
+}
+
+static unsigned int evdev_mask_cnt(unsigned int type)
+{
+	switch (type) {
+	case EV_SYN:
+		return EV_CNT; // [0]: the mask of types
+	case EV_KEY:
+		return KEY_CNT;
+	case EV_REL:
+		return REL_CNT;
+	case EV_ABS:
+		return ABS_CNT;
+	case EV_MSC:
+		return MSC_CNT;
+	case EV_SW:
+		return SW_CNT;
+	case EV_LED:
+		return LED_CNT;
+	case EV_SND:
+		return SND_CNT;
+	case EV_FF:
+		return FF_CNT;
+	default:
+		return 0;
+	}
+}
+
+/* Masked out by EVIOCSMASK?  EV_SYN never is: packets must stay framed. */
+static int evdev_is_filtered(const struct evdev_client *c, unsigned int type,
+			     unsigned int code)
+{
+	const unsigned long *m;
+	unsigned int cnt;
+
+	if (type == EV_SYN)
+		return 0;
+	m = c->evmasks[0];
+	if (m && type < EV_CNT && !input_test_bit(type, m))
+		return 1;
+	cnt = evdev_mask_cnt(type);
+	if (!cnt || code >= cnt || type >= EV_CNT)
+		return 0;
+	m = c->evmasks[type];
+	return m && !input_test_bit(code, m);
+}
+
+/* Queue one packet for one client; returns whether it completed a packet
+ * the client can read now. */
+static int evdev_pass_client(struct evdev_client *c,
+			     const struct input_value *vals,
+			     unsigned int count, uint64_t mono_ns,
+			     uint64_t real_ns)
+{
+	struct input_event ev;
+	int wake = 0;
+
+	if (c->revoked)
+		return 0;
+	evdev_set_time(&ev, c->clk_type == EVDEV_CLK_REAL ? real_ns : mono_ns);
+	for (unsigned int i = 0; i < count; i++) {
+		const struct input_value *v = &vals[i];
+
+		if (evdev_is_filtered(c, v->type, v->code))
+			continue;
+		if (v->type == EV_SYN && v->code == SYN_REPORT) {
+			/* Everything of the packet was masked out. */
+			if (c->packet_head == c->head)
+				continue;
+			wake = 1;
+		}
+		ev.type = v->type;
+		ev.code = v->code;
+		ev.value = v->value;
+		evdev_queue_event(c, &ev);
+	}
+	return wake;
+}
+
+int evdev_pass_values(struct evdev *e, const struct input_value *vals,
+		      unsigned int count, uint64_t mono_ns)
+{
+	struct evdev_client *c;
+	uint64_t real_ns, f;
+	int wake = 0, grabbed;
+
+	if (!e || !count)
+		return 0;
+	real_ns = mono_ns + timer_realtime_offset_ns(mono_ns);
+	spin_lock_irqsave(&e->client_lock, &f);
+	grabbed = e->grab != NULL;
+	if (grabbed) {
+		wake = evdev_pass_client(e->grab, vals, count, mono_ns,
+					 real_ns);
+	} else {
+		for (c = e->clients; c; c = c->next)
+			wake |= evdev_pass_client(c, vals, count, mono_ns,
+						  real_ns);
+	}
+	spin_unlock_irqrestore(&e->client_lock, f);
+	/* Still under the device's event lock: the node cannot be unlinked
+	 * and freed before this wake is done. */
+	if (wake)
+		evdev_wake(e, EVDEV_POLLIN | EVDEV_POLLRDNORM | EVDEV_POLLOUT |
+				      EVDEV_POLLWRNORM);
+	return grabbed;
+}
+
+// ---------------------------------------------------------------------------
+// Open / release
+// ---------------------------------------------------------------------------
+
+static unsigned int evdev_compute_bufsize(const struct evdev *e)
+{
+	const struct input_dev *dev = e->dev;
+	unsigned int n, size;
+
+	if (e->is_static)
+		return EVDEV_BUILTIN_BUFFER;
+	n = dev->hint_events_per_packet * EVDEV_BUF_PACKETS;
+	if (n < EVDEV_MIN_BUFFER_SIZE)
+		n = EVDEV_MIN_BUFFER_SIZE;
+	if (n > EVDEV_MAX_BUFFER_SIZE)
+		n = EVDEV_MAX_BUFFER_SIZE;
+	for (size = 1; size < n; size <<= 1)
+		;
+	return size;
+}
+
+int evdev_open(int unit, struct evdev_client **out)
+{
+	struct evdev_client *c;
+	struct evdev *e = NULL;
+	uint64_t f;
+	int rc = 0;
+
+	might_sleep();
+	if (!out || unit < 0 || unit >= EVDEV_MINORS)
+		return -ENODEV;
+	evdev_builtin_init();
+
+	spin_lock_irqsave(&g_evdev_table_lock, &f);
+	if (g_evdev_table[unit] &&
+	    __atomic_load_n(&g_evdev_table[unit]->exist, __ATOMIC_ACQUIRE) &&
+	    refcount_inc_not_zero(&g_evdev_table[unit]->refcount))
+		e = g_evdev_table[unit];
+	spin_unlock_irqrestore(&g_evdev_table_lock, f);
+	if (!e)
+		return -ENODEV;
+
+	c = (struct evdev_client *)kcalloc(1, sizeof(*c));
+	if (c) {
+		c->bufsize = evdev_compute_bufsize(e);
+		c->buffer = (struct input_event *)kcalloc(
+			c->bufsize, sizeof(struct input_event));
+	}
+	if (!c || !c->buffer) {
+		kfree(c);
+		evdev_put(e);
+		return -ENOMEM;
+	}
+	c->evdev = e;
+	c->clk_type = EVDEV_CLK_REAL;
+
+	mutex_lock(&e->mutex);
+	if (!e->exist) {
+		rc = -ENODEV;
+	} else {
+		/* The client is attached before the device opens, so it sees
+		 * whatever the device reports from its open() on. */
+		spin_lock_irqsave(&e->client_lock, &f);
+		c->next = e->clients;
+		e->clients = c;
+		spin_unlock_irqrestore(&e->client_lock, f);
+		if (e->open++ == 0) {
+			rc = input_open_device(e->dev);
+			if (rc)
+				e->open--;
+		}
+		if (rc) {
+			struct evdev_client **pp;
+
+			spin_lock_irqsave(&e->client_lock, &f);
+			for (pp = &e->clients; *pp; pp = &(*pp)->next) {
+				if (*pp == c) {
+					*pp = c->next;
+					break;
+				}
+			}
+			spin_unlock_irqrestore(&e->client_lock, f);
+		}
+	}
+	mutex_unlock(&e->mutex);
+
+	if (rc) {
+		kfree(c->buffer);
+		kfree(c);
+		evdev_put(e);
+		return rc;
+	}
+	*out = c;
+	return 0;
+}
+
+void evdev_release(struct evdev_client *c)
+{
+	struct evdev_client **pp;
+	struct evdev *e;
+	uint64_t f;
+
+	might_sleep();
+	if (!c)
+		return;
+	e = c->evdev;
+
+	mutex_lock(&e->mutex);
+	spin_lock_irqsave(&e->client_lock, &f);
+	/* A grab held through this descriptor ends with it, whoever closes
+	 * it -- a descriptor is not always closed by the task that opened
+	 * it, and a grab left behind would swallow every event for good. */
+	if (e->grab == c)
+		e->grab = NULL;
+	for (pp = &e->clients; *pp; pp = &(*pp)->next) {
+		if (*pp == c) {
+			*pp = c->next;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&e->client_lock, f);
+	/* After a disconnect the device was already closed for everybody
+	 * (and `open' reset); only a live node counts its users down. */
+	if (e->exist && !WARN_ON(e->open <= 0) && --e->open == 0)
+		input_close_device(e->dev);
+	mutex_unlock(&e->mutex);
+
+	for (unsigned int i = 0; i < EV_CNT; i++)
+		kfree(c->evmasks[i]);
+	kfree(c->buffer);
+	kfree(c);
+	evdev_put(e);
+}
+
+int evdev_client_unit(const struct evdev_client *c)
+{
+	return c ? c->evdev->minor : -1;
+}
+
+// ---------------------------------------------------------------------------
+// read / write / poll
+// ---------------------------------------------------------------------------
+
+/* SMAP-aware copies of whole, user-range-checked spans.  A zero length
+ * touches nothing and always succeeds. */
+static int evdev_copy_out(void *user_dst, const void *src, size_t len)
+{
+	if (!len)
+		return 0;
+	if (!user_dst || !user_range_ok((uint64_t)user_dst, len))
+		return -EFAULT;
+	smap_disable();
+	kmemcpy(user_dst, src, len);
+	smap_enable();
+	return 0;
+}
+
+static int evdev_copy_in(void *dst, const void *user_src, size_t len)
+{
+	if (!len)
+		return 0;
+	if (!user_src || !user_range_ok((uint64_t)user_src, len))
+		return -EFAULT;
+	smap_disable();
+	kmemcpy(dst, user_src, len);
+	smap_enable();
+	return 0;
+}
+
+static int evdev_zero_out(void *user_dst, size_t len)
+{
+	static const uint8_t zeros[64];
+	size_t off = 0;
+
+	if (!len)
+		return 0;
+	if (!user_dst || !user_range_ok((uint64_t)user_dst, len))
+		return -EFAULT;
+	while (off < len) {
+		size_t chunk = len - off;
+
+		if (chunk > sizeof(zeros))
+			chunk = sizeof(zeros);
+		smap_disable();
+		kmemcpy((uint8_t *)user_dst + off, zeros, chunk);
+		smap_enable();
+		off += chunk;
+	}
+	return 0;
+}
+
+static int evdev_alive(const struct evdev_client *c)
+{
+	return __atomic_load_n(&c->evdev->exist, __ATOMIC_ACQUIRE) &&
+	       !__atomic_load_n(&c->revoked, __ATOMIC_ACQUIRE);
+}
+
+static int evdev_has_packet(const struct evdev_client *c)
+{
+	return __atomic_load_n(&c->packet_head, __ATOMIC_ACQUIRE) !=
+	       __atomic_load_n(&c->tail, __ATOMIC_ACQUIRE);
+}
+
+long evdev_read(struct evdev_client *c, void *user_buf, long bytes,
+		int nonblock)
+{
+	struct input_event burst[EVDEV_READ_BURST];
+	struct evdev *e;
+	task_t *cur = sched_current();
+	uint64_t f;
+
+	BUILD_BUG_ON(sizeof(struct input_event) != 24);
+	if (!c || bytes < 0)
+		return -EINVAL;
+	/* Whole records only (a zero-length read just reports readiness). */
+	if (bytes != 0 && bytes < (long)sizeof(struct input_event))
+		return -EINVAL;
+	e = c->evdev;
+
+	for (;;) {
+		long done = 0;
+
+		if (!evdev_alive(c))
+			return -ENODEV;
+		if (!evdev_has_packet(c) && nonblock)
+			return -EAGAIN;
+		if (bytes == 0)
+			return 0;
+		/* Checked before anything is taken off the queue: a bad
+		 * buffer loses no events. */
+		if (!user_buf ||
+		    !user_range_ok((uint64_t)user_buf, (uint64_t)bytes))
+			return -EFAULT;
+
+		while (done + (long)sizeof(struct input_event) <= bytes) {
+			unsigned int want, got = 0;
+
+			want = (unsigned int)((bytes - done) /
+					      (long)sizeof(struct input_event));
+			if (want > EVDEV_READ_BURST)
+				want = EVDEV_READ_BURST;
+			spin_lock_irqsave(&e->client_lock, &f);
+			while (got < want && c->tail != c->packet_head) {
+				burst[got++] = c->buffer[c->tail];
+				c->tail = (c->tail + 1) & (c->bufsize - 1);
+			}
+			spin_unlock_irqrestore(&e->client_lock, f);
+			if (!got)
+				break;
+			if (evdev_copy_out((uint8_t *)user_buf + done, burst,
+					   got * sizeof(struct input_event)))
+				return -EFAULT;
+			done += (long)(got * sizeof(struct input_event));
+		}
+		if (done)
+			return done;
+		if (nonblock)
+			return -EAGAIN; // another reader of this queue won
+		if (!cur)
+			return -EAGAIN; // no task context: cannot block
+
+		// Park atomically wrt the producer (same protocol as
+		// tty_read): publish BLOCKED + channel, re-check the queue
+		// under the lock, then schedule.
+		cur->wait_channel = (void *)&e->wait_key;
+		task_set_blocked(cur);
+		spin_lock_irqsave(&e->client_lock, &f);
+		if (c->packet_head != c->tail || !evdev_alive(c)) {
+			task_state_t asleep = TASK_BLOCKED;
+
+			/* Un-park by CAS, the way every waker claims: a trace
+			 * stop may have claimed this sleep meanwhile, and a
+			 * plain store ran on straight through it.  Claimed
+			 * first -- woken, or stopped -- the scheduler below
+			 * reconciles. */
+			if (__atomic_compare_exchange_n(&cur->state, &asleep,
+							TASK_READY, false,
+							__ATOMIC_ACQ_REL,
+							__ATOMIC_ACQUIRE)) {
+				cur->wait_channel = NULL;
+				spin_unlock_irqrestore(&e->client_lock, f);
+				continue;
+			}
+		}
+		spin_unlock_irqrestore(&e->client_lock, f);
+		sched_schedule();
+		if (cur->state == TASK_ZOMBIE || cur->has_exited ||
+		    signal_pending(cur))
+			return -EINTR;
+	}
+}
+
+long evdev_write(struct evdev_client *c, const void *user_buf, long bytes)
+{
+	struct input_event ev;
+	struct evdev *e;
+	long done = 0;
+	int rc;
+
+	if (!c || bytes < 0)
+		return -EINVAL;
+	if (bytes > EVDEV_WRITE_MAX)
+		bytes = EVDEV_WRITE_MAX;
+	if (bytes != 0 && bytes < (long)sizeof(struct input_event))
+		return -EINVAL;
+	e = c->evdev;
+	rc = mutex_lock_interruptible(&e->mutex);
+	if (rc)
+		return rc;
+	if (!evdev_alive(c)) {
+		done = -ENODEV;
+		goto out;
+	}
+	while (done + (long)sizeof(ev) <= bytes) {
+		if (evdev_copy_in(&ev, (const uint8_t *)user_buf + done,
+				  sizeof(ev))) {
+			done = -EFAULT;
+			goto out;
+		}
+		done += (long)sizeof(ev);
+		input_inject_event(e->dev, ev.type, ev.code, ev.value);
+	}
+out:
+	mutex_unlock(&e->mutex);
+	return done;
+}
+
+short evdev_poll(struct evdev_client *c, short events)
+{
+	short mask;
+
+	if (!c)
+		return EVDEV_POLLERR;
+	mask = evdev_alive(c) ? (EVDEV_POLLOUT | EVDEV_POLLWRNORM) :
+				(EVDEV_POLLHUP | EVDEV_POLLERR);
+	if (evdev_has_packet(c))
+		mask |= EVDEV_POLLIN | EVDEV_POLLRDNORM;
+	return (short)(mask & (events | EVDEV_POLLHUP | EVDEV_POLLERR));
+}
+
+struct wait_queue_head *evdev_pollq(struct evdev_client *c)
+{
+	return c ? &c->evdev->poll_wq : NULL;
+}
+
+// ---------------------------------------------------------------------------
+// ioctl helpers
+// ---------------------------------------------------------------------------
+
+/* A bitmap of codes 0..maxbit: as many whole words as the bitmap has, cut
+ * to the caller's length.  Returns the bytes copied. */
+static int evdev_bits_to_user(void *argp, const unsigned long *bits,
+			      unsigned int maxbit, unsigned int maxlen)
+{
+	unsigned int len = INPUT_BITS_TO_LONGS(maxbit) * sizeof(unsigned long);
+
+	if (len > maxlen)
+		len = maxlen;
+	return evdev_copy_out(argp, bits, len) ? -EFAULT : (int)len;
+}
+
+/* A string with its NUL, cut to the caller's length; -ENOENT for a device
+ * that does not have the property at all. */
+static int evdev_str_to_user(void *argp, const char *str, unsigned int maxlen)
+{
+	unsigned int len;
+
+	if (!str)
+		return -ENOENT;
+	len = (unsigned int)kstrlen(str) + 1;
+	if (len > maxlen)
+		len = maxlen;
+	return evdev_copy_out(argp, str, len) ? -EFAULT : (int)len;
+}
+
+static int evdev_handle_eviocgbit(struct input_dev *dev, unsigned int type,
+				  unsigned int size, void *argp)
+{
+	unsigned long snap[INPUT_BITS_TO_LONGS(KEY_CNT)];
+	const unsigned long *bits;
+	unsigned int max;
+	uint64_t f;
+
+	switch (type) {
+	case 0:
+		bits = dev->evbit, max = EV_MAX;
+		break;
+	case EV_KEY:
+		bits = dev->keybit, max = KEY_MAX;
+		break;
+	case EV_REL:
+		bits = dev->relbit, max = REL_MAX;
+		break;
+	case EV_ABS:
+		bits = dev->absbit, max = ABS_MAX;
+		break;
+	case EV_MSC:
+		bits = dev->mscbit, max = MSC_MAX;
+		break;
+	case EV_LED:
+		bits = dev->ledbit, max = LED_MAX;
+		break;
+	case EV_SND:
+		bits = dev->sndbit, max = SND_MAX;
+		break;
+	case EV_FF:
+		bits = dev->ffbit, max = FF_MAX;
+		break;
+	case EV_SW:
+		bits = dev->swbit, max = SW_MAX;
+		break;
+	default:
+		return -EINVAL;
+	}
+	/* A snapshot: the built-in mouse can turn absolute at run time. */
+	spin_lock_irqsave(&dev->event_lock, &f);
+	kmemcpy(snap, bits, INPUT_BITS_TO_LONGS(max) * sizeof(unsigned long));
+	spin_unlock_irqrestore(&dev->event_lock, f);
+	return evdev_bits_to_user(argp, snap, max, size);
+}
+
+/* EVIOCGKEY / EVIOCGLED / EVIOCGSND / EVIOCGSW: the state bitmap, with the
+ * queued events of that type removed from the client's queue so the two
+ * agree.  When the copy fails the client is told its view is incomplete. */
+static int evdev_handle_get_state(struct evdev_client *c,
+				  struct input_dev *dev, unsigned int type,
+				  unsigned int size, void *argp)
+{
+	unsigned long snap[INPUT_BITS_TO_LONGS(KEY_CNT)];
+	const unsigned long *bits;
+	unsigned int max;
+	uint64_t f, cf;
+	int rc;
+
+	switch (type) {
+	case EV_KEY:
+		bits = dev->key, max = KEY_MAX;
+		break;
+	case EV_LED:
+		bits = dev->led, max = LED_MAX;
+		break;
+	case EV_SND:
+		bits = dev->snd, max = SND_MAX;
+		break;
+	default:
+		bits = dev->sw, max = SW_MAX;
+		break;
+	}
+	spin_lock_irqsave(&dev->event_lock, &f);
+	spin_lock_irqsave(&c->evdev->client_lock, &cf);
+	kmemcpy(snap, bits, INPUT_BITS_TO_LONGS(max) * sizeof(unsigned long));
+	evdev_flush_type_locked(c, type);
+	spin_unlock_irqrestore(&c->evdev->client_lock, cf);
+	spin_unlock_irqrestore(&dev->event_lock, f);
+
+	rc = evdev_bits_to_user(argp, snap, max, size);
+	if (rc < 0) {
+		uint64_t ns = evdev_syn_dropped_ns(c, c->clk_type);
+
+		spin_lock_irqsave(&c->evdev->client_lock, &cf);
+		evdev_queue_syn_dropped_locked(c, ns);
+		spin_unlock_irqrestore(&c->evdev->client_lock, cf);
+	}
+	return rc;
+}
+
+/* EVIOCGMTSLOTS: { u32 code; s32 values[]; } -- the code in, one value per
+ * slot out, as many slots as the buffer has room for. */
+static int evdev_handle_mt_request(struct input_dev *dev, unsigned int size,
+				   void *argp)
+{
+	int32_t values[EVDEV_MT_CHUNK];
+	uint32_t code;
+	int max_slots, done = 0;
+
+	/* Without room for the code the request is malformed (rather than
+	 * a buffer of "minus one" slots). */
+	if (size < sizeof(uint32_t))
+		return -EINVAL;
+	if (evdev_copy_in(&code, argp, sizeof(code)))
+		return -EFAULT;
+	if (!dev->mt || !input_is_mt_value((int)code))
+		return -EINVAL;
+	max_slots = (int)((size - sizeof(uint32_t)) / sizeof(int32_t));
+	while (done < max_slots) {
+		int want = max_slots - done < EVDEV_MT_CHUNK ?
+				   max_slots - done :
+				   EVDEV_MT_CHUNK;
+		int n = input_mt_get_values(dev, code, done, values, want);
+
+		if (n < 0)
+			return n;
+		if (n == 0)
+			break;
+		if (evdev_copy_out((uint8_t *)argp + sizeof(uint32_t) +
+					   (size_t)done * sizeof(int32_t),
+				   values, (size_t)n * sizeof(int32_t)))
+			return -EFAULT;
+		done += n;
+	}
+	return 0;
+}
+
+static int evdev_grab(struct evdev *e, struct evdev_client *c)
+{
+	uint64_t f;
+	int rc = 0;
+
+	spin_lock_irqsave(&e->client_lock, &f);
+	if (e->grab)
+		rc = -EBUSY;
+	else
+		e->grab = c;
+	spin_unlock_irqrestore(&e->client_lock, f);
+	return rc;
+}
+
+static int evdev_ungrab(struct evdev *e, struct evdev_client *c)
+{
+	uint64_t f;
+	int rc = 0;
+
+	spin_lock_irqsave(&e->client_lock, &f);
+	if (e->grab != c)
+		rc = -EINVAL;
+	else
+		e->grab = NULL;
+	spin_unlock_irqrestore(&e->client_lock, f);
+	return rc;
+}
+
+static int evdev_revoke(struct evdev *e, struct evdev_client *c)
+{
+	uint64_t f;
+
+	spin_lock_irqsave(&e->client_lock, &f);
+	__atomic_store_n(&c->revoked, 1, __ATOMIC_RELEASE);
+	if (e->grab == c)
+		e->grab = NULL;
+	spin_unlock_irqrestore(&e->client_lock, f);
+	evdev_wake(e, EVDEV_POLLHUP | EVDEV_POLLERR);
+	return 0;
+}
+
+static int evdev_set_clk_type(struct evdev_client *c, int clkid)
+{
+	uint64_t f, ns;
+	int t;
+
+	switch (clkid) {
+	case CLOCK_REALTIME:
+		t = EVDEV_CLK_REAL;
+		break;
+	case CLOCK_MONOTONIC:
+		t = EVDEV_CLK_MONO;
+		break;
+	case CLOCK_BOOTTIME:
+		t = EVDEV_CLK_BOOT;
+		break;
+	default:
+		return -EINVAL;
+	}
+	if (c->clk_type == t)
+		return 0;
+	/* Read before the client lock (the device's lock comes first);
+	 * the clock is only changed here, under the node's mutex. */
+	ns = evdev_syn_dropped_ns(c, t);
+	spin_lock_irqsave(&c->evdev->client_lock, &f);
+	c->clk_type = t;
+	/* Queued events carry the other clock's time: drop them, and say
+	 * so. */
+	if (c->head != c->tail) {
+		c->packet_head = c->head = c->tail;
+		evdev_queue_syn_dropped_locked(c, ns);
+	}
+	spin_unlock_irqrestore(&c->evdev->client_lock, f);
+	return 0;
+}
+
+/* Bytes of a mask of `cnt' codes as it travels between the client and the
+ * kernel: whole words up to the highest code (cnt - 1), cut to `maxlen'. */
+static unsigned int evdev_mask_xfer(unsigned int cnt, unsigned int maxlen)
+{
+	unsigned int len = INPUT_BITS_TO_LONGS(cnt - 1) * sizeof(unsigned long);
+
+	return len > maxlen ? maxlen : len;
+}
+
+/* EVIOCGMASK: the client's mask of one type; all bits set (every byte 0xff)
+ * when it has none.  Unknown types read as nothing; a caller's buffer
+ * larger than the mask is zero-filled (forward compatibility). */
+static int evdev_get_mask(struct evdev_client *c, unsigned int type,
+			  void *codes, uint32_t codes_size)
+{
+	unsigned long snap[INPUT_BITS_TO_LONGS(KEY_CNT)];
+	unsigned int cnt = evdev_mask_cnt(type);
+	unsigned int size = INPUT_BITS_TO_LONGS(cnt) * sizeof(unsigned long);
+	unsigned int xfer = codes_size < size ? codes_size : size;
+	uint64_t f;
+
+	if (cnt > 0) {
+		unsigned int len = xfer;
+
+		spin_lock_irqsave(&c->evdev->client_lock, &f);
+		if (c->evmasks[type]) {
+			len = evdev_mask_xfer(cnt, xfer);
+			kmemcpy(snap, c->evmasks[type], len);
+		} else {
+			kmemset(snap, 0xff, xfer);
+		}
+		spin_unlock_irqrestore(&c->evdev->client_lock, f);
+		if (evdev_copy_out(codes, snap, len))
+			return -EFAULT;
+	}
+	if (xfer < codes_size &&
+	    evdev_zero_out((uint8_t *)codes + xfer, codes_size - xfer))
+		return -EFAULT;
+	return 0;
+}
+
+/* EVIOCSMASK: replace the client's mask of one type.  Unknown types are
+ * accepted and ignored, and so is the part of a caller's buffer beyond
+ * the mask (forward compatibility); the buffer is whole words. */
+static int evdev_set_mask(struct evdev_client *c, unsigned int type,
+			  const void *codes, uint32_t codes_size)
+{
+	unsigned int cnt = evdev_mask_cnt(type);
+	unsigned int size = INPUT_BITS_TO_LONGS(cnt) * sizeof(unsigned long);
+	unsigned long *mask, *old;
+	uint64_t f;
+
+	if (!cnt)
+		return 0;
+	mask = (unsigned long *)kcalloc(1, size);
+	if (!mask)
+		return -ENOMEM;
+	if (codes_size % sizeof(unsigned long)) {
+		kfree(mask);
+		return -EINVAL;
+	}
+	if (evdev_copy_in(mask, codes, evdev_mask_xfer(cnt, codes_size))) {
+		kfree(mask);
+		return -EFAULT;
+	}
+	spin_lock_irqsave(&c->evdev->client_lock, &f);
+	old = c->evmasks[type];
+	c->evmasks[type] = mask;
+	spin_unlock_irqrestore(&c->evdev->client_lock, f);
+	kfree(old);
+	return 0;
+}
+
+/* EVIOCGKEYCODE / EVIOCSKEYCODE: the legacy form is { scancode, keycode }
+ * as two unsigned ints, the _V2 form a struct input_keymap_entry. */
+static int evdev_handle_get_keycode(struct input_dev *dev, void *argp)
+{
+	struct input_keymap_entry ke;
+	unsigned int scancode;
+	int rc;
+
+	kmemset(&ke, 0, sizeof(ke));
+	ke.len = sizeof(unsigned int);
+	if (evdev_copy_in(&scancode, argp, sizeof(scancode)))
+		return -EFAULT;
+	kmemcpy(ke.scancode, &scancode, sizeof(scancode));
+	rc = input_get_keycode(dev, &ke);
+	if (rc)
+		return rc;
+	if (evdev_copy_out((unsigned int *)argp + 1, &ke.keycode,
+			   sizeof(ke.keycode)))
+		return -EFAULT;
+	return 0;
+}
+
+static int evdev_handle_get_keycode_v2(struct input_dev *dev, void *argp)
+{
+	struct input_keymap_entry ke;
+	int rc;
+
+	if (evdev_copy_in(&ke, argp, sizeof(ke)))
+		return -EFAULT;
+	rc = input_get_keycode(dev, &ke);
+	if (rc)
+		return rc;
+	if (evdev_copy_out(argp, &ke, sizeof(ke)))
+		return -EFAULT;
+	return 0;
+}
+
+static int evdev_handle_set_keycode(struct input_dev *dev, void *argp)
+{
+	struct input_keymap_entry ke;
+	unsigned int scancode;
+
+	kmemset(&ke, 0, sizeof(ke));
+	ke.len = sizeof(unsigned int);
+	if (evdev_copy_in(&scancode, argp, sizeof(scancode)))
+		return -EFAULT;
+	kmemcpy(ke.scancode, &scancode, sizeof(scancode));
+	if (evdev_copy_in(&ke.keycode, (unsigned int *)argp + 1,
+			  sizeof(ke.keycode)))
+		return -EFAULT;
+	return input_set_keycode(dev, &ke);
+}
+
+static int evdev_handle_set_keycode_v2(struct input_dev *dev, void *argp)
+{
+	struct input_keymap_entry ke;
+
+	if (evdev_copy_in(&ke, argp, sizeof(ke)))
+		return -EFAULT;
+	if (ke.len > sizeof(ke.scancode))
+		return -EINVAL;
+	return input_set_keycode(dev, &ke);
+}
+
+#define EVDEV_IOC_NR(req) ((unsigned int)((req) >> _INPUT_IOC_NRSHIFT) & _INPUT_IOC_NRMASK)
+#define EVDEV_IOC_TYPE(req) \
+	((unsigned int)((req) >> _INPUT_IOC_TYPESHIFT) & _INPUT_IOC_TYPEMASK)
+#define EVDEV_IOC_SIZE(req) \
+	((unsigned int)((req) >> _INPUT_IOC_SIZESHIFT) & _INPUT_IOC_SIZEMASK)
+#define EVDEV_IOC_DIR(req) \
+	((unsigned int)((req) >> _INPUT_IOC_DIRSHIFT) & _INPUT_IOC_DIRMASK)
+/* The request with its size field cleared: matches every length of a
+ * variable-length request. */
+#define EVDEV_IOC_NOSIZE(req) \
+	((req) & ~((unsigned long)_INPUT_IOC_SIZEMASK << _INPUT_IOC_SIZESHIFT))
+
+static int evdev_do_ioctl(struct evdev_client *c, struct evdev *e,
+			  struct input_dev *dev, unsigned long req, void *argp)
+{
+	unsigned int size = EVDEV_IOC_SIZE(req);
+	unsigned int nr = EVDEV_IOC_NR(req);
+	uint64_t f;
+
+	/* Fixed-length requests. */
+	switch (req) {
+	case EVIOCGVERSION: {
+		int v = EV_VERSION;
+
+		return evdev_copy_out(argp, &v, sizeof(v));
+	}
+	case EVIOCGID: {
+		struct input_id id = dev->id;
+
+		return evdev_copy_out(argp, &id, sizeof(id));
+	}
+	case EVIOCGREP: {
+		unsigned int rep[2];
+
+		if (!input_test_bit(EV_REP, dev->evbit))
+			return -ENOSYS;
+		spin_lock_irqsave(&dev->event_lock, &f);
+		rep[0] = (unsigned int)dev->rep[REP_DELAY];
+		rep[1] = (unsigned int)dev->rep[REP_PERIOD];
+		spin_unlock_irqrestore(&dev->event_lock, f);
+		return evdev_copy_out(argp, rep, sizeof(rep));
+	}
+	case EVIOCSREP: {
+		unsigned int rep[2];
+
+		if (!input_test_bit(EV_REP, dev->evbit))
+			return -ENOSYS;
+		if (evdev_copy_in(rep, argp, sizeof(rep)))
+			return -EFAULT;
+		input_inject_event(dev, EV_REP, REP_DELAY, (int)rep[0]);
+		input_inject_event(dev, EV_REP, REP_PERIOD, (int)rep[1]);
+		return 0;
+	}
+	case EVIOCRMFF:
+		/* No device here stores effects: nothing to erase. */
+		return input_test_bit(EV_FF, dev->evbit) ? -EINVAL : -ENOSYS;
+	case EVIOCGEFFECTS: {
+		int n = 0;
+
+		return evdev_copy_out(argp, &n, sizeof(n));
+	}
+	case EVIOCGRAB:
+		/* The argument is the flag itself, not a pointer. */
+		return argp ? evdev_grab(e, c) : evdev_ungrab(e, c);
+	case EVIOCREVOKE:
+		return argp ? -EINVAL : evdev_revoke(e, c);
+	case EVIOCGMASK:
+	case EVIOCSMASK: {
+		struct input_mask m;
+
+		if (evdev_copy_in(&m, argp, sizeof(m)))
+			return -EFAULT;
+		if (req == EVIOCGMASK)
+			return evdev_get_mask(c, m.type,
+					      (void *)(unsigned long)m.codes_ptr,
+					      m.codes_size);
+		return evdev_set_mask(c, m.type,
+				      (const void *)(unsigned long)m.codes_ptr,
+				      m.codes_size);
+	}
+	case EVIOCSCLOCKID: {
+		int id;
+
+		if (evdev_copy_in(&id, argp, sizeof(id)))
+			return -EFAULT;
+		return evdev_set_clk_type(c, id);
+	}
+	case EVIOCGKEYCODE:
+		return evdev_handle_get_keycode(dev, argp);
+	case EVIOCSKEYCODE:
+		return evdev_handle_set_keycode(dev, argp);
+	case EVIOCGKEYCODE_V2:
+		return evdev_handle_get_keycode_v2(dev, argp);
+	case EVIOCSKEYCODE_V2:
+		return evdev_handle_set_keycode_v2(dev, argp);
+	default:
+		break;
+	}
+
+	/* Variable-length requests. */
+	switch (EVDEV_IOC_NOSIZE(req)) {
+	case EVDEV_IOC_NOSIZE(EVIOCGPROP(0)): {
+		unsigned long snap[INPUT_BITS_TO_LONGS(INPUT_PROP_CNT)];
+
+		spin_lock_irqsave(&dev->event_lock, &f);
+		kmemcpy(snap, dev->propbit, sizeof(snap));
+		spin_unlock_irqrestore(&dev->event_lock, f);
+		return evdev_bits_to_user(argp, snap, INPUT_PROP_MAX, size);
+	}
+	case EVDEV_IOC_NOSIZE(EVIOCGMTSLOTS(0)):
+		return evdev_handle_mt_request(dev, size, argp);
+	case EVDEV_IOC_NOSIZE(EVIOCGKEY(0)):
+		return evdev_handle_get_state(c, dev, EV_KEY, size, argp);
+	case EVDEV_IOC_NOSIZE(EVIOCGLED(0)):
+		return evdev_handle_get_state(c, dev, EV_LED, size, argp);
+	case EVDEV_IOC_NOSIZE(EVIOCGSND(0)):
+		return evdev_handle_get_state(c, dev, EV_SND, size, argp);
+	case EVDEV_IOC_NOSIZE(EVIOCGSW(0)):
+		return evdev_handle_get_state(c, dev, EV_SW, size, argp);
+	case EVDEV_IOC_NOSIZE(EVIOCGNAME(0)):
+		return evdev_str_to_user(argp, dev->name, size);
+	case EVDEV_IOC_NOSIZE(EVIOCGPHYS(0)):
+		return evdev_str_to_user(argp, dev->phys, size);
+	case EVDEV_IOC_NOSIZE(EVIOCGUNIQ(0)):
+		return evdev_str_to_user(argp, dev->uniq, size);
+	case EVDEV_IOC_NOSIZE(EVIOCSFF): {
+		struct ff_effect effect;
+
+		/* An effect of another layout cannot be read: -EFAULT, as a
+		 * failed copy. */
+		if (size != sizeof(effect))
+			return -EFAULT;
+		if (evdev_copy_in(&effect, argp, sizeof(effect)))
+			return -EFAULT;
+		return -ENOSYS; // nothing here plays effects
+	}
+	default:
+		break;
+	}
+
+	/* Requests that carry a number in their nr field. */
+	if (EVDEV_IOC_TYPE(req) != 'E')
+		return -EINVAL;
+	if (EVDEV_IOC_DIR(req) == _INPUT_IOC_READ) {
+		if ((nr & ~(unsigned int)EV_MAX) == 0x20) // EVIOCGBIT(ev, len)
+			return evdev_handle_eviocgbit(dev, nr & EV_MAX, size,
+						      argp);
+		if ((nr & ~(unsigned int)ABS_MAX) == 0x40) { // EVIOCGABS(abs)
+			struct input_absinfo abs;
+			unsigned int len = size < sizeof(abs) ? size :
+								(unsigned int)sizeof(abs);
+			int has_abs;
+
+			spin_lock_irqsave(&dev->event_lock, &f);
+			has_abs = input_test_bit(EV_ABS, dev->evbit);
+			abs = dev->absinfo[nr & ABS_MAX];
+			spin_unlock_irqrestore(&dev->event_lock, f);
+			/* A device without absolute axes has no axis
+			 * parameters to ask about. */
+			if (!has_abs)
+				return -EINVAL;
+			return evdev_copy_out(argp, &abs, len);
+		}
+	}
+	if (EVDEV_IOC_DIR(req) == _INPUT_IOC_WRITE) {
+		if ((nr & ~(unsigned int)ABS_MAX) == 0xc0) { // EVIOCSABS(abs)
+			struct input_absinfo abs = { 0, 0, 0, 0, 0, 0 };
+			unsigned int axis = nr & ABS_MAX;
+			unsigned int len = size < sizeof(abs) ? size :
+								(unsigned int)sizeof(abs);
+
+			if (!input_test_bit(EV_ABS, dev->evbit))
+				return -EINVAL;
+			if (evdev_copy_in(&abs, argp, len))
+				return -EFAULT;
+			if (size < sizeof(abs))
+				abs.resolution = 0; // an older, shorter layout
+			/* The slot count is fixed at registration. */
+			if (axis == ABS_MT_SLOT)
+				return -EINVAL;
+			spin_lock_irqsave(&dev->event_lock, &f);
+			dev->absinfo[axis] = abs;
+			spin_unlock_irqrestore(&dev->event_lock, f);
+			return 0;
+		}
+	}
+	return -EINVAL;
+}
+
+int evdev_ioctl(struct evdev_client *c, unsigned long req, void *argp)
+{
+	struct evdev *e;
+	int rc;
+
+	if (!c)
+		return -EINVAL;
+	e = c->evdev;
+	rc = mutex_lock_interruptible(&e->mutex);
+	if (rc)
+		return rc;
+	/* Under the mutex: the device cannot be taken away while a request
+	 * reads it, and after that every request answers ENODEV. */
+	if (!evdev_alive(c))
+		rc = -ENODEV;
+	else
+		rc = evdev_do_ioctl(c, e, e->dev, req, argp);
+	mutex_unlock(&e->mutex);
+	return rc;
+}
+
+// ---------------------------------------------------------------------------
+// Producer entry points of the built-in devices (interrupt context)
+// ---------------------------------------------------------------------------
 
 // Set-1 extended (0xE0-prefixed) scancode -> key code
 static uint16_t evdev_e0_keycode(uint8_t code)
@@ -143,178 +1596,6 @@ static uint16_t evdev_e0_keycode(uint8_t code)
 	}
 }
 
-/* The poll wait queue of one unit, for poll()/select() to register on.
- * NULL when the unit number is out of range. */
-struct wait_queue_head *evdev_pollq(int unit)
-{
-	if (unit < 0 || unit >= EVDEV_NUM_UNITS)
-		return NULL;
-	return &g_evdev[unit].poll_wq;
-}
-
-static void evdev_init_devices(void)
-{
-	evdev_dev_t *kbd = &g_evdev[EVDEV_UNIT_KEYBOARD];
-	evdev_dev_t *mou = &g_evdev[EVDEV_UNIT_MOUSE];
-	unsigned i;
-
-	if (g_evdev_initialized)
-		return;
-
-	spinlock_init(&kbd->lock, "evdev_kbd");
-	for (i = 0; i < EVDEV_NUM_UNITS; i++)
-		wq_head_init(&g_evdev[i].poll_wq, "evdev-poll");
-	kbd->name = "LikeOS Keyboard";
-	/* Physical path in the conventional serio form; a display server uses
-	 * it to tell devices apart and to match configuration rules. */
-	kbd->phys = "isa0060/serio0/input0";
-	kbd->clock_id = CLOCK_REALTIME;
-	/* The keyboard reports the three standard lock LEDs.  Their state is
-	 * tracked but not driven yet, so EVIOCGLED reads them all unlit. */
-	bit_set(kbd->evbits, EV_LED);
-	bit_set(kbd->ledbits, LED_NUML);
-	bit_set(kbd->ledbits, LED_CAPSL);
-	bit_set(kbd->ledbits, LED_SCROLLL);
-	kbd->id.bustype = BUS_I8042;
-	kbd->id.vendor = 0x0001;
-	kbd->id.product = 0x0001;
-	kbd->id.version = 0x0100;
-	bit_set(kbd->evbits, EV_SYN);
-	bit_set(kbd->evbits, EV_KEY);
-	// Base set-1 make codes map 1:1 onto key codes 1..88, plus the
-	// extended navigation/modifier block.
-	for (i = KEY_ESC; i <= KEY_F12; i++)
-		bit_set(kbd->keybits, i);
-	for (i = KEY_KPENTER; i <= KEY_DELETE; i++)
-		bit_set(kbd->keybits, i);
-	bit_set(kbd->keybits, KEY_KPEQUAL);
-	bit_set(kbd->keybits, KEY_PAUSE);
-	bit_set(kbd->keybits, KEY_RO);
-	bit_set(kbd->keybits, KEY_HENKAN);
-	bit_set(kbd->keybits, KEY_KATAKANAHIRAGANA);
-	bit_set(kbd->keybits, KEY_MUHENKAN);
-	bit_set(kbd->keybits, KEY_KPCOMMA);
-	bit_set(kbd->keybits, KEY_HANGEUL);
-	bit_set(kbd->keybits, KEY_HANJA);
-	bit_set(kbd->keybits, KEY_YEN);
-	bit_set(kbd->keybits, KEY_LEFTMETA);
-	bit_set(kbd->keybits, KEY_RIGHTMETA);
-	bit_set(kbd->keybits, KEY_COMPOSE);
-
-	spinlock_init(&mou->lock, "evdev_mouse");
-	mou->name = "LikeOS Mouse";
-	mou->phys = "isa0060/serio1/input0";
-	mou->clock_id = CLOCK_REALTIME;
-	/* INPUT_PROP_POINTER: motion is relative and drives a cursor, rather
-	 * than mapping onto screen coordinates the way a touchscreen does. */
-	bit_set(mou->propbits, INPUT_PROP_POINTER);
-	mou->id.bustype = BUS_I8042;
-	mou->id.vendor = 0x0001;
-	mou->id.product = 0x0002;
-	mou->id.version = 0x0100;
-	bit_set(mou->evbits, EV_SYN);
-	bit_set(mou->evbits, EV_KEY);
-	bit_set(mou->evbits, EV_REL);
-	bit_set(mou->keybits, BTN_LEFT);
-	bit_set(mou->keybits, BTN_RIGHT);
-	bit_set(mou->keybits, BTN_MIDDLE);
-	bit_set(mou->keybits, BTN_SIDE);
-	bit_set(mou->keybits, BTN_EXTRA);
-	bit_set(mou->relbits, REL_X);
-	bit_set(mou->relbits, REL_Y);
-	bit_set(mou->relbits, REL_WHEEL);
-	bit_set(mou->relbits, REL_HWHEEL);
-
-	__asm__ volatile("" ::: "memory");
-	g_evdev_initialized = 1;
-}
-
-static void evdev_timestamp(evdev_dev_t *dev, struct input_event *ev)
-{
-	uint64_t ns = timer_get_precise_ns();
-
-	/* CLOCK_MONOTONIC is time since boot; CLOCK_REALTIME adds the wall
-	 * clock's offset.  Both come from the same counter, so events stay
-	 * ordered whichever a client picks. */
-	if (!dev || dev->clock_id != CLOCK_MONOTONIC)
-		ns += timer_realtime_offset_ns(ns);
-	ev->time.tv_sec = (int64_t)(ns / 1000000000ULL);
-	ev->time.tv_usec = (int64_t)((ns % 1000000000ULL) / 1000ULL);
-}
-
-// Queue one event; caller holds dev->lock.  Interrupt-context safe:
-// no prints, no allocation, no sleeping.
-static void evdev_queue_locked(evdev_dev_t *dev, uint16_t type, uint16_t code,
-			       int32_t value)
-{
-	struct input_event *ev;
-
-	if (dev->count == EVDEV_RING_SIZE) {
-		// Overflow: drop everything and leave a SYN_DROPPED marker so
-		// clients know to re-sync their state (standard semantics).
-		dev->head = 0;
-		dev->tail = 0;
-		dev->count = 0;
-		dev->dropped++;
-		ev = &dev->ring[dev->head];
-		evdev_timestamp(dev, ev);
-		ev->type = EV_SYN;
-		ev->code = SYN_DROPPED;
-		ev->value = 0;
-		dev->head = (dev->head + 1) % EVDEV_RING_SIZE;
-		dev->count++;
-	}
-	ev = &dev->ring[dev->head];
-	evdev_timestamp(dev, ev);
-	ev->type = type;
-	ev->code = code;
-	ev->value = value;
-	dev->head = (dev->head + 1) % EVDEV_RING_SIZE;
-	dev->count++;
-}
-
-static void evdev_wake_readers(evdev_dev_t *dev)
-{
-	extern void poll_notify_wq(struct wait_queue_head *);
-
-	sched_wake_channel((void *)&dev->wq);
-	/* Only the tasks polling THIS device.  The display server polls the
-	 * keyboard and the mouse as separate descriptors, and a mouse event
-	 * has no business waking anything else on the machine. */
-	poll_notify_wq(&dev->poll_wq);
-}
-
-// Emit a key event with automatic press/release/repeat value derivation.
-static void evdev_report_key(evdev_dev_t *dev, uint16_t code, int pressed)
-{
-	uint64_t f;
-	int32_t value;
-
-	if (code == KEY_RESERVED || code > KEY_MAX)
-		return;
-	spin_lock_irqsave(&dev->lock, &f);
-	if (pressed) {
-		value = bit_test(dev->key_state, code) ? 2 : 1; // repeat?
-		bit_set(dev->key_state, code);
-	} else {
-		if (!bit_test(dev->key_state, code)) {
-			// Release without press (lost sync): drop silently.
-			spin_unlock_irqrestore(&dev->lock, f);
-			return;
-		}
-		value = 0;
-		bit_clear(dev->key_state, code);
-	}
-	evdev_queue_locked(dev, EV_KEY, code, value);
-	evdev_queue_locked(dev, EV_SYN, SYN_REPORT, 0);
-	spin_unlock_irqrestore(&dev->lock, f);
-	evdev_wake_readers(dev);
-}
-
-// ---------------------------------------------------------------------------
-// Producer entry points (called from the keyboard/mouse interrupt paths)
-// ---------------------------------------------------------------------------
-
 // Set-1 make codes above 0x58 (no prefix) -> key codes: the keys of
 // Japanese, Korean and Brazilian keyboards.
 static uint16_t evdev_high_keycode(uint8_t code)
@@ -343,17 +1624,37 @@ static uint16_t evdev_high_keycode(uint8_t code)
 	}
 }
 
+/* One key edge as its own packet: press (1), autorepeat (2: a press while
+ * the key is already down) or release (0; one without a press is dropped
+ * by the core). */
+static void evdev_builtin_key(struct input_dev *dev, unsigned int code,
+			      int pressed)
+{
+	uint64_t f;
+	int value;
+
+	if (code == KEY_RESERVED || code > KEY_MAX)
+		return;
+	spin_lock_irqsave(&dev->event_lock, &f);
+	if (pressed)
+		value = input_test_bit(code, dev->key) ? 2 : 1;
+	else
+		value = 0;
+	input_handle_event_locked(dev, EV_KEY, code, value);
+	input_handle_event_locked(dev, EV_SYN, SYN_REPORT, 0);
+	spin_unlock_irqrestore(&dev->event_lock, f);
+}
+
 int evdev_feed_keyboard(uint8_t scan_code)
 {
 	static int e0_prefix; // producer-side prefix state (IRQ serialised)
 	static int e1_left; // bytes still to come of an 0xE1 sequence
 	static uint8_t e1_first;
-	evdev_dev_t *dev = &g_evdev[EVDEV_UNIT_KEYBOARD];
+	struct input_dev *dev = &g_kbd_dev;
 	uint16_t code;
 	int pressed;
 
-	if (!g_evdev_initialized)
-		evdev_init_devices();
+	evdev_builtin_init();
 
 	if (scan_code == 0xE0) {
 		e0_prefix = 1;
@@ -371,7 +1672,7 @@ int evdev_feed_keyboard(uint8_t scan_code)
 			return evdev_kbd_grabbed();
 		}
 		if ((e1_first & 0x7F) == 0x1D && (scan_code & 0x7F) == 0x45)
-			evdev_report_key(dev, KEY_PAUSE, !(scan_code & 0x80));
+			evdev_builtin_key(dev, KEY_PAUSE, !(scan_code & 0x80));
 		return evdev_kbd_grabbed();
 	}
 	pressed = !(scan_code & 0x80);
@@ -381,599 +1682,157 @@ int evdev_feed_keyboard(uint8_t scan_code)
 	} else if (scan_code == 0xF1 || scan_code == 0xF2) {
 		// Hanja / Hangul: a press with no release code.
 		code = evdev_high_keycode(scan_code & 0x7F);
-		evdev_report_key(dev, code, 1);
+		evdev_builtin_key(dev, code, 1);
 		pressed = 0;
 	} else {
 		code = scan_code & 0x7F; // set-1 make codes == key codes
 		if (code > 0x58)
 			code = evdev_high_keycode((uint8_t)code);
 	}
-	evdev_report_key(dev, code, pressed);
+	evdev_builtin_key(dev, code, pressed);
 	return evdev_kbd_grabbed();
 }
 
-// Button edges as EV_KEY events.  The state is the device's, whichever
-// source reports: the producers are serialised by the mouse driver.
-static void evdev_mouse_buttons(evdev_dev_t *dev, uint8_t buttons)
+// Button edges as EV_KEY events, each its own packet.  The state is the
+// device's, whichever source reports: the producers are serialised by the
+// mouse driver.
+static void evdev_mouse_buttons(struct input_dev *dev, uint8_t buttons)
 {
 	static uint8_t last_buttons;
 	uint8_t changed = buttons ^ last_buttons;
 
 	if (changed & 0x01)
-		evdev_report_key(dev, BTN_LEFT, buttons & 0x01);
+		evdev_builtin_key(dev, BTN_LEFT, buttons & 0x01);
 	if (changed & 0x02)
-		evdev_report_key(dev, BTN_RIGHT, buttons & 0x02);
+		evdev_builtin_key(dev, BTN_RIGHT, buttons & 0x02);
 	if (changed & 0x04)
-		evdev_report_key(dev, BTN_MIDDLE, buttons & 0x04);
+		evdev_builtin_key(dev, BTN_MIDDLE, buttons & 0x04);
 	last_buttons = buttons;
 }
 
-// Move an absolute axis to `value' (clamped), queueing the event when it
-// changed; returns whether it did.  Caller holds dev->lock.
-static int evdev_abs_move_locked(evdev_dev_t *dev, unsigned axis,
-				 int64_t value)
+// Move an absolute axis to `value' (clamped to its range); the core drops
+// the event when the position does not change.  Caller holds the event lock.
+static void evdev_abs_move_locked(struct input_dev *dev, unsigned int axis,
+				  int64_t value)
 {
-	struct input_absinfo *a = &dev->abs[axis];
+	const struct input_absinfo *a = &dev->absinfo[axis];
 
 	if (value < a->minimum)
 		value = a->minimum;
 	if (value > a->maximum)
 		value = a->maximum;
-	if ((int32_t)value == a->value)
-		return 0;
-	a->value = (int32_t)value;
-	evdev_queue_locked(dev, EV_ABS, (uint16_t)(ABS_X + axis), a->value);
-	return 1;
+	input_handle_event_locked(dev, EV_ABS, axis, (int)value);
 }
 
 void evdev_mouse_set_absolute(int32_t max, int screen_w, int screen_h)
 {
-	evdev_dev_t *dev = &g_evdev[EVDEV_UNIT_MOUSE];
+	struct input_dev *dev = &g_mouse_dev;
 	uint64_t f;
 
-	if (!g_evdev_initialized)
-		evdev_init_devices();
-	spin_lock_irqsave(&dev->lock, &f);
+	evdev_builtin_init();
+	spin_lock_irqsave(&dev->event_lock, &f);
 	/* An absolute pointer: positions on the screen, no relative motion
 	 * of its own, and so not INPUT_PROP_POINTER either.  The wheel stays
 	 * relative. */
-	bit_set(dev->evbits, EV_ABS);
-	bit_set(dev->absbits, ABS_X);
-	bit_set(dev->absbits, ABS_Y);
-	bit_clear(dev->relbits, REL_X);
-	bit_clear(dev->relbits, REL_Y);
-	bit_clear(dev->propbits, INPUT_PROP_POINTER);
-	for (unsigned i = 0; i < 2; i++) {
-		dev->abs[i].minimum = 0;
-		dev->abs[i].maximum = max;
-		dev->abs[i].value = max / 2;
+	input_set_bit(EV_ABS, dev->evbit);
+	input_set_bit(ABS_X, dev->absbit);
+	input_set_bit(ABS_Y, dev->absbit);
+	input_clear_bit(REL_X, dev->relbit);
+	input_clear_bit(REL_Y, dev->relbit);
+	input_clear_bit(INPUT_PROP_POINTER, dev->propbit);
+	for (unsigned int i = ABS_X; i <= ABS_Y; i++) {
+		dev->absinfo[i].minimum = 0;
+		dev->absinfo[i].maximum = max;
+		dev->absinfo[i].value = max / 2;
+		dev->absinfo[i].fuzz = 0;
+		dev->absinfo[i].flat = 0;
 	}
-	dev->abs_screen_w = screen_w;
-	dev->abs_screen_h = screen_h;
-	spin_unlock_irqrestore(&dev->lock, f);
+	g_abs_screen_w = screen_w;
+	g_abs_screen_h = screen_h;
+	spin_unlock_irqrestore(&dev->event_lock, f);
 }
 
 void evdev_mouse_set_abs_screen(int screen_w, int screen_h)
 {
-	evdev_dev_t *dev = &g_evdev[EVDEV_UNIT_MOUSE];
+	struct input_dev *dev = &g_mouse_dev;
 	uint64_t f;
 
-	if (!g_evdev_initialized)
-		evdev_init_devices();
-	spin_lock_irqsave(&dev->lock, &f);
-	dev->abs_screen_w = screen_w;
-	dev->abs_screen_h = screen_h;
-	spin_unlock_irqrestore(&dev->lock, f);
+	evdev_builtin_init();
+	spin_lock_irqsave(&dev->event_lock, &f);
+	g_abs_screen_w = screen_w;
+	g_abs_screen_h = screen_h;
+	spin_unlock_irqrestore(&dev->event_lock, f);
 }
 
 int evdev_feed_mouse_abs(uint32_t x, uint32_t y, uint8_t buttons, int wheel)
 {
-	evdev_dev_t *dev = &g_evdev[EVDEV_UNIT_MOUSE];
+	struct input_dev *dev = &g_mouse_dev;
 	uint64_t f;
-	int queued = 0;
 
-	if (!g_evdev_initialized)
-		evdev_init_devices();
+	evdev_builtin_init();
 	evdev_mouse_buttons(dev, buttons);
 
-	spin_lock_irqsave(&dev->lock, &f);
-	if (bit_test(dev->evbits, EV_ABS)) {
-		queued |= evdev_abs_move_locked(dev, 0, x);
-		queued |= evdev_abs_move_locked(dev, 1, y);
+	spin_lock_irqsave(&dev->event_lock, &f);
+	if (input_test_bit(EV_ABS, dev->evbit)) {
+		evdev_abs_move_locked(dev, ABS_X, x);
+		evdev_abs_move_locked(dev, ABS_Y, y);
 	}
-	if (wheel) {
-		evdev_queue_locked(dev, EV_REL, REL_WHEEL, wheel);
-		queued = 1;
-	}
-	if (queued)
-		evdev_queue_locked(dev, EV_SYN, SYN_REPORT, 0);
-	spin_unlock_irqrestore(&dev->lock, f);
-	if (queued)
-		evdev_wake_readers(dev);
+	input_handle_event_locked(dev, EV_REL, REL_WHEEL, wheel);
+	input_handle_event_locked(dev, EV_SYN, SYN_REPORT, 0);
+	spin_unlock_irqrestore(&dev->event_lock, f);
 	return evdev_mouse_grabbed();
 }
 
 int evdev_feed_mouse(int dx, int dy, uint8_t buttons, int wheel, int hwheel)
 {
-	evdev_dev_t *dev = &g_evdev[EVDEV_UNIT_MOUSE];
+	struct input_dev *dev = &g_mouse_dev;
 	uint64_t f;
-	int queued = 0;
 
-	if (!g_evdev_initialized)
-		evdev_init_devices();
-
+	evdev_builtin_init();
 	evdev_mouse_buttons(dev, buttons);
 
-	spin_lock_irqsave(&dev->lock, &f);
-	if (bit_test(dev->evbits, EV_ABS)) {
+	spin_lock_irqsave(&dev->event_lock, &f);
+	if (input_test_bit(EV_ABS, dev->evbit)) {
 		/* The axes are absolute: relative motion from another source
 		 * (the emulated mouse, before the absolute pointer has said
 		 * anything) moves the position by the same share of the
 		 * screen it would move a pointer. */
-		int w = dev->abs_screen_w > 0 ? dev->abs_screen_w : 1;
-		int h = dev->abs_screen_h > 0 ? dev->abs_screen_h : 1;
+		int w = g_abs_screen_w > 0 ? g_abs_screen_w : 1;
+		int h = g_abs_screen_h > 0 ? g_abs_screen_h : 1;
+		const struct input_absinfo *ax = &dev->absinfo[ABS_X];
+		const struct input_absinfo *ay = &dev->absinfo[ABS_Y];
 
 		if (dx)
-			queued |= evdev_abs_move_locked(
-				dev, 0,
-				(int64_t)dev->abs[0].value +
-					(int64_t)dx * (dev->abs[0].maximum + 1) / w);
+			evdev_abs_move_locked(
+				dev, ABS_X,
+				(int64_t)ax->value +
+					(int64_t)dx * ((int64_t)ax->maximum + 1) /
+						w);
 		if (dy)
-			queued |= evdev_abs_move_locked(
-				dev, 1,
-				(int64_t)dev->abs[1].value +
-					(int64_t)dy * (dev->abs[1].maximum + 1) / h);
+			evdev_abs_move_locked(
+				dev, ABS_Y,
+				(int64_t)ay->value +
+					(int64_t)dy * ((int64_t)ay->maximum + 1) /
+						h);
 	} else {
-		if (dx) {
-			evdev_queue_locked(dev, EV_REL, REL_X, dx);
-			queued = 1;
-		}
-		if (dy) {
-			evdev_queue_locked(dev, EV_REL, REL_Y, dy);
-			queued = 1;
-		}
+		input_handle_event_locked(dev, EV_REL, REL_X, dx);
+		input_handle_event_locked(dev, EV_REL, REL_Y, dy);
 	}
-	if (wheel) {
-		evdev_queue_locked(dev, EV_REL, REL_WHEEL, wheel);
-		queued = 1;
-	}
-	if (hwheel) {
-		evdev_queue_locked(dev, EV_REL, REL_HWHEEL, hwheel);
-		queued = 1;
-	}
-	if (queued)
-		evdev_queue_locked(dev, EV_SYN, SYN_REPORT, 0);
-	spin_unlock_irqrestore(&dev->lock, f);
-	if (queued)
-		evdev_wake_readers(dev);
+	input_handle_event_locked(dev, EV_REL, REL_WHEEL, wheel);
+	input_handle_event_locked(dev, EV_REL, REL_HWHEEL, hwheel);
+	input_handle_event_locked(dev, EV_SYN, SYN_REPORT, 0);
+	spin_unlock_irqrestore(&dev->event_lock, f);
 	return evdev_mouse_grabbed();
 }
 
 int evdev_kbd_grabbed(void)
 {
-	return g_evdev[EVDEV_UNIT_KEYBOARD].grab_task != 0;
+	return __atomic_load_n(&g_builtin_nodes[EVDEV_UNIT_KEYBOARD].grab,
+			       __ATOMIC_RELAXED) != NULL;
 }
 
 int evdev_mouse_grabbed(void)
 {
-	return g_evdev[EVDEV_UNIT_MOUSE].grab_task != 0;
-}
-
-// ---------------------------------------------------------------------------
-// Reader interface
-// ---------------------------------------------------------------------------
-
-static evdev_dev_t *evdev_get(int unit)
-{
-	if (unit < 0 || unit >= EVDEV_NUM_UNITS)
-		return NULL;
-	if (!g_evdev_initialized)
-		evdev_init_devices();
-	return &g_evdev[unit];
-}
-
-long evdev_read(int unit, void *user_buf, long bytes, int nonblock)
-{
-	evdev_dev_t *dev = evdev_get(unit);
-	struct input_event burst[EVDEV_MAX_READ_BURST];
-	task_t *cur = sched_current();
-	unsigned want, got;
-	uint64_t f;
-
-	if (!dev || !user_buf)
-		return -EINVAL;
-	if (bytes < (long)sizeof(struct input_event))
-		return -EINVAL;
-	BUILD_BUG_ON(sizeof(struct input_event) != 24);
-
-	want = (unsigned)(bytes / sizeof(struct input_event));
-	if (want > EVDEV_MAX_READ_BURST)
-		want = EVDEV_MAX_READ_BURST;
-
-	for (;;) {
-		got = 0;
-		spin_lock_irqsave(&dev->lock, &f);
-		while (dev->count > 0 && got < want) {
-			burst[got++] = dev->ring[dev->tail];
-			dev->tail = (dev->tail + 1) % EVDEV_RING_SIZE;
-			dev->count--;
-		}
-		spin_unlock_irqrestore(&dev->lock, f);
-
-		if (got > 0) {
-			smap_disable();
-			kmemcpy(user_buf, burst,
-				got * sizeof(struct input_event));
-			smap_enable();
-			return (long)(got * sizeof(struct input_event));
-		}
-		if (nonblock)
-			return -EAGAIN;
-		if (!cur)
-			return -EAGAIN; // no task context: cannot block
-
-		// Park atomically wrt the producer (same protocol as
-		// tty_read): publish BLOCKED + channel, re-check the ring
-		// under the lock, then schedule.
-		cur->wait_channel = (void *)&dev->wq;
-		task_set_blocked(cur);
-		spin_lock_irqsave(&dev->lock, &f);
-		if (dev->count > 0) {
-			task_state_t asleep = TASK_BLOCKED;
-
-			/* Un-park by CAS, the way every waker claims: a trace
-			 * stop may have claimed this sleep meanwhile, and a
-			 * plain store ran on straight through it.  Claimed
-			 * first -- woken, or stopped -- the scheduler below
-			 * reconciles. */
-			if (__atomic_compare_exchange_n(&cur->state, &asleep,
-							TASK_READY, false,
-							__ATOMIC_ACQ_REL,
-							__ATOMIC_ACQUIRE)) {
-				cur->wait_channel = NULL;
-				spin_unlock_irqrestore(&dev->lock, f);
-				continue;
-			}
-		}
-		spin_unlock_irqrestore(&dev->lock, f);
-		sched_schedule();
-		if (cur->state == TASK_ZOMBIE || cur->has_exited ||
-		    signal_pending(cur))
-			return -EINTR;
-	}
-}
-
-short evdev_poll(int unit, short events)
-{
-	evdev_dev_t *dev = evdev_get(unit);
-	short rev = 0;
-
-	if (!dev)
-		return 0;
-	// POLLIN|POLLRDNORM when events are queued; never writable.
-	if ((events & 0x0041 /* POLLIN|POLLRDNORM */) && dev->count > 0)
-		rev |= (short)(events & 0x0041);
-	return rev;
-}
-
-/* Release a grab held through this descriptor, whoever is closing it. */
-void evdev_release_grab_by_owner(int unit, void *owner)
-{
-	evdev_dev_t *dev = evdev_get(unit);
-	uint64_t f;
-
-	if (!dev || !owner)
-		return;
-	spin_lock_irqsave(&dev->lock, &f);
-	if (dev->grab_owner == owner) {
-		dev->grab_owner = NULL;
-		dev->grab_task = 0;
-	}
-	spin_unlock_irqrestore(&dev->lock, f);
-}
-
-void evdev_release_grab_for(int unit, int64_t task_id)
-{
-	evdev_dev_t *dev = evdev_get(unit);
-	uint64_t f;
-
-	if (!dev)
-		return;
-	spin_lock_irqsave(&dev->lock, &f);
-	if (dev->grab_task == task_id)
-		dev->grab_task = 0;
-	spin_unlock_irqrestore(&dev->lock, f);
-}
-
-// ---------------------------------------------------------------------------
-// ioctl interface
-// ---------------------------------------------------------------------------
-
-/* SMAP-aware copies of whole, user-range-checked spans. */
-static int evdev_copy_out(void *user_dst, const void *src, size_t len)
-{
-	if (!user_dst || !user_range_ok((uint64_t)user_dst, len))
-		return -EFAULT;
-	smap_disable();
-	kmemcpy(user_dst, src, len);
-	smap_enable();
-	return 0;
-}
-
-static int evdev_copy_in(void *dst, const void *user_src, size_t len)
-{
-	if (!user_src || !user_range_ok((uint64_t)user_src, len))
-		return -EFAULT;
-	smap_disable();
-	kmemcpy(dst, user_src, len);
-	smap_enable();
-	return 0;
-}
-
-// Copy a capability bitmap, honouring the user-supplied size; returns the
-// number of bytes copied (standard EVIOCGBIT return convention).
-static int evdev_copy_bits(void *argp, const uint8_t *bits, size_t bits_len,
-			   size_t user_len)
-{
-	size_t n = user_len < bits_len ? user_len : bits_len;
-	int rc;
-
-	if (n == 0)
-		return 0;
-	/* The zero fill below writes the caller's whole length. */
-	if (!argp || !user_range_ok((uint64_t)argp, user_len))
-		return -EFAULT;
-	rc = evdev_copy_out(argp, bits, n);
-	if (rc != 0)
-		return rc;
-	// Zero-fill the tail when the caller asked for more than we have.
-	if (user_len > bits_len) {
-		static const uint8_t zeros[32];
-		size_t off = bits_len;
-		while (off < user_len) {
-			size_t chunk = user_len - off;
-			if (chunk > sizeof(zeros))
-				chunk = sizeof(zeros);
-			smap_disable();
-			kmemcpy((uint8_t *)argp + off, zeros, chunk);
-			smap_enable();
-			off += chunk;
-		}
-	}
-	return (int)n;
-}
-
-int evdev_ioctl(int unit, unsigned long req, void *argp, struct task *cur,
-		void *owner)
-{
-	evdev_dev_t *dev = evdev_get(unit);
-	unsigned int nr = (unsigned int)((req >> _INPUT_IOC_NRSHIFT) & 0xFF);
-	unsigned int type =
-		(unsigned int)((req >> _INPUT_IOC_TYPESHIFT) & 0xFF);
-	size_t user_len =
-		(size_t)((req >> _INPUT_IOC_SIZESHIFT) & 0x3FFF);
-
-	if (!dev)
-		return -EINVAL;
-	if (type != 'E')
-		return -ENOTTY;
-
-	if (req == EVIOCGVERSION) {
-		int v = EV_VERSION;
-		return evdev_copy_out(argp, &v, sizeof(v));
-	}
-	if (req == EVIOCGID)
-		return evdev_copy_out(argp, &dev->id, sizeof(dev->id));
-	if (nr == 0x06) { // EVIOCGNAME(len)
-		size_t len = 0;
-		while (dev->name[len])
-			len++;
-		len++; // NUL
-		if (len > user_len)
-			len = user_len;
-		if (len == 0)
-			return 0;
-		if (evdev_copy_out(argp, dev->name, len) != 0)
-			return -EFAULT;
-		return (int)len;
-	}
-	if (nr == 0x18) { // EVIOCGKEY(len)
-		uint64_t f;
-		uint8_t snapshot[sizeof(dev->key_state)];
-		spin_lock_irqsave(&dev->lock, &f);
-		kmemcpy(snapshot, (const void *)dev->key_state,
-			sizeof(snapshot));
-		spin_unlock_irqrestore(&dev->lock, f);
-		return evdev_copy_bits(argp, snapshot, sizeof(snapshot),
-				       user_len);
-	}
-	if (nr >= 0x20 && nr <= 0x20 + EV_MAX) { // EVIOCGBIT(ev, len)
-		unsigned int ev = nr - 0x20;
-		if (ev == 0)
-			return evdev_copy_bits(argp, dev->evbits,
-					       sizeof(dev->evbits), user_len);
-		if (ev == EV_KEY)
-			return evdev_copy_bits(argp, dev->keybits,
-					       sizeof(dev->keybits),
-					       user_len);
-		if (ev == EV_REL)
-			return evdev_copy_bits(argp, dev->relbits,
-					       sizeof(dev->relbits),
-					       user_len);
-		if (ev == EV_LED)
-			return evdev_copy_bits(argp, dev->ledbits,
-					       sizeof(dev->ledbits),
-					       user_len);
-		if (ev == EV_ABS)
-			return evdev_copy_bits(argp, dev->absbits,
-					       sizeof(dev->absbits),
-					       user_len);
-		// Unsupported event class: report an empty bitmap.
-		{
-			static const uint8_t none[8];
-			return evdev_copy_bits(argp, none, sizeof(none),
-					       user_len);
-		}
-	}
-	if (nr == 0x07) { // EVIOCGPHYS(len) - physical location
-		const char *ph = dev->phys ? dev->phys : "";
-		size_t len = 0;
-		while (ph[len])
-			len++;
-		len++; // NUL
-		if (len > user_len)
-			len = user_len;
-		if (len == 0)
-			return 0;
-		if (evdev_copy_out(argp, ph, len) != 0)
-			return -EFAULT;
-		return (int)len;
-	}
-	if (nr == 0x08) { // EVIOCGUNIQ(len) - unique identifier
-		/* These devices have no serial number.  Reporting "no such
-		 * entry" is how a driver says the property is absent; an empty
-		 * string would claim it exists and is blank. */
-		return -ENOENT;
-	}
-	if (nr == 0x09) // EVIOCGPROP(len) - device properties
-		return evdev_copy_bits(argp, dev->propbits,
-				       sizeof(dev->propbits), user_len);
-	if (nr == 0x19) // EVIOCGLED(len) - which LEDs are lit
-		return evdev_copy_bits(argp, dev->led_state,
-				       sizeof(dev->led_state), user_len);
-	if (nr == 0x1a) { // EVIOCGSND(len) - sound-source state
-		static const uint8_t none[8];
-		return evdev_copy_bits(argp, none, sizeof(none), user_len);
-	}
-	if (nr == 0x1b) { // EVIOCGSW(len) - switch state
-		static const uint8_t none[8];
-		return evdev_copy_bits(argp, none, sizeof(none), user_len);
-	}
-	if (nr >= 0x40 && nr <= 0x40 + ABS_MAX) { // EVIOCGABS(abs)
-		/* An axis the device has: its range and position.  A zeroed
-		 * absinfo for one it does not have, the conventional answer:
-		 * the query succeeds and the range reads as empty, which is
-		 * what a driver checks. */
-		struct input_absinfo abs = { 0, 0, 0, 0, 0, 0 };
-		unsigned int axis = nr - 0x40;
-		uint64_t f;
-
-		spin_lock_irqsave(&dev->lock, &f);
-		if (axis <= ABS_Y && bit_test(dev->absbits, axis))
-			abs = dev->abs[axis];
-		spin_unlock_irqrestore(&dev->lock, f);
-		return evdev_copy_out(argp, &abs, sizeof(abs));
-	}
-	if (req == EVIOCSCLOCKID) { // select the clock used for timestamps
-		int id;
-		uint64_t f;
-
-		if (!argp)
-			return -EFAULT;
-		if (evdev_copy_in(&id, argp, sizeof(id)) != 0)
-			return -EFAULT;
-		if (id != CLOCK_REALTIME && id != CLOCK_MONOTONIC)
-			return -EINVAL;
-		spin_lock_irqsave(&dev->lock, &f);
-		dev->clock_id = id;
-		spin_unlock_irqrestore(&dev->lock, f);
-		return 0;
-	}
-	if (req == EVIOCGRAB) {
-		// The argument is the flag value itself, not a pointer.
-		long grab = (long)(uint64_t)argp;
-		int64_t tid = cur ? cur->id : 0;
-		uint64_t f;
-		int rc = 0;
-
-		if (WARN_ON_ONCE(!cur))
-			return -EINVAL;
-		spin_lock_irqsave(&dev->lock, &f);
-		if (grab) {
-			if (dev->grab_task == 0 || dev->grab_task == tid) {
-				dev->grab_task = tid;
-				dev->grab_owner = owner;
-			} else {
-				rc = -EBUSY;
-			}
-		} else {
-			if (dev->grab_task == tid || dev->grab_task == 0) {
-				dev->grab_task = 0;
-				dev->grab_owner = NULL;
-			} else {
-				rc = -EINVAL;
-			}
-		}
-		spin_unlock_irqrestore(&dev->lock, f);
-		return rc;
-	}
-	return -EINVAL;
-}
-
-// ---------------------------------------------------------------------------
-// write interface
-// ---------------------------------------------------------------------------
-
-/* One event a client injects; caller holds dev->lock.  Only what the device
- * reports is taken, the rest is dropped without complaint: a display server
- * writes the lock LEDs of every keyboard it drives, including LEDs the
- * keyboard does not have (Kana, Compose).  A lock LED that changes is passed
- * on to the readers, as are the frame ends after such changes; *pending says
- * whether a frame has changes not yet ended. */
-static void evdev_inject_locked(evdev_dev_t *dev, const struct input_event *ev,
-				int *pending)
-{
-	if (ev->type == EV_LED) {
-		int lit;
-
-		if (ev->code >= LED_CNT || !bit_test(dev->evbits, EV_LED) ||
-		    !bit_test(dev->ledbits, ev->code))
-			return;
-		lit = ev->value != 0;
-		if (bit_test(dev->led_state, ev->code) == lit)
-			return;
-		if (lit)
-			bit_set(dev->led_state, ev->code);
-		else
-			bit_clear(dev->led_state, ev->code);
-		evdev_queue_locked(dev, EV_LED, ev->code, lit);
-		*pending = 1;
-		return;
-	}
-	if (ev->type == EV_SYN && ev->code == SYN_REPORT && *pending) {
-		evdev_queue_locked(dev, EV_SYN, SYN_REPORT, 0);
-		*pending = 0;
-	}
-}
-
-long evdev_write(int unit, const void *user_buf, long bytes)
-{
-	evdev_dev_t *dev = evdev_get(unit);
-	struct input_event ev;
-	long done = 0;
-	int pending = 0, queued = 0;
-	uint64_t f;
-
-	if (!dev || bytes < 0)
-		return -EINVAL;
-	if (bytes == 0)
-		return 0;
-	/* Whole records only, at least one. */
-	if (bytes < (long)sizeof(struct input_event))
-		return -EINVAL;
-
-	while (done + (long)sizeof(ev) <= bytes) {
-		if (evdev_copy_in(&ev, (const uint8_t *)user_buf + done,
-				  sizeof(ev)) != 0)
-			return -EFAULT;
-		done += (long)sizeof(ev);
-		spin_lock_irqsave(&dev->lock, &f);
-		evdev_inject_locked(dev, &ev, &pending);
-		if (pending)
-			queued = 1;
-		spin_unlock_irqrestore(&dev->lock, f);
-	}
-	if (queued)
-		evdev_wake_readers(dev);
-	return done;
+	return __atomic_load_n(&g_builtin_nodes[EVDEV_UNIT_MOUSE].grab,
+			       __ATOMIC_RELAXED) != NULL;
 }

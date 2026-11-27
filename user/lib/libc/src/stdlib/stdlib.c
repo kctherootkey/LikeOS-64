@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <locale.h>
 
 /* atexit / at_quick_exit and the exit handler list live in cxa_atexit.c: they
  * are the same mechanism as the C++ static-destructor registry, which has to
@@ -446,6 +447,30 @@ float strtof(const char *nptr, char **endptr)
 long double strtold(const char *nptr, char **endptr)
 {
 	return (long double)strtod(nptr, endptr);
+}
+
+/* The conversions in a given locale.  A locale decides only the radix
+ * character here, and every locale this system has -- the global one and
+ * any newlocale() returns -- uses '.', so they convert exactly as the
+ * functions above.  Software that wants numbers parsed independently of the
+ * user's locale (configuration files, device databases) calls these with a
+ * "C" locale object; it gets that behaviour. */
+double strtod_l(const char *nptr, char **endptr, locale_t loc)
+{
+	(void)loc;
+	return strtod(nptr, endptr);
+}
+
+float strtof_l(const char *nptr, char **endptr, locale_t loc)
+{
+	(void)loc;
+	return strtof(nptr, endptr);
+}
+
+long double strtold_l(const char *nptr, char **endptr, locale_t loc)
+{
+	(void)loc;
+	return strtold(nptr, endptr);
 }
 
 double atof(const char *nptr)

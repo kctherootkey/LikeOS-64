@@ -41,21 +41,38 @@ enum device_event_class {
 	DEVICE_CLASS_USB_DEVICE = 3,      /* any enumerated USB device */
 	DEVICE_CLASS_USB_INPUT = 4,       /* a USB keyboard, mouse, ... */
 	DEVICE_CLASS_PCI = 5,             /* name "0000:00:14.0" */
+	DEVICE_CLASS_INPUT = 6,           /* an event node, name "event6" */
 };
 
 /* flags */
 #define DEVICE_EVENT_F_REMOVABLE 0x0001u  /* removable medium or device */
 #define DEVICE_EVENT_F_HOTPLUGGED 0x0002u /* appeared after boot */
 #define DEVICE_EVENT_F_USB 0x0004u        /* reached through USB */
+/* Input devices: what kind of device it is, judged from its capabilities
+ * (several can be set; a touchpad with physical keys is TOUCHPAD|KEY). */
+#define DEVICE_EVENT_F_INPUT_KEYBOARD 0x0100u      /* a full keyboard */
+#define DEVICE_EVENT_F_INPUT_KEY 0x0200u           /* has some keys */
+#define DEVICE_EVENT_F_INPUT_MOUSE 0x0400u         /* relative/absolute pointer */
+#define DEVICE_EVENT_F_INPUT_TOUCHPAD 0x0800u
+#define DEVICE_EVENT_F_INPUT_TOUCHSCREEN 0x1000u
+#define DEVICE_EVENT_F_INPUT_TABLET 0x2000u        /* pen / stylus */
+#define DEVICE_EVENT_F_INPUT_JOYSTICK 0x4000u      /* joystick, gamepad */
+#define DEVICE_EVENT_F_INPUT_SWITCH 0x8000u        /* lid, tablet mode, ... */
+#define DEVICE_EVENT_F_INPUT_ACCELEROMETER 0x10000u
+#define DEVICE_EVENT_F_INPUT_POINTINGSTICK 0x20000u
 
 /* device_id: block -- (major << 32) | minor, the numbers of the /dev node;
  * PCI -- (segment << 16) | (bus << 8) | (device << 3) | function;
  * USB -- (controller << 32) | (root port << 8) | slot id;
- * USB input -- the USB device's id with the interface number in bits 16..23.
+ * USB input -- the USB device's id with the interface number in bits 16..23;
+ * input -- (bus type << 48) | (version << 32) | N of /dev/input/eventN, with
+ * major/minor the node's numbers (13, 64 + N) and vendor/product the
+ * device's input_id.
  * parent_id: a partition's disk, a USB input's USB device (same encodings);
  * 0 otherwise.
  * name: block -- "sdb", "sdb1"; USB -- "<controller+1>-<root port>", e.g.
- * "1-3"; USB input -- "keyboard" or "mouse"; PCI -- "SSSS:BB:DD.F". */
+ * "1-3"; USB input -- "keyboard" or "mouse"; PCI -- "SSSS:BB:DD.F";
+ * input -- "event6" (the device's own name is EVIOCGNAME on the node). */
 struct device_event {
 	uint32_t size;          /* sizeof(struct device_event): 128 */
 	uint32_t version;       /* DEVEVENT_VERSION */

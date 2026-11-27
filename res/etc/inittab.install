@@ -15,9 +15,22 @@
 # screen changes to the installer.
 wait	console	/bin/echo LikeOS Setup is starting ...
 
+# The touchpad configuration of the X server, brought up to date (or removed)
+# before the installer session can start an X server: the file may be left
+# from an earlier boot, with event node numbers that name a different device
+# this time.  The daemon below adds a touchpad the kernel only finds later.
+wait	/usr/sbin/likeos-input-devices
+
 # Audio service, so the installer can play its sounds (optional: setup
 # works without it).
 respawn	/usr/sbin/audiod -f
+
+# Touchpads for the X server: writes /etc/X11/xorg.conf.d/50-likeos-touchpads.conf
+# for the touchpads the kernel reports (and removes it when there is none),
+# then keeps it current as input devices come and go.  -f keeps it in the
+# foreground for init.  It runs as root: the file is part of the setuid X
+# server's configuration, which nobody else may write.
+respawn	/usr/sbin/likeos-input-devices -f
 
 # The installer session (X server + likeos-installer, or likeos-install on
 # the console).  "console": it needs the terminal for its messages and for

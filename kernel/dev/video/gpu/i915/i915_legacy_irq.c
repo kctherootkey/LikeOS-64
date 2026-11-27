@@ -686,7 +686,7 @@ int i915_legacy_irq_init(struct i915_device *i915)
 		rc = gsi < 0 ? -ENODEV : irq_request_gsi(gsi, legacy_irq, i915, "i915", 1, 1);
 		if (rc == 0) {
 			g_leg.irq_gsi = gsi;
-			i915->irq_vector = 32 + gsi;
+			i915->irq_vector = irq_gsi_vector(gsi);
 		}
 	}
 	if (rc) {

@@ -140,6 +140,11 @@ long tty_write(tty_t *tty, const void *buf, long count);
 void tty_printf(tty_t *tty, const char *fmt, ...)
 	__attribute__((format(printf, 2, 3)));
 int tty_ioctl(tty_t *tty, unsigned long req, void *argp, task_t *cur);
+/* The same, for a request made through an open file of the terminal:
+ * `kd_token' is that file's console token (keyboard_console_file_token()),
+ * which the console's KD* requests record (0: no file). */
+int tty_ioctl_file(tty_t *tty, unsigned long req, void *argp, task_t *cur,
+		   uint64_t kd_token);
 
 // PTY helpers
 int tty_pty_allocate(int *out_id);

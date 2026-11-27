@@ -287,8 +287,6 @@ Devices and buses
   (Bulk-Only Transport); HID boot keyboards and mice, report-protocol mice with
   scroll wheel; USB-serial logging.
 - Legacy input: PS/2 keyboard and mouse.
-- I2C-HID: Intel LPSS DesignWare I2C controller with HID-over-I2C touchpads,
-  found through ACPI (experimental).
 - Input interface: evdev (/dev/input/event*), used by the X server.
 - Display: Intel i915, VMware SVGA II/SVGA3D (vmwgfx), UEFI GOP framebuffer,
   /dev/fb0 (fbdev).

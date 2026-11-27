@@ -115,6 +115,9 @@ void fb_flush_dirty_regions_unlocked(void);
 void fb_mark_dirty(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2);
 void fb_mark_full_dirty(void);
 void fb_flush_dirty_regions(void);
+// Returns once no flush that started before the call is still blitting:
+// for whoever has just closed the console's output gate.
+void fb_flush_barrier(void);
 void fb_clear_dirty_regions(void);
 
 // Optimized pixel operations (these replace direct framebuffer access)

@@ -174,7 +174,8 @@ int irq_alloc_desc_block(const struct irq_chip_ops *ops, void *const *data,
 			 unsigned int n, const cpumask_t *affinity, int *irqs);
 /* A descriptor with no CPU vector of its own: its source is delivered
  * through another interrupt whose handler calls irq_handle_virtual() (a
- * device behind a VMD domain with MSI remapping).  compose_msg is called
+ * device behind a VMD domain with MSI remapping, a GPIO pad behind its
+ * controller's shared line -- kernel/dev/gpio/gpiolib.c).  compose_msg is called
  * with vector 0 / APIC ID 0 at startup and on restore; the chip composes
  * its own message.  `affinity' and `managed' are recorded (and reported)
  * but delivery follows the parent interrupt. */

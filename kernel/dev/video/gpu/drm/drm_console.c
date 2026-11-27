@@ -281,8 +281,11 @@ static void drm_console_worker(void *arg)
 		 * a framebuffer in video memory the device noticed those
 		 * writes by itself; a buffer object in RAM has no such
 		 * mechanism, so the whole screen goes out on each tick for as
-		 * long as the descriptor is open, and only then. */
-		if (fbdev_display_owned() && !g_con.suspended)
+		 * long as the descriptor is open, and only then.  That is
+		 * the open count, not display ownership: a program drawing
+		 * alongside the console (no KD_GRAPHICS) needs it as much as
+		 * one that has the screen to itself. */
+		if (fbdev_has_clients() && !g_con.suspended)
 			console_push_all();
 		else
 			console_push();

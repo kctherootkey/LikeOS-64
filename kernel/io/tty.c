@@ -1302,6 +1302,12 @@ void __attribute__((format(printf, 2, 3))) tty_printf(tty_t *tty,
 
 int tty_ioctl(tty_t *tty, unsigned long req, void *argp, task_t *cur)
 {
+	return tty_ioctl_file(tty, req, argp, cur, 0);
+}
+
+int tty_ioctl_file(tty_t *tty, unsigned long req, void *argp, task_t *cur,
+		   uint64_t kd_token)
+{
 	if (!tty) {
 		return -ENOTTY;
 	}
@@ -1311,7 +1317,7 @@ int tty_ioctl(tty_t *tty, unsigned long req, void *argp, task_t *cur)
 	if ((req & ~0xFFUL) == 0x4B00UL) {
 		if (tty != &g_console_tty)
 			return -ENOTTY;
-		return keyboard_kd_ioctl(req, argp, cur);
+		return keyboard_kd_ioctl(req, argp, cur, kd_token);
 	}
 	switch (req) {
 	case TCGETS:

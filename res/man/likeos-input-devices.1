@@ -1,0 +1,93 @@
+LIKEOS-INPUT-DEVICES(1)          User Commands         LIKEOS-INPUT-DEVICES(1)
+
+NAME
+       likeos-input-devices - keep the X server's touchpad configuration
+       current
+
+SYNOPSIS
+       likeos-input-devices [-f] [-n] [-o FILE]
+
+DESCRIPTION
+       The X server here finds its input devices in its configuration, not
+       by itself.  The keyboard (/dev/input/event0) and the mouse
+       (/dev/input/event1) are named in /etc/X11/xorg.conf and its siblings;
+       a touchpad's event node is numbered when it appears, so it cannot be.
+
+       likeos-input-devices finds the touchpads the kernel reports (through
+       libudev: event nodes tagged ID_INPUT_TOUCHPAD) and writes
+       /etc/X11/xorg.conf.d/50-likeos-touchpads.conf, one InputDevice section
+       per touchpad, driven by libinput and added to the server's layout with
+       Option "AutoServerLayout".  On a machine without a touchpad it removes
+       the file, and the server starts as it would without this program.
+       The server reads the file when it starts.
+
+       init starts it at boot (/etc/inittab) with -f: it writes the file,
+       then rewrites it whenever an input device appears or goes away
+       (/dev/devevents).  It runs as root, because the file is part of the
+       configuration of the setuid X server.
+
+       The touchpad settings, unless /etc/likeos/touchpad.conf says
+       otherwise: tap to click and tap-and-drag on; two-finger scrolling
+       (edge scrolling on a touchpad that cannot tell two fingers apart);
+       natural scrolling off; on clickpads, libinput's default for the
+       model, which on most clickpads is a click in the bottom right corner
+       for the right button (a tap with two fingers is the right button
+       with every click method); disable while typing on; adaptive pointer
+       acceleration.  Palm and thumb detection, pinch and swipe gestures and
+       the model corrections from libinput's quirks database always apply.
+
+OPTIONS
+       -f     Stay in the foreground and keep the file current (for init).
+              SIGHUP rewrites it at once, for example after the settings
+              file changed.
+
+       -n     Print the configuration that would be written; change
+              nothing.
+
+       -o FILE
+              Maintain FILE instead of the default.
+
+FILES
+       /etc/X11/xorg.conf.d/50-likeos-touchpads.conf
+              The configuration written.  Do not edit it.
+
+       /etc/likeos/touchpad.conf
+              Settings, one KEY=VALUE per line, # for comments:
+
+              Tapping, TappingDrag, TappingDragLock, NaturalScrolling,
+              HorizontalScrolling, DisableWhileTyping, MiddleEmulation,
+              LeftHanded
+                     on or off
+
+              ScrollMethod
+                     twofinger, edge or none
+
+              ClickMethod
+                     buttonareas (the bottom of a clickpad is split into
+                     left and right buttons), clickfinger (a click with two
+                     fingers is the right button, with three the middle
+                     one) or none
+
+              AccelProfile
+                     adaptive or flat
+
+              AccelSpeed
+                     -1.0 to 1.0
+
+              After a change, run likeos-input-devices as root (or send the
+              running one SIGHUP) and restart X.
+
+EXAMPLES
+       Show what the X server will be given:
+
+              likeos-input-devices -n
+
+       What libinput makes of the touchpad, and its events:
+
+              libinput list-devices
+              libinput debug-events --device /dev/input/event6
+
+SEE ALSO
+       devd(1), init(8)
+
+LikeOS                             2026-11-26          LIKEOS-INPUT-DEVICES(1)

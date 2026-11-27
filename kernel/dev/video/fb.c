@@ -933,26 +933,39 @@ void fb_pointer_damage(void)
 
 void fb_flush_dirty_regions(void)
 {
-	/* Nothing is painted while another program owns the display.
+	uint64_t flags;
+
+	/* Nothing is painted while another program owns the display
+	 * (console_display_owned: KD_GRAPHICS, or a DRM master).
 	 *
 	 * The console and a display server would otherwise be writing the same
 	 * pixels, and the console would win every time anything made it draw --
 	 * an echoed keystroke, a kernel message -- appearing on top of the X
-	 * screen.  On a system with virtual terminals KD_GRAPHICS does this;
-	 * with no VTs, having /dev/fb0 open is the equivalent statement.
+	 * screen.
 	 *
 	 * Only the BLIT is skipped.  The back buffer and the dirty regions
-	 * carry on being updated, so the full redraw on the last close shows
+	 * carry on being updated, so the full redraw on release shows
 	 * everything that happened in the meantime rather than a blank screen.
-	 */
-	if (fbdev_display_owned())
-		return;
-
-	uint64_t flags;
+	 *
+	 * Asked under the lock the blit runs under: whoever takes the display
+	 * then waits for that lock once (fb_flush_barrier), and a flush that
+	 * saw the display free has finished by the time the new owner draws. */
 	spin_lock_irqsave(&fb_lock, &flags);
+	if (console_display_owned()) {
+		spin_unlock_irqrestore(&fb_lock, flags);
+		return;
+	}
 	fb_flush_dirty_regions_unlocked();
 	spin_unlock_irqrestore(&fb_lock, flags);
 	fb_flush_hook_run();
+}
+
+void fb_flush_barrier(void)
+{
+	uint64_t flags;
+
+	spin_lock_irqsave(&fb_lock, &flags);
+	spin_unlock_irqrestore(&fb_lock, flags);
 }
 
 // Unlocked variant - caller must hold fb_lock via fb_acquire()

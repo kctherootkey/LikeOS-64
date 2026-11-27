@@ -6,10 +6,23 @@
 // one table indexed by IDT vector, shared by every CPU, used by the
 // drivers that existed before the interrupt core and kept exactly as it
 // was, dynamic vectors 63..127 included.  The vector matrix of the
-// interrupt core covers 128..239 only; the fixed vector (32 + GSI) of an
-// I/O APIC line that falls into that range is taken there on every CPU
-// the moment the line is routed (irq_reserve_legacy_vector), so the two
-// layers can never collide.
+// interrupt core covers 128..239 only; a vector of an I/O APIC line that
+// falls into that range is taken there on every CPU the moment the line
+// is routed (irq_reserve_legacy_vector), so the two layers can never
+// collide.
+//
+// I/O APIC lines: each GSI has ONE vector, recorded in g_gsi_vector the
+// first time the line is routed (by irq_request_gsi, or by a driver that
+// routes its line itself through ioapic_configure_legacy_irq) and kept
+// for good; every later user of a shared line gets the same vector.  The
+// choice (kernel/ke/irq_gsi.c): GSIs 0..25 keep their natural vector
+// 32 + GSI -- the legacy INTx arms of interrupt.c recognise their line by
+// it -- unless that vector has a fixed meaning (32 LAPIC timer, 47 LAPIC
+// error, 58 SCI, 59-61 NIC MSI, 62 HPET), which no line may share: a
+// handled line interrupt skips the fixed arm.  Those GSIs, and every GSI
+// above 25, get a free vector of the dynamic range instead, which the
+// MSI allocator then no longer hands out.  A line moved off its natural
+// vector is reported once ("irq: GSI n on vector v").
 //
 // The interrupt core: interrupt NUMBERS (IRQ_NR_FIRST + descriptor index)
 // for request_irq()/free_irq(), each with an affinity mask, a source
@@ -104,12 +117,25 @@ struct irq_action {
 struct irq_vdesc {
 	struct irq_action act[IRQ_MAX_ACTIONS];
 	int nact;
-	int allocated; /* handed out by irq_alloc_vector() */
+	int allocated; /* handed out by irq_alloc_vector(), or a GSI's */
+	int gsi; /* GSI + 1 of the I/O APIC line routed here, 0: none */
 	uint64_t count;
 };
 
 static struct irq_vdesc g_irq[256];
 static spinlock_t g_irq_lock = SPINLOCK_INIT("irq");
+/* GSI -> vector, 0: not routed (g_irq_lock). */
+static uint8_t g_gsi_vector[IRQ_GSI_MAX];
+
+/* The fixed vectors irq_gsi.c keeps lines away from are their owners'. */
+BUILD_BUG_ON(IRQ_VEC_LAPIC_TIMER != LAPIC_TIMER_VECTOR);
+BUILD_BUG_ON(IRQ_VEC_LAPIC_ERROR != LAPIC_ERROR_VECTOR);
+BUILD_BUG_ON(IRQ_VEC_ACPI_SCI != ACPI_SCI_VECTOR);
+BUILD_BUG_ON(IRQ_VEC_E1000_MSI != E1000_MSI_VECTOR);
+BUILD_BUG_ON(IRQ_VEC_E1000E_MSI != E1000E_MSI_VECTOR);
+BUILD_BUG_ON(IRQ_VEC_VMXNET3_MSI != VMXNET3_MSI_VECTOR);
+BUILD_BUG_ON(IRQ_VEC_HRTIMER != HRTIMER_VECTOR);
+BUILD_BUG_ON(32 + IRQ_GSI_NATURAL_LAST >= IRQ_VEC_ACPI_SCI);
 
 int irq_alloc_vector(void)
 {
@@ -117,7 +143,8 @@ int irq_alloc_vector(void)
 
 	spin_lock_irqsave(&g_irq_lock, &fl);
 	for (int v = IRQ_DYN_VECTOR_FIRST; v <= IRQ_DYN_VECTOR_LAST; v++) {
-		if (!g_irq[v].allocated && g_irq[v].nact == 0) {
+		if (!g_irq[v].allocated && g_irq[v].nact == 0 &&
+		    !g_irq[v].gsi) {
 			g_irq[v].allocated = 1;
 			spin_unlock_irqrestore(&g_irq_lock, fl);
 			return v;
@@ -134,8 +161,110 @@ void irq_free_vector(int vector)
 	if (vector < 0 || vector > 255)
 		return;
 	spin_lock_irqsave(&g_irq_lock, &fl);
-	g_irq[vector].allocated = 0;
+	/* A line's vector stays with the line. */
+	if (!WARN_ON_ONCE(g_irq[vector].gsi != 0))
+		g_irq[vector].allocated = 0;
 	spin_unlock_irqrestore(&g_irq_lock, fl);
+}
+
+/* Is `v' unavailable for a GSI that has no vector yet (g_irq_lock). */
+static int gsi_vector_busy_locked(int v, void *ctx)
+{
+	(void)ctx;
+	lockdep_assert_held(&g_irq_lock);
+	return g_irq[v].allocated || g_irq[v].nact > 0 || g_irq[v].gsi != 0;
+}
+
+/* Record the line's vector (g_irq_lock). */
+static void gsi_route_record_locked(int gsi, int v)
+{
+	lockdep_assert_held(&g_irq_lock);
+	g_gsi_vector[gsi] = (uint8_t)v;
+	g_irq[v].gsi = gsi + 1;
+	/* A dynamic vector is the line's now: the MSI allocator skips it. */
+	if (v >= IRQ_DYN_VECTOR_FIRST && v <= IRQ_DYN_VECTOR_LAST)
+		g_irq[v].allocated = 1;
+}
+
+/* The vector of `gsi', chosen now if the line has none.  -errno. */
+static int irq_gsi_vector_assign(int gsi)
+{
+	uint64_t fl;
+	int v, chosen = 0;
+
+	if (gsi < 0 || gsi >= IRQ_GSI_MAX)
+		return -EINVAL;
+	spin_lock_irqsave(&g_irq_lock, &fl);
+	v = g_gsi_vector[gsi];
+	if (!v) {
+		v = irq_gsi_choose_vector(gsi, gsi_vector_busy_locked, NULL);
+		if (v > 0) {
+			gsi_route_record_locked(gsi, v);
+			chosen = 1;
+		}
+	}
+	spin_unlock_irqrestore(&g_irq_lock, fl);
+	if (v <= 0) {
+		kprintf("irq: no free vector for GSI %d\n", gsi);
+		return -ENOSPC;
+	}
+	/* A line some fixed-vector owner routed itself: only the SCI's (a
+	 * level line, whose arm runs whenever no handler claimed the
+	 * interrupt) can be shared.  On an edge source's vector -- the HPET
+	 * comparator -- a handled line interrupt would swallow its edge. */
+	if (irq_vector_is_fixed(v) && v != IRQ_VEC_ACPI_SCI) {
+		kprintf("irq: GSI %d is routed to fixed vector %d, not shared\n",
+			gsi, v);
+		return -EBUSY;
+	}
+	if (chosen && v != 32 + gsi)
+		kprintf("irq: GSI %d on vector %d (%s)\n", gsi, v,
+			gsi > IRQ_GSI_NATURAL_LAST ?
+				"above the natural range" :
+			irq_vector_is_fixed(32 + gsi) ?
+				"vector 32 + GSI is a fixed one" :
+				"vector 32 + GSI is taken");
+	return v;
+}
+
+int irq_gsi_vector(int gsi)
+{
+	uint64_t fl;
+	int v;
+
+	if (gsi < 0 || gsi >= IRQ_GSI_MAX)
+		return -1;
+	spin_lock_irqsave(&g_irq_lock, &fl);
+	v = g_gsi_vector[gsi];
+	spin_unlock_irqrestore(&g_irq_lock, fl);
+	return v ? v : -1;
+}
+
+void irq_note_gsi_route(int gsi, int vector)
+{
+	uint64_t fl;
+	int old;
+
+	if (gsi < 0 || gsi >= IRQ_GSI_MAX || vector < 32 || vector > 255)
+		return;
+	spin_lock_irqsave(&g_irq_lock, &fl);
+	old = g_gsi_vector[gsi];
+	if (old != vector) {
+		if (old && g_irq[old].gsi == gsi + 1) {
+			g_irq[old].gsi = 0;
+			/* A dynamic vector nobody listens on goes back. */
+			if (old >= IRQ_DYN_VECTOR_FIRST &&
+			    old <= IRQ_DYN_VECTOR_LAST && g_irq[old].nact == 0)
+				g_irq[old].allocated = 0;
+		}
+		gsi_route_record_locked(gsi, vector);
+	}
+	spin_unlock_irqrestore(&g_irq_lock, fl);
+	/* A second router of the line with a vector of its own: the entry
+	 * points at the new one, whoever listens on the old one is cut off. */
+	if (old && old != vector)
+		kprintf("irq: GSI %d moved from vector %d to %d\n", gsi, old,
+			vector);
 }
 
 int irq_request_vector(int vector, irq_handler_t fn, void *arg,
@@ -207,11 +336,14 @@ int irq_reserve_legacy_vector(int vector)
 int irq_request_gsi(int gsi, irq_handler_t fn, void *arg, const char *name,
 		    int active_low, int level)
 {
-	if (gsi < 0 || gsi > 223)
-		return -EINVAL;
-	int vector = 32 + gsi;
-	int rc = irq_request_vector(vector, fn, arg, name);
+	int vector, rc;
 
+	if (gsi < 0 || gsi >= IRQ_GSI_MAX)
+		return -EINVAL;
+	vector = irq_gsi_vector_assign(gsi);
+	if (vector < 0)
+		return vector;
+	rc = irq_request_vector(vector, fn, arg, name);
 	if (rc)
 		return rc;
 	if (ioapic_configure_legacy_irq((uint8_t)gsi, (uint8_t)vector,
@@ -381,6 +513,10 @@ struct irq_desc {
 	struct irq_spurious spur;
 	volatile uint32_t threads_handled; /* thread_fn returned IRQ_HANDLED */
 	uint32_t spurious_disabled;
+	/* Trigger programmed through irq_set_irq_type (IRQ_TYPE_*), and the
+	 * wake-up nesting of irq_set_irq_wake (desc->lock). */
+	unsigned int trigger;
+	unsigned int wake_depth;
 	struct irq_desc *free_next;
 };
 
@@ -478,6 +614,8 @@ static void desc_reset(struct irq_desc *d, const struct irq_chip_ops *ops,
 	__builtin_memset(&d->spur, 0, sizeof(d->spur));
 	d->threads_handled = 0;
 	d->spurious_disabled = 0;
+	d->trigger = IRQ_TYPE_NONE;
+	d->wake_depth = 0;
 }
 
 /* The CPUs a message can be aimed at: online, with an APIC ID that fits
@@ -537,10 +675,14 @@ int irq_alloc_desc_gsi(const struct irq_chip_ops *ops, void *data, int gsi,
 		       int active_low, int level)
 {
 	struct irq_desc *d;
+	int vector;
 
 	might_sleep();
-	if (gsi < 0 || gsi > 223)
+	if (gsi < 0 || gsi >= IRQ_GSI_MAX)
 		return -EINVAL;
+	vector = irq_gsi_vector_assign(gsi);
+	if (vector < 0)
+		return vector;
 	d = desc_get();
 	if (!d)
 		return -ENOMEM;
@@ -552,7 +694,7 @@ int irq_alloc_desc_gsi(const struct irq_chip_ops *ops, void *data, int gsi,
 	d->gsi_active_low = active_low;
 	d->gsi_level = level;
 	d->no_move = 1;
-	d->vector = 32 + gsi;
+	d->vector = vector; /* the line's, for good (irq_gsi_vector) */
 	d->cpu = 0;
 	__atomic_store_n(&d->in_use, 1, __ATOMIC_RELEASE);
 	return d->irq;
@@ -707,9 +849,15 @@ static int desc_can_mask(const struct irq_desc *d)
 	return d->ops && d->ops->mask && d->ops->unmask;
 }
 
-/* Send the vector to its CPU again (lost-while-disabled replay). */
+/* Send the vector to its CPU again (lost-while-disabled replay).  A
+ * virtual source with a retrigger operation (a GPIO pad whose controller
+ * cleared the event when it was taken) is asked to deliver it again. */
 static void desc_retrigger(struct irq_desc *d)
 {
+	if (d->kind == IRQ_KIND_VIRTUAL && d->ops && d->ops->retrigger) {
+		d->ops->retrigger(d->irq, d->data);
+		return;
+	}
 	if (d->kind == IRQ_KIND_GSI || d->kind == IRQ_KIND_VIRTUAL ||
 	    d->vector < 0 || d->cpu < 0)
 		return;
@@ -740,7 +888,8 @@ static void desc_replay_pending(struct irq_desc *d)
 	lockdep_assert_held(&d->lock);
 	if (!d->pending)
 		return;
-	if (!desc_lazy_disable(d) && desc_can_mask(d))
+	if (!desc_lazy_disable(d) && desc_can_mask(d) &&
+	    !(d->kind == IRQ_KIND_VIRTUAL && d->ops && d->ops->retrigger))
 		return;
 	d->pending = 0;
 	desc_retrigger(d);
@@ -771,6 +920,10 @@ static int irq_startup_locked(struct irq_desc *d)
 				     d->gsi_level);
 		if (rc)
 			return rc;
+		/* The line's vector (assigned at creation, kept for good,
+		 * unless a fixed-vector driver rerouted the line since). */
+		if (WARN_ON_ONCE(irq_gsi_vector(d->gsi) != d->vector))
+			d->vector = irq_gsi_vector(d->gsi);
 		d->apic_id = irq_cpu_apic_id(0);
 		d->started = 1;
 		return 0;
@@ -1283,6 +1436,13 @@ int irq_dispatch(uint64_t vector)
  * request_irq / free_irq
  * ========================================================================== */
 
+/* Must a thread-only handler keep the source masked until it ran. */
+static int desc_needs_oneshot(const struct irq_desc *d)
+{
+	return d->kind == IRQ_KIND_GSI ||
+	       (d->ops && (d->ops->flags & IRQ_CHIP_ONESHOT_REQUIRED));
+}
+
 static int irq_default_primary(void *arg)
 {
 	(void)arg;
@@ -1315,11 +1475,13 @@ int request_threaded_irq(int irq, irq_handler_t fn, irq_handler_t thread_fn,
 	if (!fn) {
 		fn = irq_default_primary;
 		/* A level line must stay masked until the thread ran;
-		 * message-signalled sources are edge and need not be. */
-		if (d->kind == IRQ_KIND_GSI && !(flags & IRQF_ONESHOT))
+		 * message-signalled sources are edge and need not be.  A
+		 * source behind a demultiplexing controller (a GPIO pad)
+		 * says so with IRQ_CHIP_ONESHOT_REQUIRED. */
+		if (desc_needs_oneshot(d) && !(flags & IRQF_ONESHOT))
 			return -EINVAL;
 	}
-	if (d->kind != IRQ_KIND_GSI && fn == irq_default_primary)
+	if (!desc_needs_oneshot(d) && fn == irq_default_primary)
 		flags &= ~(unsigned long)IRQF_ONESHOT;
 
 	mutex_lock(&d->req_mutex);
@@ -1758,4 +1920,82 @@ int irq_desc_retrigger(int irq)
 	desc_retrigger(d);
 	spin_unlock_irqrestore(&d->lock, fl);
 	return 0;
+}
+
+/* ==========================================================================
+ * Trigger type and wake-up
+ * ========================================================================== */
+
+int irq_set_irq_type(int irq, unsigned int type)
+{
+	struct irq_desc *d = irq_to_desc(irq);
+	uint64_t fl;
+	int rc;
+
+	if (!d || (type & ~IRQ_TYPE_SENSE_MASK))
+		return -EINVAL;
+	/* Level high and low at once, or a level and an edge, is no trigger
+	 * a pin can have. */
+	if ((type & IRQ_TYPE_LEVEL_MASK) == IRQ_TYPE_LEVEL_MASK ||
+	    ((type & IRQ_TYPE_LEVEL_MASK) && (type & IRQ_TYPE_EDGE_BOTH)))
+		return -EINVAL;
+	if (!d->ops || !d->ops->set_type)
+		return -ENOSYS;
+	spin_lock_irqsave(&d->lock, &fl);
+	rc = d->ops->set_type(d->irq, d->data, type);
+	if (rc == 0)
+		d->trigger = type;
+	spin_unlock_irqrestore(&d->lock, fl);
+	return rc;
+}
+
+unsigned int irq_get_trigger_type(int irq)
+{
+	struct irq_desc *d = irq_to_desc(irq);
+
+	if (!d)
+		return IRQ_TYPE_NONE;
+	if (d->kind == IRQ_KIND_GSI && d->trigger == IRQ_TYPE_NONE) {
+		if (d->gsi_level)
+			return d->gsi_active_low ? IRQ_TYPE_LEVEL_LOW :
+						   IRQ_TYPE_LEVEL_HIGH;
+		return d->gsi_active_low ? IRQ_TYPE_EDGE_FALLING :
+					   IRQ_TYPE_EDGE_RISING;
+	}
+	return d->trigger;
+}
+
+int irq_set_irq_wake(int irq, unsigned int on)
+{
+	struct irq_desc *d = irq_to_desc(irq);
+	uint64_t fl;
+	int rc = 0;
+
+	if (!d)
+		return -EINVAL;
+	spin_lock_irqsave(&d->lock, &fl);
+	if (on) {
+		if (d->wake_depth == 0 && d->ops && d->ops->set_wake)
+			rc = d->ops->set_wake(d->irq, d->data, 1);
+		if (rc == 0)
+			d->wake_depth++;
+	} else if (WARN(d->wake_depth == 0,
+			"irq %d: unbalanced disable_irq_wake", irq)) {
+		rc = -EINVAL;
+	} else {
+		if (d->wake_depth == 1 && d->ops && d->ops->set_wake)
+			rc = d->ops->set_wake(d->irq, d->data, 0);
+		/* The count drops even if the source refused: the caller
+		 * has given the wake-up up either way. */
+		d->wake_depth--;
+	}
+	spin_unlock_irqrestore(&d->lock, fl);
+	return rc;
+}
+
+int irq_is_wake_enabled(int irq)
+{
+	struct irq_desc *d = irq_to_desc(irq);
+
+	return d ? d->wake_depth != 0 : 0;
 }

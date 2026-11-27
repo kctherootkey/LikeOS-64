@@ -8,6 +8,7 @@ RTLD_DIR = ../lib/rtld
 LIBPAM_DIR = ../lib/libpam
 LIBCRYPT_DIR = ../lib/libcrypt
 LIBAUDIO_DIR = ../lib/libaudio
+LIBUDEV_DIR = ../lib/libudev
 
 # Header dependencies: without them a change to a libc header rebuilt none of
 # these programs, so a binary could be linked against a libc whose structures
@@ -18,6 +19,7 @@ CFLAGS = $(DEPFLAGS) -Wall -Wextra -Werror=implicit-function-declaration \
 	-Werror=misleading-indentation -O2 -nostdlib -fno-builtin -fstack-protector-strong \
          -mno-red-zone -ffreestanding -fPIE -I$(LIBC_DIR)/include \
          -I$(LIBPAM_DIR)/include -I$(LIBAUDIO_DIR)/include \
+         -I$(LIBUDEV_DIR)/include \
          -fno-tree-vectorize -fno-strict-aliasing
 
 # Dynamic PIE linking against libc.so (includes pthread)
@@ -114,9 +116,11 @@ addgroup: adduser
 delgroup: deluser
 	cp deluser delgroup
 
-# test_libc: exercises pam_* and crypt() directly, so link both explicitly.
+# test_libc: exercises pam_* and crypt() directly, so link both explicitly;
+# and libudev (the input device information libinput reads).
 tests/test_libc: $(CRT1) tests/test_libc.o $(LDSCRIPT)
-	$(LD) $(LDFLAGS) $(AUTH_LDFLAGS) $(CRT1) tests/test_libc.o -lpam -lcrypt $(LIBS) -o $@
+	$(LD) $(LDFLAGS) $(AUTH_LDFLAGS) -L$(LIBUDEV_DIR) -rpath-link $(LIBUDEV_DIR) \
+		$(CRT1) tests/test_libc.o -lpam -lcrypt -ludev $(LIBS) -o $@
 
 # reboot and halt are copies of poweroff (determines action from argv[0])
 reboot: poweroff

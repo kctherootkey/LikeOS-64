@@ -11,6 +11,10 @@
 #include <kernel/io/console.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/interrupt.h>
+#include <kernel/ke/sched.h>
+#include <kernel/ke/mutex.h>
+#include <kernel/ke/workqueue.h>
+#include <kernel/dev/gpio/gpiolib.h>
 #include <kernel/uapi/bug.h>
 /* AcpiHwClearAcpiStatus() is internal to ACPICA and reachable through no
  * public header; achware.h, where it is declared, needs most of ACPICA's
@@ -34,6 +38,14 @@ ACPI_STATUS AcpiHwClearAcpiStatus(void);
 
 static acpi_info_t g_acpi_info = { 0 };
 
+/* The namespace is loaded and initialised (acpi_init got through). */
+static volatile int g_acpi_namespace_ready;
+
+int acpi_namespace_ready(void)
+{
+	return __atomic_load_n(&g_acpi_namespace_ready, __ATOMIC_ACQUIRE);
+}
+
 // ACPICA RSDP address setter (defined in oslikeos.c)
 extern void acpica_set_rsdp(uint64_t phys_addr);
 
@@ -54,14 +66,6 @@ static void my_memcpy(void *dst, const void *src, size_t n)
 	const uint8_t *s = (const uint8_t *)src;
 	for (size_t i = 0; i < n; i++)
 		d[i] = s[i];
-}
-
-static int my_strlen(const char *s)
-{
-	int len = 0;
-	while (s[len])
-		len++;
-	return len;
 }
 
 static void my_strncpy(char *dst, const char *src, int n)
@@ -198,6 +202,19 @@ static void acpi_parse_madt(void)
 // The EC uses two IO ports (data + command/status) with a standard protocol.
 // AML methods (e.g. _SRS for PS/2 devices) access EC registers through this.
 // Without this handler, ACPICA cannot evaluate AML that touches EC OpRegions.
+//
+// Serialisation: every transaction (one operation region access, one
+// query) holds ec_mutex -- AML runs in many tasks at once, and ACPICA
+// leaves its interpreter while an operation region handler runs -- and,
+// when the EC's _GLK says so, the ACPI global lock inside it (with a
+// timeout, as a holder of the global lock may be waiting for ec_mutex).
+//
+// Events: the EC's GPE handler (interrupt context, or the boot-time
+// poll) only looks at SCI_EVT.  The queries run in an ordered work queue
+// (kec), with the GPE left disabled until they are done, and each event's
+// _Qxx method in a second one (kec_query), in arrival order.  Before the
+// work queues exist (acpi_init), the boot-time poll queries and runs the
+// methods itself, after the SCI handler returned.
 // ============================================================================
 
 // EC status register bits
@@ -213,6 +230,31 @@ static uint16_t ec_data_port = 0;
 static uint16_t ec_cmd_port = 0;
 static int ec_initialized = 0;
 static ACPI_HANDLE ec_device_handle = NULL; // saved for deferred _REG call
+static DEFINE_MUTEX(ec_mutex); // one transaction at a time
+static int ec_use_global_lock; // _GLK: transactions take the global lock
+#define EC_GLK_TIMEOUT_MS 1000
+
+/* Begin a transaction: 0, or -1 when the global lock could not be had.
+ * Thread context (the mutex spins where sleeping is impossible: before
+ * the scheduler, with interrupts off). */
+static int ec_lock(UINT32 *glk)
+{
+	*glk = 0;
+	mutex_lock(&ec_mutex);
+	if (ec_use_global_lock &&
+	    ACPI_FAILURE(AcpiAcquireGlobalLock(EC_GLK_TIMEOUT_MS, glk))) {
+		mutex_unlock(&ec_mutex);
+		return -1;
+	}
+	return 0;
+}
+
+static void ec_unlock(UINT32 glk)
+{
+	if (ec_use_global_lock)
+		(void)AcpiReleaseGlobalLock(glk);
+	mutex_unlock(&ec_mutex);
+}
 
 static int ec_wait_ibf_clear(void)
 {
@@ -273,6 +315,8 @@ static ACPI_STATUS ec_space_handler(UINT32 Function,
 {
 	int bytes = BitWidth / 8;
 	uint8_t *val = (uint8_t *)Value;
+	ACPI_STATUS st = AE_OK;
+	UINT32 glk;
 
 	(void)HandlerContext;
 	(void)RegionContext;
@@ -281,7 +325,11 @@ static ACPI_STATUS ec_space_handler(UINT32 Function,
 		return AE_BAD_PARAMETER;
 	if (Function != ACPI_READ && Function != ACPI_WRITE)
 		return AE_BAD_PARAMETER;
+	if (ec_lock(&glk))
+		return AE_NOT_FOUND;
 
+	/* The whole access is one transaction: a multi-byte field is not
+	 * torn by another task's access in between. */
 	for (int i = 0; i < bytes; i++) {
 		int rc;
 		if (Function == ACPI_READ) {
@@ -296,10 +344,13 @@ static ACPI_STATUS ec_space_handler(UINT32 Function,
 			if (rc)
 				acpi_dbg("ACPI EC: WR FAIL\n");
 		}
-		if (rc)
-			return AE_TIME;
+		if (rc) {
+			st = AE_TIME;
+			break;
+		}
 	}
-	return AE_OK;
+	ec_unlock(glk);
+	return st;
 }
 
 // Parse IO ports from EC _CRS — first IO resource = data, second = command
@@ -375,6 +426,17 @@ static void acpi_ec_init(void)
 	ec_data_port = ports.data_port;
 	ec_cmd_port = ports.cmd_port;
 
+	// _GLK: the firmware wants the global lock around EC transactions.
+	if (ec_handle) {
+		ACPI_OBJECT glk;
+		ACPI_BUFFER gbuf = { sizeof(glk), &glk };
+
+		if (ACPI_SUCCESS(AcpiEvaluateObject(ec_handle, "_GLK", NULL,
+						    &gbuf)) &&
+		    glk.Type == ACPI_TYPE_INTEGER && glk.Integer.Value)
+			ec_use_global_lock = 1;
+	}
+
 	// 3. Install EC address space handler at root.
 	// Use No_Reg variant — _REG must be called AFTER AcpiInitializeObjects
 	// so the AML namespace is fully ready. Proper sequence:
@@ -424,19 +486,50 @@ static ACPI_STATUS acpi_exception_handler(ACPI_STATUS AmlStatus, ACPI_NAME Name,
 // Stub OpRegion Handlers — prevent silent AML failures
 // ============================================================================
 
-// GPIO handler — Dell DSDTs commonly use GPIO OpRegions
+// GPIO handler — Dell DSDTs commonly use GPIO OpRegions.
+//
+// ACPICA hands the field's Connection() resource template to the handler
+// through the handler context (it fills Connection/Length/AccessLength in
+// the ACPI_CONNECTION_INFO given at install time, under the handler's
+// context mutex), Address is the pin index within that template and
+// BitWidth the number of pins.  The pins are driven through the GPIO
+// layer once their controller has registered; before that (AML run at
+// _INI time) and for pins the GPIO layer refuses, reads return 0 and
+// writes are dropped, as they always were.
+//
+// The context is shared by every GPIO field access: ACPICA fills it and
+// calls the handler under the handler's context mutex (a real mutex, see
+// oslikeos_sync.c), so the Connection read here is the one of this very
+// access.  AML runs in thread context only (the SCI's methods are
+// deferred to work queues); the GPIO layer sleeps and allocates, so an
+// access from anywhere else gets the old stub behaviour.
+static ACPI_CONNECTION_INFO g_gpio_conn_info;
+
 static ACPI_STATUS gpio_space_handler(UINT32 Function,
 				      ACPI_PHYSICAL_ADDRESS Address,
 				      UINT32 BitWidth, UINT64 *Value,
 				      void *HandlerContext, void *RegionContext)
 {
-	(void)HandlerContext;
+	ACPI_CONNECTION_INFO *ci = HandlerContext;
+	int rc = -1;
+
 	(void)RegionContext;
 	acpi_dbg("ACPI GPIO: %s addr=0x%llx bits=%d\n",
 		 Function == ACPI_READ ? "RD" : "WR",
 		 (unsigned long long)Address, BitWidth);
-	if (Function == ACPI_READ && Value)
-		*Value = 0; // default: all pins low
+	if (!Value)
+		return AE_BAD_PARAMETER;
+	/* Before the scheduler (AML of acpi_init) there is no GPIO
+	 * controller yet; with interrupts off the GPIO layer cannot be
+	 * used. */
+	if (ci && ci->Connection && ci->Length && sched_current() &&
+	    !WARN_ON_ONCE(irqs_disabled()))
+		rc = acpi_gpio_opregion_access(Function == ACPI_WRITE,
+					       (uint32_t)Address, BitWidth,
+					       Value, ci->Connection,
+					       ci->Length);
+	if (rc != 0 && Function == ACPI_READ)
+		*Value = 0; // no controller (yet) or pin refused: low
 	return AE_OK;
 }
 
@@ -477,37 +570,131 @@ static void acpi_ec_call_reg(void)
 
 static uint32_t ec_gpe_number = 0;
 
-// GPE handler for EC events (called by ACPICA when GPE fires).
+// The event work queues (acpi_late_init); NULL before.
+static struct workqueue_struct *ec_wq; // the queries (ordered)
+static struct workqueue_struct *ec_query_wq; // the _Qxx methods (ordered)
+static struct work_struct ec_event_work;
+#define EC_QUERIES_PER_PASS 8
+
+struct ec_query_item {
+	struct work_struct work;
+	uint8_t qval;
+};
+
+// One query transaction: the number of the next pending event in *qval,
+// 0 when there is none.  0, or -1 when the EC did not answer.
+static int ec_query(uint8_t *qval)
+{
+	UINT32 glk;
+	int rc = -1;
+
+	*qval = 0;
+	if (!ec_initialized || !ec_cmd_port)
+		return -1;
+	if (ec_lock(&glk))
+		return -1;
+	if (!(inb(ec_cmd_port) & EC_FLAG_SCI)) {
+		rc = 0;
+		goto out;
+	}
+	if (ec_wait_ibf_clear())
+		goto out;
+	outb(ec_cmd_port, EC_CMD_QUERY);
+	if (ec_wait_obf_set())
+		goto out;
+	*qval = inb(ec_data_port);
+	rc = 0;
+out:
+	ec_unlock(glk);
+	return rc;
+}
+
+static void ec_query_work_fn(struct work_struct *work)
+{
+	struct ec_query_item *qi =
+		container_of(work, struct ec_query_item, work);
+
+	(void)acpi_ec_eval_qxx(qi->qval);
+	kfree(qi);
+}
+
+// Run the event's _Qxx: queued once the queues exist, here before.
+static void ec_dispatch_event(uint8_t qval)
+{
+	struct workqueue_struct *q =
+		__atomic_load_n(&ec_query_wq, __ATOMIC_ACQUIRE);
+	struct ec_query_item *qi;
+
+	if (!q) {
+		(void)acpi_ec_eval_qxx(qval);
+		return;
+	}
+	qi = kcalloc(1, sizeof(*qi));
+	if (!qi) {
+		kprintf("ACPI EC: no memory, event 0x%02x dropped\n", qval);
+		return;
+	}
+	INIT_WORK(&qi->work, ec_query_work_fn);
+	qi->qval = qval;
+	(void)queue_work(q, &qi->work);
+}
+
+// The queries of one GPE: until the EC has no more events.  Returns
+// how many it had.
+static int ec_drain_events(void)
+{
+	int n = 0;
+
+	for (int pass = 0; pass < EC_QUERIES_PER_PASS; pass++) {
+		uint8_t qval;
+
+		if (ec_query(&qval) || qval == 0)
+			break;
+		acpi_dbg("ACPI EC: GPE event 0x%02x\n", qval);
+		ec_dispatch_event(qval);
+		n++;
+	}
+	return n;
+}
+
+static void ec_event_work_fn(struct work_struct *work)
+{
+	int n;
+
+	(void)work;
+	n = ec_drain_events();
+	// The handler left the GPE disabled for us (or it was enabled
+	// all along: a conditional enable then changes nothing).
+	(void)AcpiFinishGpe(NULL, ec_gpe_number);
+	// Events that came in meanwhile (the GPE was off): once more.
+	if (n && (inb(ec_cmd_port) & EC_FLAG_SCI))
+		(void)queue_work(ec_wq, &ec_event_work);
+}
+
+// GPE handler for EC events (called by ACPICA when GPE fires), in the
+// SCI handler or the boot-time poll, under ACPICA's GPE lock: it must not
+// run a transaction (that sleeps) nor AML.
 static UINT32 ec_gpe_handler_cb(ACPI_HANDLE gpe_dev, UINT32 gpe_num, void *ctx)
 {
+	struct workqueue_struct *q = __atomic_load_n(&ec_wq, __ATOMIC_ACQUIRE);
+
 	(void)gpe_dev;
 	(void)gpe_num;
 	(void)ctx;
 
 	if (!ec_initialized || !ec_cmd_port)
 		return ACPI_REENABLE_GPE;
-
-	uint8_t sts = inb(ec_cmd_port);
-	if (!(sts & EC_FLAG_SCI))
+	if (!(inb(ec_cmd_port) & EC_FLAG_SCI))
 		return ACPI_REENABLE_GPE;
-
-	if (ec_wait_ibf_clear())
+	if (!q) {
+		// acpi_init: the poll that called us queries next.
 		return ACPI_REENABLE_GPE;
-	outb(ec_cmd_port, EC_CMD_QUERY);
-	if (ec_wait_obf_set())
-		return ACPI_REENABLE_GPE;
-	uint8_t qval = inb(ec_data_port);
-
-	acpi_dbg("ACPI EC: GPE event 0x%02x\n", qval);
-
-	if (qval && ec_device_handle) {
-		char method[5] = { '_', 'Q',
-				   "0123456789ABCDEF"[(qval >> 4) & 0xF],
-				   "0123456789ABCDEF"[qval & 0xF], '\0' };
-		AcpiEvaluateObject(ec_device_handle, method, NULL, NULL);
 	}
-
-	return ACPI_REENABLE_GPE;
+	// The GPE stays disabled until the work has queried the EC empty
+	// (ec_event_work_fn finishes it): a level that stays up while the
+	// events wait cannot storm.
+	(void)queue_work(q, &ec_event_work);
+	return ACPI_INTERRUPT_HANDLED;
 }
 
 // Set up EC GPE: read _GPE, install handler, enable GPE in hardware.
@@ -559,54 +746,36 @@ static void ec_setup_gpe(void)
 }
 
 // Process pending EC events by sending query commands.
-// Fallback when SCI interrupt doesn't deliver GPE events.
+// Fallback when SCI interrupt doesn't deliver GPE events.  Thread
+// context; at boot (acpi_init) the _Qxx methods run right here.
 static void ec_process_pending_events(void)
 {
 	if (!ec_initialized || !ec_cmd_port)
 		return;
 
 	// Also call ACPICA's SCI handler to process PM/GPE status registers
+	// (and, at boot, the GPE methods it deferred).
 	extern void acpi_poll_events(void);
 	acpi_poll_events();
 
-	for (int pass = 0; pass < 8; pass++) {
-		uint8_t sts = inb(ec_cmd_port);
-		if (!(sts & EC_FLAG_SCI)) {
+	for (int pass = 0; pass < EC_QUERIES_PER_PASS; pass++) {
+		uint8_t qval;
+
+		if (ec_query(&qval)) {
+			acpi_dbg("ACPI EC: query timeout (pass %d)\n", pass);
+			break;
+		}
+		acpi_dbg("ACPI EC: query returned 0x%02x\n", qval);
+		if (qval == 0) {
 			if (pass)
 				acpi_dbg(
 					"ACPI EC: SCI_EVT cleared after %d queries\n",
 					pass);
-			break;
-		}
-
-		// Send query command
-		if (ec_wait_ibf_clear())
-			break;
-		outb(ec_cmd_port, EC_CMD_QUERY);
-		if (ec_wait_obf_set()) {
-			acpi_dbg("ACPI EC: query timeout (pass %d)\n", pass);
-			break;
-		}
-		uint8_t qval = inb(ec_data_port);
-		acpi_dbg("ACPI EC: query returned 0x%02x\n", qval);
-
-		if (qval == 0)
 			break; // No event pending
+		}
 
 		// Evaluate _Qxx method on EC device
-		if (ec_device_handle) {
-			char method[5];
-			method[0] = '_';
-			method[1] = 'Q';
-			method[2] = "0123456789ABCDEF"[(qval >> 4) & 0xF];
-			method[3] = "0123456789ABCDEF"[qval & 0xF];
-			method[4] = '\0';
-
-			ACPI_STATUS as = AcpiEvaluateObject(ec_device_handle,
-							    method, NULL, NULL);
-			acpi_dbg("ACPI EC: %s -> %s\n", method,
-				 ACPI_SUCCESS(as) ? "OK" : "not found/failed");
-		}
+		ec_dispatch_event(qval);
 
 		// Check i8042 after each event
 		uint8_t ps2 = inb(0x64);
@@ -621,7 +790,41 @@ static void ec_process_pending_events(void)
 
 void acpi_service_events(void)
 {
-	ec_process_pending_events();
+	struct workqueue_struct *q = __atomic_load_n(&ec_wq, __ATOMIC_ACQUIRE);
+
+	if (!q) {
+		ec_process_pending_events();
+		return;
+	}
+	// The queues run the events: the SCI handler's GPE methods, the
+	// EC's queries.
+	extern void acpi_poll_events(void);
+	acpi_poll_events();
+	if (ec_initialized && ec_cmd_port && (inb(ec_cmd_port) & EC_FLAG_SCI))
+		(void)queue_work(q, &ec_event_work);
+}
+
+void acpi_late_init(void)
+{
+	extern int acpi_os_initialize1(void);
+	struct workqueue_struct *ev, *qr;
+
+	(void)acpi_os_initialize1();
+	if (!ec_initialized)
+		return;
+	INIT_WORK(&ec_event_work, ec_event_work_fn);
+	ev = alloc_ordered_workqueue("kec", 0);
+	qr = alloc_ordered_workqueue("kec_query", 0);
+	if (!ev || !qr) {
+		kprintf("ACPI EC: no work queues, events are not serviced\n");
+		if (ev)
+			destroy_workqueue(ev);
+		if (qr)
+			destroy_workqueue(qr);
+		return;
+	}
+	__atomic_store_n(&ec_query_wq, qr, __ATOMIC_RELEASE);
+	__atomic_store_n(&ec_wq, ev, __ATOMIC_RELEASE);
 }
 
 int acpi_ec_eval_qxx(uint8_t qval)
@@ -717,7 +920,8 @@ int acpi_init(uint64_t rsdp_hint)
 	// access GPIO silently abort.
 	status = AcpiInstallAddressSpaceHandler(ACPI_ROOT_OBJECT,
 						ACPI_ADR_SPACE_GPIO,
-						gpio_space_handler, NULL, NULL);
+						gpio_space_handler, NULL,
+						&g_gpio_conn_info);
 	if (ACPI_FAILURE(status))
 		acpi_dbg("ACPI: GPIO handler install failed (%d)\n",
 			 (int)status);
@@ -823,6 +1027,9 @@ int acpi_init(uint64_t rsdp_hint)
 		acpi_dbg("0x60=%02x ", inb(0x60)); // KBC data
 		acpi_dbg("0x64=%02x\n", inb(0x64)); // KBC status
 	}
+
+	// The namespace is usable from here on (acpi_dev.c).
+	__atomic_store_n(&g_acpi_namespace_ready, 1, __ATOMIC_RELEASE);
 
 	// Parse MADT for CPU/IOAPIC information
 	acpi_parse_madt();
@@ -997,27 +1204,12 @@ void *aml_bump_alloc(aml_bump_alloc_t *alloc, uint32_t size)
 	return p;
 }
 
-void aml_value_init(aml_value_t *val)
-{
-	if (val)
-		my_memset(val, 0, sizeof(*val));
-}
-
 void aml_value_copy(aml_value_t *dst, const aml_value_t *src,
 		    aml_bump_alloc_t *alloc)
 {
 	(void)alloc;
 	if (dst && src)
 		my_memcpy(dst, src, sizeof(*dst));
-}
-
-uint64_t aml_value_to_integer(const aml_value_t *val)
-{
-	if (!val)
-		return 0;
-	if (val->type == AML_VALUE_INTEGER)
-		return val->integer;
-	return 0;
 }
 
 // ============================================================================
@@ -1101,311 +1293,6 @@ int acpi_aml_find_devices_by_hid(const char *hid, acpi_aml_device_info_t *out,
 	return ctx.count;
 }
 
-// Walk direct children (depth = 1) of the given ACPI path and populate info.
-int acpi_aml_find_children(const char *parent_path, acpi_aml_device_info_t *out,
-			   int max_out)
-{
-	if (!parent_path || !out || max_out <= 0)
-		return 0;
-
-	ACPI_HANDLE parent;
-	ACPI_STATUS status = AcpiGetHandle(NULL, (char *)parent_path, &parent);
-	if (ACPI_FAILURE(status))
-		return 0;
-
-	find_devices_ctx_t ctx;
-	ctx.hid = NULL;
-	ctx.out = out;
-	ctx.max_out = max_out;
-	ctx.count = 0;
-
-	// Walk depth=1 under the parent to get immediate children only
-	AcpiWalkNamespace(ACPI_TYPE_DEVICE, parent, 1, find_devices_callback,
-			  NULL, &ctx, NULL);
-	return ctx.count;
-}
-
-// ============================================================================
-// _STA Evaluation
-// ============================================================================
-
-uint32_t acpi_aml_eval_sta(const char *device_path)
-{
-	ACPI_HANDLE handle;
-	ACPI_STATUS status;
-	ACPI_BUFFER buf = { ACPI_ALLOCATE_BUFFER, NULL };
-	uint32_t sta_value =
-		0x0F; // Default: present + enabled + functioning + visible
-
-	if (!device_path)
-		return 0x0F;
-
-	status = AcpiGetHandle(NULL, (char *)device_path, &handle);
-	if (ACPI_FAILURE(status))
-		return 0x0F; // Not found = assume present
-
-	status = AcpiEvaluateObject(handle, "_STA", NULL, &buf);
-	if (status == AE_NOT_FOUND)
-		return 0x0F; // No _STA = assume present & enabled
-
-	if (ACPI_SUCCESS(status) && buf.Pointer) {
-		ACPI_OBJECT *obj = (ACPI_OBJECT *)buf.Pointer;
-		if (obj->Type == ACPI_TYPE_INTEGER)
-			sta_value = (uint32_t)obj->Integer.Value;
-		AcpiOsFree(buf.Pointer);
-	}
-
-	return sta_value;
-}
-
-// ============================================================================
-// _DEP Evaluation
-// ============================================================================
-
-int acpi_aml_eval_dep(const char *device_path,
-		      char dep_paths[][ACPI_AML_MAX_PATH], int max_deps)
-{
-	ACPI_HANDLE handle;
-	ACPI_STATUS status;
-	ACPI_BUFFER buf = { ACPI_ALLOCATE_BUFFER, NULL };
-	int count = 0;
-
-	if (!device_path || !dep_paths || max_deps <= 0)
-		return 0;
-
-	status = AcpiGetHandle(NULL, (char *)device_path, &handle);
-	if (ACPI_FAILURE(status))
-		return 0;
-
-	status = AcpiEvaluateObject(handle, "_DEP", NULL, &buf);
-	if (ACPI_FAILURE(status) || !buf.Pointer) {
-		if (buf.Pointer)
-			AcpiOsFree(buf.Pointer);
-		return 0;
-	}
-
-	ACPI_OBJECT *obj = (ACPI_OBJECT *)buf.Pointer;
-	if (obj->Type == ACPI_TYPE_PACKAGE) {
-		for (UINT32 i = 0; i < obj->Package.Count && count < max_deps;
-		     i++) {
-			ACPI_OBJECT *elem = &obj->Package.Elements[i];
-			if (elem->Type == ACPI_TYPE_LOCAL_REFERENCE &&
-			    elem->Reference.Handle) {
-				ACPI_BUFFER name_buf = { ACPI_ALLOCATE_BUFFER,
-							 NULL };
-				if (AcpiGetName(elem->Reference.Handle,
-						ACPI_FULL_PATHNAME,
-						&name_buf) == AE_OK) {
-					my_strncpy(dep_paths[count],
-						   (char *)name_buf.Pointer,
-						   ACPI_AML_MAX_PATH);
-					AcpiOsFree(name_buf.Pointer);
-					count++;
-				}
-			}
-		}
-	}
-
-	AcpiOsFree(buf.Pointer);
-	return count;
-}
-
-// ============================================================================
-// _CRS Evaluation and Resource Parsing
-// ============================================================================
-
-static ACPI_STATUS crs_walk_callback(ACPI_RESOURCE *Resource, void *Context)
-{
-	acpi_crs_result_t *result = (acpi_crs_result_t *)Context;
-
-	switch (Resource->Type) {
-	case ACPI_RESOURCE_TYPE_FIXED_MEMORY32:
-		if (result->mmio_base == 0) {
-			result->mmio_base =
-				Resource->Data.FixedMemory32.Address;
-			result->mmio_len =
-				Resource->Data.FixedMemory32.AddressLength;
-		}
-		if (result->mmio_range_count < ACPI_CRS_MAX_MMIO_RANGES) {
-			uint8_t idx = result->mmio_range_count;
-			result->mmio_ranges[idx].base =
-				Resource->Data.FixedMemory32.Address;
-			result->mmio_ranges[idx].length =
-				Resource->Data.FixedMemory32.AddressLength;
-			result->mmio_range_count++;
-		}
-		break;
-
-	case ACPI_RESOURCE_TYPE_ADDRESS32: {
-		ACPI_RESOURCE_ADDRESS32 *a32 = &Resource->Data.Address32;
-		if (a32->ResourceType == ACPI_MEMORY_RANGE &&
-		    result->mmio_base == 0) {
-			result->mmio_base = a32->Address.Minimum;
-			result->mmio_len = a32->Address.AddressLength;
-		}
-		if (a32->ResourceType == ACPI_MEMORY_RANGE &&
-		    result->mmio_range_count < ACPI_CRS_MAX_MMIO_RANGES) {
-			uint8_t idx = result->mmio_range_count;
-			result->mmio_ranges[idx].base = a32->Address.Minimum;
-			result->mmio_ranges[idx].length =
-				a32->Address.AddressLength;
-			result->mmio_range_count++;
-		}
-		break;
-	}
-
-	case ACPI_RESOURCE_TYPE_ADDRESS64: {
-		ACPI_RESOURCE_ADDRESS64 *a64 = &Resource->Data.Address64;
-		if (a64->ResourceType == ACPI_MEMORY_RANGE &&
-		    result->mmio_base == 0) {
-			result->mmio_base = a64->Address.Minimum;
-			result->mmio_len = (uint32_t)a64->Address.AddressLength;
-		}
-		if (a64->ResourceType == ACPI_MEMORY_RANGE &&
-		    result->mmio_range_count < ACPI_CRS_MAX_MMIO_RANGES) {
-			uint8_t idx = result->mmio_range_count;
-			result->mmio_ranges[idx].base = a64->Address.Minimum;
-			result->mmio_ranges[idx].length =
-				(uint32_t)a64->Address.AddressLength;
-			result->mmio_range_count++;
-		}
-		break;
-	}
-
-	case ACPI_RESOURCE_TYPE_IRQ: {
-		// Legacy ISA IRQ descriptor (used by PNP0303/PNP0F13 PS/2 devices)
-		ACPI_RESOURCE_IRQ *irq = &Resource->Data.Irq;
-		result->irq_triggering =
-			(irq->Triggering == ACPI_EDGE_SENSITIVE) ? 1 : 0;
-		result->irq_polarity =
-			(irq->Polarity == ACPI_ACTIVE_LOW) ? 1 : 0;
-		result->irq_sharing = irq->Shareable ? 1 : 0;
-		for (UINT8 j = 0; j < irq->InterruptCount &&
-				  result->irq_count < ACPI_CRS_MAX_IRQS;
-		     j++) {
-			result->irqs[result->irq_count++] = irq->Interrupts[j];
-		}
-		break;
-	}
-
-	case ACPI_RESOURCE_TYPE_EXTENDED_IRQ: {
-		ACPI_RESOURCE_EXTENDED_IRQ *irq = &Resource->Data.ExtendedIrq;
-		result->irq_triggering =
-			(irq->Triggering == ACPI_EDGE_SENSITIVE) ? 1 : 0;
-		result->irq_polarity =
-			(irq->Polarity == ACPI_ACTIVE_LOW) ? 1 : 0;
-		result->irq_sharing = irq->Shareable ? 1 : 0;
-		for (UINT8 j = 0; j < irq->InterruptCount &&
-				  result->irq_count < ACPI_CRS_MAX_IRQS;
-		     j++) {
-			result->irqs[result->irq_count++] = irq->Interrupts[j];
-		}
-		break;
-	}
-
-	case ACPI_RESOURCE_TYPE_SERIAL_BUS: {
-		ACPI_RESOURCE_I2C_SERIALBUS *i2c;
-		if (Resource->Data.CommonSerialBus.Type !=
-		    ACPI_RESOURCE_SERIAL_TYPE_I2C)
-			break;
-		if (result->i2c_device_count >= ACPI_CRS_MAX_I2C_DEVICES)
-			break;
-		i2c = &Resource->Data.I2cSerialBus;
-		{
-			uint8_t idx = result->i2c_device_count;
-			result->i2c_devices[idx].slave_addr = i2c->SlaveAddress;
-			result->i2c_devices[idx].connection_speed =
-				i2c->ConnectionSpeed;
-			result->i2c_devices[idx].addr_mode =
-				(i2c->AccessMode == ACPI_I2C_10BIT_MODE) ? 1 :
-									   0;
-			result->i2c_device_count++;
-		}
-		break;
-	}
-
-	case ACPI_RESOURCE_TYPE_GPIO: {
-		ACPI_RESOURCE_GPIO *gpio = &Resource->Data.Gpio;
-		if (gpio->ConnectionType == ACPI_RESOURCE_GPIO_TYPE_INT &&
-		    gpio->PinTableLength > 0 && gpio->PinTable &&
-		    !result->gpio_int.valid) {
-			result->gpio_int.pin = gpio->PinTable[0];
-			result->gpio_int.triggering =
-				(gpio->Triggering == ACPI_EDGE_SENSITIVE) ? 1 :
-									    0;
-			result->gpio_int.polarity =
-				(gpio->Polarity == ACPI_ACTIVE_LOW)  ? 1 :
-				(gpio->Polarity == ACPI_ACTIVE_BOTH) ? 2 :
-								       0;
-			result->gpio_int.sharing = gpio->Shareable ? 1 : 0;
-			result->gpio_int.valid = 1;
-			if (gpio->ResourceSource.StringPtr) {
-				const char *src =
-					gpio->ResourceSource.StringPtr;
-				int i = 0;
-				while (src[i] &&
-				       i < ACPI_CRS_GPIO_SOURCE_LEN - 1) {
-					result->gpio_int.resource_source[i] =
-						src[i];
-					i++;
-				}
-				result->gpio_int.resource_source[i] = '\0';
-			}
-		}
-		break;
-	}
-
-	case ACPI_RESOURCE_TYPE_END_TAG:
-		return AE_OK;
-
-	default:
-		break;
-	}
-
-	return AE_OK;
-}
-
-int acpi_aml_eval_crs(const char *device_path, acpi_crs_result_t *result)
-{
-	ACPI_HANDLE handle;
-	ACPI_STATUS status;
-
-	if (!device_path || !result)
-		return -1;
-	my_memset(result, 0, sizeof(*result));
-
-	status = AcpiGetHandle(NULL, (char *)device_path, &handle);
-	if (ACPI_FAILURE(status)) {
-		acpi_dbg("[CRS] %s not found(%d)\n", device_path, (int)status);
-		return -1;
-	}
-
-	// Check _CRS exists + try eval + walk — one diagnostic line
-	{
-		ACPI_HANDLE crs_h;
-		ACPI_STATUS ck = AcpiGetHandle(handle, "_CRS", &crs_h);
-		ACPI_BUFFER eb = { ACPI_ALLOCATE_BUFFER, NULL };
-		ACPI_STATUS ev = AcpiEvaluateObject(handle, "_CRS", NULL, &eb);
-		int blen = 0;
-		if (ACPI_SUCCESS(ev) && eb.Pointer) {
-			ACPI_OBJECT *o = (ACPI_OBJECT *)eb.Pointer;
-			if (o->Type == ACPI_TYPE_BUFFER)
-				blen = (int)o->Buffer.Length;
-			AcpiOsFree(eb.Pointer);
-		}
-		acpi_dbg("[CRS] %s exist=%d eval=%d blen=%d\n", device_path,
-			 (int)ck, (int)ev, blen);
-	}
-
-	status = AcpiWalkResources(handle, "_CRS", crs_walk_callback, result);
-	if (ACPI_FAILURE(status)) {
-		acpi_dbg("[CRS] %s walk fail=%d\n", device_path, (int)status);
-		return -1;
-	}
-
-	return 0;
-}
-
 // ============================================================================
 // PNP Device Activation via _SRS (Set Resource Settings)
 // Reads the _CRS buffer and passes it to _SRS to activate the device.
@@ -1447,448 +1334,6 @@ int acpi_aml_activate_dev(const char *device_path)
 
 	acpi_dbg("[SRS] %s: activated via _SRS\n", device_path);
 	return 0;
-}
-
-// ============================================================================
-// _DSM Call (Device Specific Method)
-// ============================================================================
-
-int acpi_aml_call_dsm(const char *device_path, const uint8_t uuid[16],
-		      uint64_t revision, uint64_t func_index,
-		      aml_value_t *result)
-{
-	ACPI_HANDLE handle;
-	ACPI_STATUS status;
-	ACPI_OBJECT_LIST arg_list;
-	ACPI_OBJECT args[4];
-	ACPI_BUFFER ret_buf = { ACPI_ALLOCATE_BUFFER, NULL };
-
-	if (!device_path || !uuid)
-		return -1;
-	if (result)
-		aml_value_init(result);
-
-	status = AcpiGetHandle(NULL, (char *)device_path, &handle);
-	if (ACPI_FAILURE(status))
-		return -1;
-
-	// Arg0: UUID buffer (16 bytes, byte-swapped as per ACPI spec)
-	uint8_t uuid_buf[16];
-	// ACPI UUID byte order: first 3 components swapped, rest as-is
-	uuid_buf[0] = uuid[3];
-	uuid_buf[1] = uuid[2];
-	uuid_buf[2] = uuid[1];
-	uuid_buf[3] = uuid[0];
-	uuid_buf[4] = uuid[5];
-	uuid_buf[5] = uuid[4];
-	uuid_buf[6] = uuid[7];
-	uuid_buf[7] = uuid[6];
-	my_memcpy(&uuid_buf[8], &uuid[8], 8);
-
-	args[0].Type = ACPI_TYPE_BUFFER;
-	args[0].Buffer.Length = 16;
-	args[0].Buffer.Pointer = uuid_buf;
-
-	// Arg1: Revision
-	args[1].Type = ACPI_TYPE_INTEGER;
-	args[1].Integer.Value = revision;
-
-	// Arg2: Function Index
-	args[2].Type = ACPI_TYPE_INTEGER;
-	args[2].Integer.Value = func_index;
-
-	// Arg3: Empty package
-	args[3].Type = ACPI_TYPE_PACKAGE;
-	args[3].Package.Count = 0;
-	args[3].Package.Elements = NULL;
-
-	arg_list.Count = 4;
-	arg_list.Pointer = args;
-
-	status = AcpiEvaluateObject(handle, "_DSM", &arg_list, &ret_buf);
-	if (ACPI_FAILURE(status))
-		return -1;
-
-	if (result && ret_buf.Pointer) {
-		ACPI_OBJECT *obj = (ACPI_OBJECT *)ret_buf.Pointer;
-		if (obj->Type == ACPI_TYPE_INTEGER) {
-			result->type = AML_VALUE_INTEGER;
-			result->integer = obj->Integer.Value;
-		} else if (obj->Type == ACPI_TYPE_BUFFER) {
-			result->type = AML_VALUE_BUFFER;
-			// Note: caller must not use buffer after this function returns
-			// since we free it here. For simplicity, just return integer 0.
-			result->type = AML_VALUE_INTEGER;
-			result->integer = 0;
-			if (obj->Buffer.Length >= 1)
-				result->integer = obj->Buffer.Pointer[0];
-		}
-	}
-
-	if (ret_buf.Pointer)
-		AcpiOsFree(ret_buf.Pointer);
-	return 0;
-}
-
-// ============================================================================
-// PCI-to-ACPI Path Mapping
-// ============================================================================
-
-typedef struct {
-	uint32_t target_adr;
-	char *out_path;
-	int out_size;
-	int found;
-} find_pci_ctx_t;
-
-static ACPI_STATUS find_pci_callback(ACPI_HANDLE Object, UINT32 NestingLevel,
-				     void *Context, void **ReturnValue)
-{
-	find_pci_ctx_t *ctx = (find_pci_ctx_t *)Context;
-	ACPI_STATUS status;
-	uint64_t adr_val = 0;
-	ACPI_BUFFER name_buf = { ACPI_ALLOCATE_BUFFER, NULL };
-	(void)NestingLevel;
-	(void)ReturnValue;
-
-	if (ctx->found)
-		return AE_CTRL_TERMINATE;
-
-	// Try to get _ADR via public API
-	{
-		ACPI_BUFFER buf = { ACPI_ALLOCATE_BUFFER, NULL };
-		status = AcpiEvaluateObject(Object, "_ADR", NULL, &buf);
-		if (ACPI_FAILURE(status))
-			return AE_OK;
-		if (buf.Pointer) {
-			ACPI_OBJECT *obj = (ACPI_OBJECT *)buf.Pointer;
-			if (obj->Type == ACPI_TYPE_INTEGER)
-				adr_val = obj->Integer.Value;
-			AcpiOsFree(buf.Pointer);
-		} else {
-			return AE_OK;
-		}
-	}
-
-	if ((uint32_t)adr_val == ctx->target_adr) {
-		status = AcpiGetName(Object, ACPI_FULL_PATHNAME, &name_buf);
-		if (ACPI_SUCCESS(status) && name_buf.Pointer) {
-			my_strncpy(ctx->out_path, (char *)name_buf.Pointer,
-				   ctx->out_size);
-			AcpiOsFree(name_buf.Pointer);
-			ctx->found = 1;
-			return AE_CTRL_TERMINATE;
-		}
-	}
-
-	return AE_OK;
-}
-
-int acpi_find_pci_acpi_path(uint8_t bus, uint8_t device, uint8_t function,
-			    char *out_path, int out_size)
-{
-	find_pci_ctx_t ctx;
-	ACPI_STATUS status;
-
-	(void)bus;
-	if (!out_path || out_size <= 0)
-		return -1;
-
-	ctx.target_adr = ((uint32_t)device << 16) | function;
-	ctx.out_path = out_path;
-	ctx.out_size = out_size;
-	ctx.found = 0;
-
-	// Walk entire namespace looking for matching _ADR
-	status = AcpiWalkNamespace(ACPI_TYPE_DEVICE, ACPI_ROOT_OBJECT,
-				   ACPI_UINT32_MAX, find_pci_callback, NULL,
-				   &ctx, NULL);
-	(void)status;
-
-	if (ctx.found)
-		return 0;
-
-	// Fallback: for Intel LPSS I2C, try I2Cn naming convention
-	{
-		char i2c_name[16];
-		for (int n = 0; n < 8; n++) {
-			ACPI_HANDLE handle;
-
-			// Build candidate name like "\\_SB.PC00.I2Cn"
-			// Try finding I2Cn anywhere in namespace
-			i2c_name[0] = 'I';
-			i2c_name[1] = '2';
-			i2c_name[2] = 'C';
-			i2c_name[3] = '0' + (char)n;
-			i2c_name[4] = 0;
-
-			// Walk namespace for this name
-			ACPI_HANDLE root;
-			AcpiGetHandle(NULL, "\\_SB", &root);
-			if (!root)
-				break;
-
-			// Use AcpiGetDevices with NULL HID to find all, then match name
-			// Simpler: try common paths
-			char paths_to_try[4][32] = { "\\_SB.PC00.",
-						     "\\_SB.PCI0.", "\\_SB.",
-						     "\\." };
-			int matched = 0;
-			for (int p = 0; p < 4 && !matched; p++) {
-				char full[64];
-				int plen = my_strlen(paths_to_try[p]);
-				my_memcpy(full, paths_to_try[p], plen);
-				my_memcpy(full + plen, i2c_name, 5);
-				if (AcpiGetHandle(NULL, full, &handle) ==
-				    AE_OK) {
-					int fmatch = 0;
-					if (device == 0x15 &&
-					    function == (uint8_t)n && n <= 3)
-						fmatch = 1;
-					else if (device == 0x19 &&
-						 function == (uint8_t)(n - 4) &&
-						 n >= 4)
-						fmatch = 1;
-					if (fmatch) {
-						my_strncpy(out_path, full,
-							   out_size);
-						return 0;
-					}
-				}
-			}
-		}
-	}
-
-	return -1;
-}
-
-// ============================================================================
-// Power On Device with Dependencies
-// ============================================================================
-
-static int acpi_eval_method_on_path(const char *path, const char *method)
-{
-	ACPI_HANDLE handle;
-	ACPI_STATUS status;
-
-	status = AcpiGetHandle(NULL, (char *)path, &handle);
-	if (ACPI_FAILURE(status))
-		return -1;
-
-	status = AcpiEvaluateObject(handle, (char *)method, NULL, NULL);
-	return ACPI_SUCCESS(status) ? 0 : -1;
-}
-
-int acpi_power_on_device_with_deps(const char *device_path)
-{
-	char dep_paths[ACPI_DEP_MAX_DEPS][ACPI_AML_MAX_PATH];
-	int dep_count;
-	int dep_failures = 0;
-
-	if (!device_path)
-		return ACPI_FW_STATUS_NOT_FOUND;
-
-	// Step 1: Evaluate _DEP
-	dep_count =
-		acpi_aml_eval_dep(device_path, dep_paths, ACPI_DEP_MAX_DEPS);
-
-	// Step 2: Power on dependencies
-	for (int i = 0; i < dep_count; i++) {
-		if (acpi_eval_method_on_path(dep_paths[i], "_PS0") == 0) {
-			acpi_dbg("[ACPI-PWR] dep %s _PS0 ok\n", dep_paths[i]);
-		} else if (acpi_eval_method_on_path(dep_paths[i], "_ON") == 0) {
-			acpi_dbg("[ACPI-PWR] dep %s _ON ok\n", dep_paths[i]);
-		} else {
-			dep_failures++;
-		}
-	}
-
-	// Step 3: Power on _PR0 power resources (evaluate _PR0 package)
-	{
-		ACPI_HANDLE handle;
-		ACPI_BUFFER buf = { ACPI_ALLOCATE_BUFFER, NULL };
-		ACPI_STATUS status =
-			AcpiGetHandle(NULL, (char *)device_path, &handle);
-		if (ACPI_SUCCESS(status)) {
-			status = AcpiEvaluateObject(handle, "_PR0", NULL, &buf);
-			if (ACPI_SUCCESS(status) && buf.Pointer) {
-				ACPI_OBJECT *obj = (ACPI_OBJECT *)buf.Pointer;
-				if (obj->Type == ACPI_TYPE_PACKAGE) {
-					for (UINT32 i = 0;
-					     i < obj->Package.Count; i++) {
-						ACPI_OBJECT *elem =
-							&obj->Package
-								 .Elements[i];
-						if (elem->Type ==
-							    ACPI_TYPE_LOCAL_REFERENCE &&
-						    elem->Reference.Handle) {
-							ACPI_BUFFER nb = {
-								ACPI_ALLOCATE_BUFFER,
-								NULL
-							};
-							if (AcpiGetName(
-								    elem->Reference
-									    .Handle,
-								    ACPI_FULL_PATHNAME,
-								    &nb) ==
-							    AE_OK) {
-								char pr_path
-									[ACPI_AML_MAX_PATH];
-								my_strncpy(
-									pr_path,
-									(char *)nb
-										.Pointer,
-									ACPI_AML_MAX_PATH);
-								AcpiOsFree(
-									nb.Pointer);
-								if (acpi_eval_method_on_path(
-									    pr_path,
-									    "_ON") ==
-								    0)
-									acpi_dbg(
-										"[ACPI-PWR] pr0 %s _ON ok\n",
-										pr_path);
-							}
-						}
-					}
-				}
-				AcpiOsFree(buf.Pointer);
-			}
-		}
-	}
-
-	// Step 4: Check _STA
-	uint32_t dev_sta = acpi_aml_eval_sta(device_path);
-	acpi_dbg("[ACPI-PWR] %s _STA=0x%x\n", device_path, dev_sta);
-
-	// Step 5: Call _PS0 on target device
-	{
-		int ps0_rc = acpi_eval_method_on_path(device_path, "_PS0");
-		acpi_dbg("[ACPI-PWR] %s _PS0=%s dep=%d/%d\n", device_path,
-			 ps0_rc == 0 ? "ok" : "fail/absent",
-			 dep_count - dep_failures, dep_count);
-	}
-
-	return ACPI_FW_STATUS_OK;
-}
-
-// ============================================================================
-// Firmware Power On by HID
-// ============================================================================
-
-int acpi_fw_power_on_device(const char *hid, acpi_aml_device_info_t *out)
-{
-	acpi_aml_device_info_t info;
-	int found;
-
-	if (!hid || !hid[0])
-		return ACPI_FW_STATUS_NOT_FOUND;
-
-	found = acpi_aml_find_devices_by_hid(hid, &info, 1);
-	if (found <= 0)
-		return ACPI_FW_STATUS_NOT_FOUND;
-
-	if (out)
-		my_memcpy(out, &info, sizeof(info));
-
-	int rc = acpi_power_on_device_with_deps(info.path);
-	return rc;
-}
-
-// ============================================================================
-// Firmware Power On by PCI BDF
-// ============================================================================
-
-int acpi_fw_power_on_pci_device(uint8_t bus, uint8_t device, uint8_t function)
-{
-	char acpi_path[ACPI_AML_MAX_PATH];
-	int rc;
-
-	rc = acpi_find_pci_acpi_path(bus, device, function, acpi_path,
-				     sizeof(acpi_path));
-	if (rc != 0) {
-		acpi_dbg("[ACPI-PCI] no ACPI path for PCI %02x:%02x.%x\n", bus,
-			 device, function);
-		return ACPI_FW_STATUS_NOT_FOUND;
-	}
-
-	acpi_dbg("[ACPI-PCI] PCI %02x:%02x.%x => %s\n", bus, device, function,
-		 acpi_path);
-	return acpi_power_on_device_with_deps(acpi_path);
-}
-
-// ============================================================================
-// Execute a named method on a device
-// ============================================================================
-
-int acpi_aml_exec_device_method(const char *device_path,
-				const char *method_name, uint64_t *ret_value)
-{
-	ACPI_HANDLE handle;
-	ACPI_STATUS status;
-	ACPI_BUFFER buf = { ACPI_ALLOCATE_BUFFER, NULL };
-
-	if (!device_path || !method_name)
-		return -1;
-
-	status = AcpiGetHandle(NULL, (char *)device_path, &handle);
-	if (ACPI_FAILURE(status))
-		return -1;
-
-	status = AcpiEvaluateObject(handle, (char *)method_name, NULL, &buf);
-	if (ACPI_FAILURE(status))
-		return -1;
-
-	if (ret_value && buf.Pointer) {
-		ACPI_OBJECT *obj = (ACPI_OBJECT *)buf.Pointer;
-		if (obj->Type == ACPI_TYPE_INTEGER)
-			*ret_value = obj->Integer.Value;
-		else
-			*ret_value = 0;
-	}
-
-	if (buf.Pointer)
-		AcpiOsFree(buf.Pointer);
-	return 0;
-}
-
-int acpi_aml_exec_device_method_pkg3(const char *device_path,
-				     const char *method_name,
-				     uint64_t out_values[3])
-{
-	ACPI_HANDLE handle;
-	ACPI_STATUS status;
-	ACPI_BUFFER buf = { ACPI_ALLOCATE_BUFFER, NULL };
-	int rc = -1;
-
-	if (!device_path || !method_name || !out_values)
-		return -1;
-
-	status = AcpiGetHandle(NULL, (char *)device_path, &handle);
-	if (ACPI_FAILURE(status))
-		return -1;
-
-	status = AcpiEvaluateObject(handle, (char *)method_name, NULL, &buf);
-	if (ACPI_FAILURE(status))
-		return -1;
-
-	if (buf.Pointer) {
-		ACPI_OBJECT *obj = (ACPI_OBJECT *)buf.Pointer;
-		if (obj->Type == ACPI_TYPE_PACKAGE && obj->Package.Count >= 3) {
-			ACPI_OBJECT *elems = obj->Package.Elements;
-			if (elems[0].Type == ACPI_TYPE_INTEGER &&
-			    elems[1].Type == ACPI_TYPE_INTEGER &&
-			    elems[2].Type == ACPI_TYPE_INTEGER) {
-				out_values[0] = elems[0].Integer.Value;
-				out_values[1] = elems[1].Integer.Value;
-				out_values[2] = elems[2].Integer.Value;
-				rc = 0;
-			}
-		}
-		AcpiOsFree(buf.Pointer);
-	}
-
-	return rc;
 }
 
 // ============================================================================
@@ -2565,10 +2010,12 @@ int acpi_pci_lookup_irq(const char *bridge_path, uint8_t pci_device,
 							}
 
 							if (chosen_irq > 0) {
-								// Build a resource buffer to program via _SRS
-								// Use a small static buffer: IRQ descriptor + end tag
-								uint8_t srs_buf
-									[32];
+								// Build a resource buffer to program via _SRS:
+								// IRQ descriptor + end tag, in storage typed
+								// (and sized) as resources
+								ACPI_RESOURCE srs_res[2];
+								uint8_t *srs_buf =
+									(uint8_t *)srs_res;
 								ACPI_RESOURCE *sr =
 									(ACPI_RESOURCE
 										 *)

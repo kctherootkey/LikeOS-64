@@ -262,12 +262,6 @@ typedef struct {
 	uint8_t from_ssdt;
 } acpi_aml_device_info_t;
 
-#define ACPI_FW_STATUS_OK 0
-#define ACPI_FW_STATUS_NOT_FOUND -1
-#define ACPI_FW_STATUS_NO_PS0 -2
-#define ACPI_FW_STATUS_UNSUPPORTED -3
-#define ACPI_FW_STATUS_FAILED -4
-
 // ============================================================================
 // AML Tagged Value Type System
 // ============================================================================
@@ -315,53 +309,6 @@ typedef struct {
 	uint32_t used;
 	uint32_t capacity;
 } aml_bump_alloc_t;
-
-// ============================================================================
-// ACPI _CRS Resource Parsing Results
-// ============================================================================
-
-#define ACPI_CRS_MAX_I2C_DEVICES 8
-#define ACPI_CRS_MAX_IRQS 4
-#define ACPI_CRS_MAX_MMIO_RANGES 8
-#define ACPI_CRS_GPIO_SOURCE_LEN 64
-
-typedef struct {
-	uint64_t mmio_base;
-	uint32_t mmio_len;
-	// All MMIO ranges from _CRS (for multi-community GPIO controllers etc.)
-	struct {
-		uint64_t base;
-		uint32_t length;
-	} mmio_ranges[ACPI_CRS_MAX_MMIO_RANGES];
-	uint8_t mmio_range_count;
-	uint32_t irqs[ACPI_CRS_MAX_IRQS];
-	uint8_t irq_count;
-	uint8_t irq_triggering; // 0=level, 1=edge
-	uint8_t irq_polarity; // 0=active-high, 1=active-low
-	uint8_t irq_sharing; // 0=exclusive, 1=shared
-	struct {
-		uint16_t slave_addr;
-		uint32_t connection_speed;
-		uint8_t addr_mode; // 0=7-bit, 1=10-bit
-	} i2c_devices[ACPI_CRS_MAX_I2C_DEVICES];
-	uint8_t i2c_device_count;
-	// GPIO interrupt resource (from GpioInt in ACPI _CRS)
-	struct {
-		uint16_t pin; // GPIO pad number within community
-		uint8_t triggering; // 0=level, 1=edge
-		uint8_t polarity; // 0=active-high, 1=active-low, 2=active-both
-		uint8_t sharing; // 0=exclusive, 1=shared
-		uint8_t valid; // 1 if GpioInt resource was found
-		char resource_source
-			[ACPI_CRS_GPIO_SOURCE_LEN]; // GPIO controller path
-	} gpio_int;
-} acpi_crs_result_t;
-
-// ============================================================================
-// ACPI _DEP Dependency Results
-// ============================================================================
-
-#define ACPI_DEP_MAX_DEPS 8
 
 // ============================================================================
 // ACPI Functions
@@ -472,6 +419,10 @@ typedef struct __attribute__((packed)) {
 void acpi_poweroff(void);
 void acpi_reset(void);
 
+// 1 once acpi_init() has loaded and initialised the ACPI namespace (the
+// device layer, kernel/hal/acpi_dev.h, refuses to work before).
+int acpi_namespace_ready(void);
+
 // Initialize power management (call after acpi_init)
 void acpi_pm_init(void);
 
@@ -495,20 +446,6 @@ int acpi_get_table_aml(const char *signature, uint32_t index,
 int acpi_aml_find_devices_by_hid(const char *hid, acpi_aml_device_info_t *out,
 				 int max_out);
 
-// Walk direct children (depth = 1) of the given ACPI path.
-// Returns the number of child devices found (up to max_out).
-int acpi_aml_find_children(const char *parent_path, acpi_aml_device_info_t *out,
-			   int max_out);
-
-// Resolve a device by _HID, locate the nearest firmware _PS0 method on the
-// device or an ancestor scope, and execute a minimal AML subset if possible.
-// Returns one of ACPI_FW_STATUS_*.
-int acpi_fw_power_on_device(const char *hid, acpi_aml_device_info_t *out);
-
-// Find the ACPI device with _ADR matching the given PCI device/function,
-// then execute its _PS0 method. Returns one of ACPI_FW_STATUS_*.
-int acpi_fw_power_on_pci_device(uint8_t bus, uint8_t device, uint8_t function);
-
 // ============================================================================
 // ACPI Enhanced Evaluation Functions (aml_value_t based)
 // ============================================================================
@@ -518,52 +455,23 @@ void aml_bump_init(aml_bump_alloc_t *alloc);
 void aml_bump_destroy(aml_bump_alloc_t *alloc);
 void *aml_bump_alloc(aml_bump_alloc_t *alloc, uint32_t size);
 
-// Initialize an aml_value_t to uninitialized
-void aml_value_init(aml_value_t *val);
 // Deep copy
 void aml_value_copy(aml_value_t *dst, const aml_value_t *src,
 		    aml_bump_alloc_t *alloc);
-// Get integer from any value type (coerce)
-uint64_t aml_value_to_integer(const aml_value_t *val);
-
-// Evaluate _STA on a device. Returns status bits (0x0F if _STA absent).
-// Bit 0: Present, Bit 1: Enabled, Bit 3: Functioning, Bit 4: UI visible.
-uint32_t acpi_aml_eval_sta(const char *device_path);
-
-// Evaluate _DEP on a device. Returns dependency device paths.
-// dep_paths: array of path buffers, max_deps: array size.
-// Returns number of dependencies found (0 if _DEP absent).
-int acpi_aml_eval_dep(const char *device_path,
-		      char dep_paths[][ACPI_AML_MAX_PATH], int max_deps);
-
-// Evaluate _CRS on a device. Parses resource descriptors into result struct.
-// Returns 0 on success, <0 on failure.
-int acpi_aml_eval_crs(const char *device_path, acpi_crs_result_t *result);
-
 // Activate a PNP device by reading _CRS and passing it to _SRS.
 // This is what a conventional PNP subsystem does to enable devices.
 int acpi_aml_activate_dev(const char *device_path);
 
-// Call _DSM on a device with given UUID, revision, function index, and arg.
-// result: output value. Returns 0 on success, <0 on failure.
-int acpi_aml_call_dsm(const char *device_path, const uint8_t uuid[16],
-		      uint64_t revision, uint64_t func_index,
-		      aml_value_t *result);
-
-// Find the ACPI namespace path for a PCI device by BDF coordinates.
-// Searches for Device with _ADR matching (dev << 16 | func).
-// Returns 0 on success, stores path in out_path.
-int acpi_find_pci_acpi_path(uint8_t bus, uint8_t device, uint8_t function,
-			    char *out_path, int out_size);
-
-// Power on a device and all its _DEP dependencies (full sequence).
-// Evaluates _DEP, powers each dependency, then powers the target device.
-// Returns ACPI_FW_STATUS_*.
-int acpi_power_on_device_with_deps(const char *device_path);
-
 // Service pending ACPI/EC events once. Useful for firmware-driven device
 // bring-up paths that require SCI/GPE work before legacy I/O responds.
+// Thread context.  Once acpi_late_init() ran, the events are handed to
+// the ACPI work queues.
 void acpi_service_events(void);
+
+// The ACPI work queues (kacpid, kacpi_notify, kec, kec_query): from here
+// on no AML runs in interrupt context, the SCI handler's methods and the
+// EC's queries are run by these.  Once, right after workqueue_init().
+void acpi_late_init(void);
 
 // Return the GSI used for ACPI SCI, or 0 if not yet installed.
 uint32_t acpi_get_sci_gsi(void);
@@ -571,17 +479,6 @@ uint32_t acpi_get_sci_gsi(void);
 // Evaluate an EC query method directly (for example _Q66) when firmware uses
 // a state machine that can require repeated method execution.
 int acpi_ec_eval_qxx(uint8_t qval);
-
-// Execute a named method on a device path (e.g., "_PS0", "_RST").
-// Returns 0 on success, <0 on failure.
-int acpi_aml_exec_device_method(const char *device_path,
-				const char *method_name, uint64_t *ret_value);
-
-// Execute a named method that returns a 3-integer package.
-// Returns 0 on success, <0 on failure.
-int acpi_aml_exec_device_method_pkg3(const char *device_path,
-				     const char *method_name,
-				     uint64_t out_values[3]);
 
 // Look up PCI interrupt routing via ACPI _PRT on the parent bridge.
 // bridge_path: ACPI path of PCI root bridge (e.g. "\\_SB_.PC00")

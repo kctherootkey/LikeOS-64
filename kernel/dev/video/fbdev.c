@@ -12,6 +12,7 @@
 #include <kernel/dev/input/mouse.h>
 #include <kernel/dev/video/fb.h>
 #include <kernel/dev/video/fbdev.h>
+#include <kernel/dev/video/console_owner.h>
 #include <kernel/uapi/fb.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/io/console.h>
@@ -207,61 +208,47 @@ static int fbdev_put_var(const struct fb_var_screeninfo *var)
 /*
  * How many handles are open on /dev/fb0.
  *
- * A process that maps the framebuffer draws straight into video memory, behind
- * the console's back.  The console keeps its own back buffer, so the text is
- * never lost -- but nothing tells it to put the text back on screen when the
- * other program is done, and on a system with no virtual terminals to switch
- * between there is no other moment at which that would happen.  Killing an X
- * server left the screen showing whatever it had drawn last, with a working
- * but invisible shell behind it.
+ * NOT who owns the display.  A program that opens the framebuffer draws
+ * alongside the console, which goes on painting too -- exactly as the
+ * framebuffer console does on other systems.  A program that wants the
+ * screen to itself says so with KD_GRAPHICS (a display server does), and
+ * that is the console's output gate (console_display_owned below).
  *
- * So the last close is the signal.  Counted rather than tracked per handle
- * because a display server has several (it dup()s, and it survives fork), and
- * the console must not be redrawn while one of them is still drawing.
+ * What the count is still for is the writes themselves: a mapping client
+ * stores pixels straight into the buffer, and nothing marks them dirty.  On
+ * a framebuffer in video memory the device notices by itself; the console's
+ * buffer object on a display manager does not, so drm_console.c pushes the
+ * whole screen on each tick while the count is nonzero (fbdev_has_clients).
+ * And when the last handle closes, whatever the program left on the screen
+ * is painted over with the console again -- unless the display is owned,
+ * whose release repaints anyway.
+ *
+ * Counted rather than tracked per handle because a program has several (it
+ * dup()s, and it survives fork).  Changed atomically: two processors can
+ * open and close at once, and read from any context.
  */
 static int g_fb0_opens;
 
-/*
- * Is another program driving the display?
- *
- * While one is, the console must not paint: it and the display server would be
- * writing to the same pixels, and the console would win whenever anything --
- * a kernel message, an echoed keystroke -- made it draw.  On a system with
- * virtual terminals this is what KD_GRAPHICS does; the open count is the same
- * signal without the VT.  A display manager on a DRM node never opens this
- * device, so drm_master_set()/drm_master_drop() count as an open and a close
- * on its behalf.
- *
- * The console keeps updating its BACK buffer throughout, so nothing written
- * meanwhile is lost: the full redraw on the last close brings it all back.
- */
-int fbdev_display_owned(void)
+int fbdev_has_clients(void)
 {
-	return g_fb0_opens > 0;
+	return __atomic_load_n(&g_fb0_opens, __ATOMIC_ACQUIRE) > 0;
 }
 
 void fbdev_opened(void)
 {
-	if (g_fb0_opens++ == 0) {
-		/* First open: the display server is taking over.  Take the
-		 * hardware cursor down now -- the device composites it, so it
-		 * would sit on top of whatever that program draws until the
-		 * pointer happened to move. */
-		mouse_console_display_taken();
-	}
+	__atomic_fetch_add(&g_fb0_opens, 1, __ATOMIC_ACQ_REL);
 }
 
-void fbdev_closed(void)
+/* Put the console back on screen: the whole of it, and the pointer. */
+static void fbdev_repaint_console(void)
 {
-	if (g_fb0_opens > 0)
-		g_fb0_opens--;
-	if (g_fb0_opens > 0)
-		return;
-
 	/* Every pixel is suspect, so mark the whole screen rather than any
 	 * region the console thinks it dirtied -- it has no idea what was
 	 * drawn over it.  Flushed directly rather than through
-	 * console_flush(), which rate-limits and would drop this one. */
+	 * console_flush(), which rate-limits and would drop this one.  The
+	 * flush itself is gated (fb.c): if the display has been taken again
+	 * meanwhile, nothing reaches the screen and the next release does
+	 * this again. */
 	fb_mark_full_dirty();
 	fb_flush_dirty_regions();
 
@@ -271,6 +258,81 @@ void fbdev_closed(void)
 	 * otherwise the first movement stamps a rectangle of pre-session pixels
 	 * onto the console that was just restored. */
 	mouse_console_display_released();
+}
+
+void fbdev_console_redraw(void)
+{
+	if (console_display_owned())
+		return; /* the release repaints */
+	fbdev_repaint_console();
+}
+
+void fbdev_closed(void)
+{
+	int n = __atomic_load_n(&g_fb0_opens, __ATOMIC_ACQUIRE);
+
+	while (n > 0 &&
+	       !__atomic_compare_exchange_n(&g_fb0_opens, &n, n - 1, 0,
+					    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+		;
+	if (n != 1)
+		return; /* another handle is still drawing (or none was open) */
+
+	fbdev_console_redraw();
+}
+
+/*
+ * The console's output gate: is the display somebody else's?
+ *
+ * Owned while the console's display mode is KD_GRAPHICS or a DRM device has
+ * a master (console_owner.h has the rules and the state machine).  While it
+ * is, the console paints nothing -- the flush to the screen (fb.c) and the
+ * pointer (mouse.c) stop -- and its back buffer keeps up, so the full
+ * repaint on release shows everything that happened meanwhile.
+ *
+ * Whether the console's keyboard and pointer LISTEN is a separate question,
+ * answered by the KD modes alone (keyboard.c, mouse.c).
+ */
+static unsigned g_display_owners;
+
+int console_display_owned(void)
+{
+	return console_owner_is_owned(&g_display_owners);
+}
+
+int console_display_kd_note(int graphics)
+{
+	return (int)console_owner_set_kd(&g_display_owners, graphics);
+}
+
+void console_display_settle(int change)
+{
+	if (change == CONSOLE_OWNER_TAKEN) {
+		/* Wait out a flush that looked at the gate before it closed:
+		 * from here on nothing the console blits reaches the screen
+		 * over the new owner's pixels. */
+		fb_flush_barrier();
+		/* The hardware cursor is composited by the device: it would
+		 * sit on top of whatever the new owner draws until the pointer
+		 * next moved.  Checks ownership again under its own lock. */
+		mouse_console_display_taken();
+	} else if (change == CONSOLE_OWNER_RELEASED) {
+		/* Unless somebody has taken it again meanwhile: their release
+		 * repaints. */
+		fbdev_console_redraw();
+	}
+}
+
+int console_display_master_note(int set)
+{
+	int underflow;
+	enum console_owner_change c;
+
+	if (set)
+		return (int)console_owner_master_set(&g_display_owners);
+	c = console_owner_master_drop(&g_display_owners, &underflow);
+	WARN_ON(underflow); /* a master dropped that was never counted */
+	return (int)c;
 }
 
 int fbdev_ioctl(unsigned long req, void *argp, struct task *cur)

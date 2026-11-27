@@ -41,14 +41,42 @@ const struct fbdev_backend *fbdev_backend(void);
 
 // ioctl entry for /dev/fb0 (FBIOGET_VSCREENINFO, FBIOGET_FSCREENINFO,
 // FBIOPUT_VSCREENINFO, FBIOBLANK).  argp is a raw user pointer.
-/* Open/close accounting for /dev/fb0.  The last close restores the console,
- * which has been drawn over by whoever mapped the framebuffer. */
-/* True while another program has /dev/fb0 open, i.e. owns the display.  The
- * console suppresses its own painting then; see fbdev.c. */
-int fbdev_display_owned(void);
-
+/* Open/close accounting for /dev/fb0.  Not ownership: a program with the
+ * framebuffer open draws alongside the console.  The count says only that
+ * somebody may be writing pixels behind the console's back (fbdev.c). */
 void fbdev_opened(void);
 void fbdev_closed(void);
+/* Nonzero while /dev/fb0 is open anywhere.  Any context. */
+int fbdev_has_clients(void);
+
+/* Repaint the whole console and its pointer -- unless another program owns
+ * the display (console_display_owned), whose release repaints.  Process
+ * context. */
+void fbdev_console_redraw(void);
+
+/* ---- the console's output gate (console_owner.h) ----
+ *
+ * Owned while the console is in KD_GRAPHICS or a DRM device has a master.
+ * While it is, the console paints nothing on the screen (its back buffer
+ * keeps up) and draws no pointer; the change that ends it repaints. */
+int console_display_owned(void); /* any context */
+
+/* The console's display mode changed: call with the console's own lock held,
+ * at the moment the mode is stored, so the gate follows the modes in the
+ * order they were set.  Atomic only; returns the enum console_owner_change,
+ * which the caller passes to console_display_settle() once it has dropped
+ * that lock. */
+int console_display_kd_note(int graphics);
+/* Act on a change: TAKEN takes the hardware cursor down, RELEASED repaints
+ * the console and its pointer.  Each re-checks the state first, so a change
+ * that a later one on another processor has already undone does nothing.
+ * Process context. */
+void console_display_settle(int change);
+
+/* A DRM device got a master (set != 0) or lost it: drm_master_set and
+ * drm_master_drop, under the device's lock that changes its master.  Atomic
+ * only; the result goes to console_display_settle() after that lock. */
+int console_display_master_note(int set);
 
 int fbdev_ioctl(unsigned long req, void *argp, struct task *cur);
 

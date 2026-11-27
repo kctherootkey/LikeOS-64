@@ -214,13 +214,15 @@ extern void irq28(void); // MSI: e1000e NIC (vector 60)
 extern void irq29(void); // MSI: vmxnet3 NIC (vector 61)
 extern void irq30(void); // HPET comparator: high-resolution timers (vector 62)
 
-// MSI vector assignment.  Never below 56: vectors 32..55 are the I/O APIC
-// lines (32 + GSI), and an edge-triggered MSI sharing a vector with a
-// level-triggered line can leave that line masked for good.
+// MSI vector assignment.  Never below 56: vectors 32..57 are the low I/O
+// APIC lines (32 + GSI), and an edge-triggered MSI sharing a vector with a
+// level-triggered line can leave that line masked for good.  No I/O APIC
+// line is ever routed to one of these fixed vectors (kernel/ke/irq_gsi.c).
 #define E1000_MSI_VECTOR 59 // IDT vector for E1000 NIC
 #define E1000E_MSI_VECTOR 60 // IDT vector for e1000e (82574L/82583V) NIC
 #define VMXNET3_MSI_VECTOR 61 // IDT vector for vmxnet3 paravirt NIC
 #define HRTIMER_VECTOR 62 // IDT vector for the HPET comparator (hrtimer.c)
+#define ACPI_SCI_VECTOR 58 // IDT vector for the ACPI SCI (acpica/oslikeos.c)
 
 // IPI stubs (SMP inter-processor interrupts)
 extern void ipi_vector_0xFC(void); // Reschedule

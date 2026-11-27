@@ -948,7 +948,7 @@ static int ahci_pci_try_intx(struct ahci_hba *hba)
 	}
 	hba->irq_mode = AHCI_IRQ_INTX;
 	hba->irq_gsi = gsi;
-	hba->irq_vector = 32 + gsi;
+	hba->irq_vector = irq_gsi_vector(gsi);
 	hba->irq_active_low = active_low;
 	hba->irq_level = level;
 	ahci_pci_intx(hba, 1);

@@ -1,0 +1,22 @@
+# pkg-config metadata for libudev, the LikeOS device-information library
+# behind the libudev API.  @VERSION@ is filled in by
+# ports/xorg/import-libudev.sh.
+#
+# The version is this library's own, deliberately low: packages that ask for
+# a minimum udev release (">= 136", ">= 143" ...) want a device manager this
+# system does not have, and should go on building without it as before.
+# libinput asks for no version and finds it.
+#
+# Copyright (C) 2026 The LikeOS Project
+
+prefix=/usr
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: libudev
+Description: LikeOS device information (libudev API: input device classification and hotplug)
+Version: @VERSION@
+Requires:
+Libs: -L${libdir} -ludev
+Cflags: -I${includedir}

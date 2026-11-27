@@ -38,6 +38,12 @@ void procfs_init(void);
 #include <kernel/fs/devfs.h>
 #include <kernel/mm/shm.h>
 #include <kernel/hal/acpi.h>
+#include <kernel/ke/workqueue.h>
+#include <kernel/dev/gpio/gpiolib.h>
+#include <kernel/hal/dmi.h>
+#include <kernel/dev/i2c/i2c.h>
+#include <kernel/dev/hid/i2c-hid/i2c-hid.h>
+#include <kernel/dev/input/mousedev.h>
 #include <kernel/hal/efi.h>
 #include <kernel/ke/percpu.h>
 #include <kernel/ke/smp.h>
@@ -387,6 +393,14 @@ __no_stack_protector void continue_system_startup(void)
 	 * onto KMS back with the display driver, before there was a scheduler
 	 * to give it one, and has been pushing its updates inline since. */
 	drm_console_start_worker();
+	/* The shared work queues (kernel/ke/workqueue.c): their worker
+	 * threads exist from here on and start running with the scheduler;
+	 * items queued before that wait for them. */
+	workqueue_init();
+	/* The ACPI work queues: from here on the methods the SCI handler
+	 * defers and the EC's queries run in them, never in interrupt
+	 * context (whatever acpi_init deferred is queued first). */
+	acpi_late_init();
 
 	/* The primordial task established by sched_init() is the sole root origin
 	 * of the credential system (real/effective/saved uid/gid all 0).  Every
@@ -398,7 +412,10 @@ __no_stack_protector void continue_system_startup(void)
 	// Mask ACPI SCI permanently — level-triggered EC GPE 0x66 fires
 	// continuously on this platform, causing an interrupt storm that
 	// blocks init progress.  We don't need EC events (battery/thermal)
-	// for PS/2 keyboard/mouse operation.
+	// for PS/2 keyboard/mouse operation.  (Should a device sharing the
+	// SCI's line unmask it, the SCI handler runs no AML: GPE methods and
+	// EC queries go to the ACPI work queues, and the EC's GPE stays off
+	// until its events are queried, so a held level cannot storm.)
 	uint32_t sci_gsi = acpi_get_sci_gsi();
 	if (sci_gsi)
 		ioapic_mask_gsi((uint8_t)sci_gsi);
@@ -475,6 +492,35 @@ __no_stack_protector void continue_system_startup(void)
 	// machines, leading to g_frequency diverging from the real tick rate.
 	// This takes ~2 seconds but keeps wall-clock time accurate.
 	timer_calibrate_frequency();
+
+	/* GPIO / pin controllers (Intel PCH and SoC, AMD FCH) from the ACPI
+	 * namespace: probing maps their registers, masks every pad
+	 * interrupt and requests the controllers' shared interrupt lines,
+	 * so it needs interrupts on and the interrupt core; it comes before
+	 * the drivers whose devices signal through GPIO pads. */
+	gpio_pinctrl_init();
+	/* The platform identification (SMBIOS) for user space: /sys/
+	 * devices/virtual/dmi/id, which input and hardware quirk tables key
+	 * on. */
+	dmi_sysfs_init();
+
+	/* I2C: the core (and /dev/i2c-N), then the DesignWare controllers
+	 * (Intel LPSS PCI functions, ACPI-described Intel/AMD controllers).
+	 * Each adapter creates the clients firmware lists for it (touchpads)
+	 * as it registers; a client whose interrupt line's GPIO controller
+	 * is missing is retried at the end.  After the GPIO controllers,
+	 * whose interrupts the clients use. */
+	i2c_core_init();
+	i2c_designware_init();
+	/* The console pointer bridge first, so it attaches to the input
+	 * devices of the touchpads the I2C-HID driver brings up next (it
+	 * feeds them to the console and /dev/input/event1 until user space
+	 * opens them).  Then the I2C-HID transport -- and the HID core's
+	 * drivers with it -- binding to the clients the adapters created;
+	 * deferred ones are retried by the late init. */
+	mousedev_init();
+	i2c_hid_acpi_init();
+	i2c_core_late_init();
 
 	/* The storage stack's threads -- kblksoftirqd/N, which takes over
 	 * the block softirq of CPU N when a run at an interrupt tail exceeds

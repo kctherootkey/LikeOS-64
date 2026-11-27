@@ -18,6 +18,10 @@
 #include <kernel/io/tty.h>
 #include <kernel/hal/ioapic.h>
 #include <kernel/dev/input/keyboard.h>
+#include <kernel/dev/input/mousedev.h>
+#include <kernel/dev/hid/ps2.h>
+#include <kernel/ke/workqueue.h>
+#include <kernel/ke/timer.h>
 #include <kernel/uapi/bug.h>
 
 // Global mouse state
@@ -43,6 +47,22 @@ static void mouse_update_cursor_internal(void);
  * a second source of the same movements.  Both under mouse_lock. */
 static int g_vmmouse_active;
 static int g_vmmouse_seen;
+
+/* Preference of an I2C touchpad over a PS/2 emulation of it on the
+ * auxiliary port (see struct mousedev_ps2_pref).  g_aux_present: a PS/2
+ * pointing device passed its reset at boot; g_aux_trackpoint: it is a
+ * TrackPoint (answered Read Secondary ID); g_aux_id: its device ID after
+ * detection.  Set once at boot, before the interrupt is unmasked.
+ * g_aux_off: the port is given up -- every byte from it is dropped from
+ * then on; the work item disables it in the controller and masks its
+ * interrupt.  Under mouse_lock. */
+static int g_aux_present;
+static int g_aux_trackpoint;
+static uint8_t g_aux_id;
+static int g_aux_off;
+static struct mousedev_ps2_pref g_ps2_pref;
+static char g_aux_off_name[64];
+static struct work_struct g_aux_off_work;
 
 
 // Mouse cursor bitmap (11x19 Windows-style arrow cursor)
@@ -269,8 +289,12 @@ static int mouse_hw_cursor_update(void)
 	 * the kernel's pointer a little away from the one X was drawing from
 	 * the same movements.  That is the two-pointers-in-lockstep seen under
 	 * VirtualBox.  Not writing the position at all leaves nothing to
-	 * re-assert. */
-	if (fbdev_display_owned()) {
+	 * re-assert.
+	 *
+	 * "Owns" is console_display_owned(): KD_GRAPHICS or a DRM master.  A
+	 * program that merely maps /dev/fb0 draws alongside the console and
+	 * leaves its pointer alone. */
+	if (console_display_owned()) {
 		if (g_hw_cursor_shown)
 			mouse_hw_cursor_hide();
 		mouse_state.last_x = mouse_state.x;
@@ -321,16 +345,27 @@ static void mouse_sync_overlay(int hw_handled)
 /*
  * Another program has taken the display.
  *
- * Called on the FIRST open of /dev/fb0 rather than waiting for the next mouse
- * packet to notice: the hardware cursor is composited by the device and would
- * otherwise sit on top of that program's output until the pointer next moved.
+ * Called when it is taken (console_display_settle) rather than waiting for the
+ * next mouse packet to notice: the hardware cursor is composited by the device
+ * and would otherwise sit on top of that program's output until the pointer
+ * next moved.
+ *
+ * Under mouse_lock, which every pointer update holds, and with the ownership
+ * checked again inside it: an update that decided to show the cursor just
+ * before the display was taken has finished showing it, and is hidden here;
+ * one that runs after sees the display owned.  A take that a release on
+ * another processor has already undone leaves the cursor alone.
  */
 void mouse_console_display_taken(void)
 {
+	uint64_t flags;
+
 	if (!vmsvga2_active() || !vmsvga2_has_hw_cursor())
 		return;
-	if (g_hw_cursor_shown)
+	spin_lock_irqsave(&mouse_lock, &flags);
+	if (console_display_owned() && g_hw_cursor_shown)
 		mouse_hw_cursor_hide();
+	spin_unlock_irqrestore(&mouse_lock, flags);
 }
 
 /*
@@ -348,9 +383,15 @@ void mouse_console_display_taken(void)
  * The software path needs only to say that the rectangle the pointer occupies
  * is suspect, which it is -- the other program drew over it.  There is no saved
  * background to discard, because the overlay keeps none.
+ *
+ * Under mouse_lock, like every other pointer update (the interrupt handler's
+ * among them).
  */
 void mouse_console_display_released(void)
 {
+	uint64_t flags;
+
+	spin_lock_irqsave(&mouse_lock, &flags);
 	g_hw_cursor_defined = 0;
 	g_hw_cursor_shown = 0;
 	fb_pointer_damage();
@@ -358,6 +399,7 @@ void mouse_console_display_released(void)
 	mouse_state.last_y = mouse_state.y;
 	/* Decides which pointer draws and repaints it. */
 	mouse_update_cursor_internal();
+	spin_unlock_irqrestore(&mouse_lock, flags);
 }
 
 // Wait for PS/2 controller input buffer to be ready
@@ -499,6 +541,56 @@ static void mouse_quiesce(void)
 	mouse_flush_output();
 }
 
+/* Is the device on the auxiliary port a TrackPoint?  Its controller
+ * answers Read Secondary ID (0xE1) with an ACK and two bytes, the first
+ * one the variant: 0x01 IBM, 0x02 ALPS, 0x03 Elan, 0x04 NXP, 0x05 JYT
+ * Synaptics, 0x06 Synaptics, 0x07 JYT NDT.  Anything else -- a resend
+ * request, an error, silence, another first byte -- is not one.
+ *
+ * The device has just been reset (reporting off).  A plain mouse may be
+ * left confused by the unknown command, so it is set back to its defaults
+ * and reset again afterwards -- whatever it answered -- as the usual
+ * protocol probing does before it goes on to the IntelliMouse knock.  The
+ * knock then runs as before for every device: a TrackPoint does not take
+ * it up (it stays a 3-byte device), and nothing else changes for a device
+ * that answered the query some other way.  The answer is used for one
+ * thing only: a TrackPoint is never given up for an I2C touchpad.  Every
+ * read is bounded (mouse_try_read), so a device that does not answer costs
+ * a fraction of a second at boot and nothing else.
+ *
+ * Portions Copyright (C) Stephen Evanchik (the variant list), Copyright (C)
+ * 1999-2002 Vojtech Pavlik, Copyright (C) 2003-2004 Dmitry Torokhov (the
+ * probe's place in the order and the reset after it). */
+#define MOUSE_CMD_TP_READ_ID 0xE1
+static int mouse_detect_trackpoint(void)
+{
+	int ack, variant = -1, firmware = -1;
+
+	mouse_flush_output();
+	mouse_write_command(MOUSE_CMD_TP_READ_ID, 0xFF);
+	ack = mouse_try_read();
+	if (ack == MOUSE_ACK) {
+		variant = mouse_try_read();
+		firmware = mouse_try_read();
+	}
+	if (ack == MOUSE_ACK && variant >= 0x01 && variant <= 0x07 &&
+	    firmware >= 0)
+		kprintf("  TrackPoint detected (variant 0x%02X, firmware 0x%02X)\n",
+			variant, firmware);
+	else
+		variant = -1;
+
+	/* Back to a known state before the next probe. */
+	mouse_flush_output();
+	mouse_write_command(MOUSE_CMD_SET_DEFAULTS, 0xFF);
+	(void)mouse_expect(MOUSE_ACK, 8);
+	mouse_write_command(MOUSE_CMD_RESET, 0xFF);
+	if (mouse_expect(0xAA, 32))
+		(void)mouse_try_read(); // the device ID again
+	mouse_flush_output();
+	return variant > 0;
+}
+
 // Detect mouse type and capabilities
 static uint8_t mouse_detect_type(void)
 {
@@ -513,6 +605,7 @@ static uint8_t mouse_detect_type(void)
 	 * buffer.  The budget is generous because a reset takes a while and the
 	 * pre-reset stream can be several packets long. */
 	if (!mouse_expect(0xAA, 32)) {
+		g_aux_present = 0;
 		kprintf("  Mouse self-test byte not seen; assuming standard mouse\n");
 		mouse_state.has_scroll_wheel = 0;
 		mouse_state.packet_size = 3;
@@ -520,7 +613,10 @@ static uint8_t mouse_detect_type(void)
 		return MOUSE_TYPE_STANDARD;
 	}
 
+	/* Something on the auxiliary port passed its self-test. */
+	g_aux_present = 1;
 	response = mouse_try_read(); // Device ID
+	g_aux_id = (uint8_t)response;
 	kprintf("  Device ID: 0x%02X\n", response);
 	if (response != 0x00) {
 		kprintf("  Mouse reset failed or not standard mouse\n");
@@ -532,6 +628,12 @@ static uint8_t mouse_detect_type(void)
 
 	/* A reset leaves reporting disabled, so from here the device only speaks
 	 * when spoken to -- provided every ACK below is consumed. */
+
+	/* A TrackPoint first, before the IntelliMouse knock, in the order of
+	 * the usual protocol probes.  A pointing stick is a device of its own
+	 * that an I2C touchpad must never take the port from. */
+	g_aux_trackpoint = mouse_detect_trackpoint();
+
 	kprintf("  Attempting IntelliMouse detection sequence...\n");
 	static const uint8_t knock[3] = { 200, 100, 80 };
 	for (int i = 0; i < 3; i++) {
@@ -557,6 +659,8 @@ static uint8_t mouse_detect_type(void)
 	}
 	response = mouse_try_read();
 	kprintf("  New Device ID: 0x%02X\n", response);
+	if (response >= 0)
+		g_aux_id = (uint8_t)response;
 
 	if (response == MOUSE_TYPE_INTELLIMOUSE) {
 		kprintf("  IntelliMouse detected (scroll wheel supported)\n");
@@ -574,6 +678,62 @@ static uint8_t mouse_detect_type(void)
 }
 
 // Draw cursor at specified position
+/* The work item that gives the auxiliary port up in the controller: 0xA7
+ * and IRQ12 masked.  Bytes still coming are consumed and dropped by the
+ * interrupt handler (the keyboard's interrupt drains them too). */
+static void mouse_aux_off_work_fn(struct work_struct *work)
+{
+	char name[sizeof(g_aux_off_name)];
+	uint64_t flags;
+	int rc;
+
+	(void)work;
+	spin_lock_irqsave(&mouse_lock, &flags);
+	kmemcpy(name, g_aux_off_name, sizeof(name));
+	name[sizeof(name) - 1] = 0;
+	spin_unlock_irqrestore(&mouse_lock, flags);
+	/* Process context, interrupts on: the controller may take a while
+	 * to empty its input buffer, and the keyboard keeps working
+	 * meanwhile (its bytes are drained by its own interrupt). */
+	rc = ps2_disable_aux_port();
+	ioapic_mask_gsi(12);
+	if (rc)
+		kprintf("i8042: AUX port ignored (controller did not take the disable command): I2C touchpad %s is active (PS/2 device ID 0x%02X)\n",
+			name, g_aux_id);
+	else
+		kprintf("i8042: AUX port disabled: I2C touchpad %s is active (PS/2 device ID 0x%02X)\n",
+			name, g_aux_id);
+}
+
+/* Give the port up: from now on its bytes are dropped; the work item
+ * tells the controller.  mouse_lock held. */
+static void mouse_aux_give_up_locked(const char *name)
+{
+	size_t i;
+
+	if (g_aux_off)
+		return;
+	g_aux_off = 1;
+	for (i = 0; name && name[i] && i < sizeof(g_aux_off_name) - 1; i++)
+		g_aux_off_name[i] = name[i];
+	g_aux_off_name[i] = 0;
+	mouse_state.packet_index = 0;
+	queue_work(system_wq, &g_aux_off_work);
+}
+
+void mouse_i2c_touchpad_report(const char *name, int contact)
+{
+	uint64_t flags;
+
+	spin_lock_irqsave(&mouse_lock, &flags);
+	/* Never in a VM: the absolute pointer rings through this port. */
+	if (!g_aux_off && !g_vmmouse_active &&
+	    mousedev_ps2_pref_touchpad(&g_ps2_pref, contact) ==
+		    MOUSEDEV_PS2_DISABLE)
+		mouse_aux_give_up_locked(name);
+	spin_unlock_irqrestore(&mouse_lock, flags);
+}
+
 static void mouse_process_packet(void)
 {
 	uint8_t flags = mouse_state.packet_buffer[0];
@@ -625,7 +785,7 @@ static void mouse_process_packet(void)
 	if (mouse_state.has_scroll_wheel && mouse_state.packet_size == 4) {
 		// For IntelliMouse, use the full Z byte without masking
 		mouse_state.scroll_delta = raw_z;
-		if (raw_z != 0 && !fbdev_display_owned()) {
+		if (raw_z != 0 && !keyboard_kd_graphics()) {
 			// Forward wheel to console immediately
 			console_handle_mouse_wheel((int)raw_z);
 			// Also report scroll to TTY as button 64|0 (up) or 64|1 (down)
@@ -706,21 +866,21 @@ static void mouse_process_packet(void)
 	}
 
 	/* Forward to the console (scrollbar, scrollback) and to the tty
-	 * (terminal mouse tracking) -- but only while the console owns the
-	 * display.
+	 * (terminal mouse tracking) -- but only while the console is in
+	 * KD_TEXT.
 	 *
-	 * While a display server has /dev/fb0 open the pointer is its input,
-	 * and it reads it from the event device.  Acting on it here as well
-	 * means two programs respond to one movement: scrolling inside a
-	 * terminal window also scrolled the console's scrollback underneath,
-	 * which nothing showed until X exited and the console repainted
-	 * somewhere else entirely.
+	 * A display server switches it to KD_GRAPHICS when it starts: the
+	 * pointer is its input then, and it reads it from the event device.
+	 * Acting on it here as well means two programs respond to one
+	 * movement: scrolling inside a terminal window also scrolled the
+	 * console's scrollback underneath, which nothing showed until X exited
+	 * and the console repainted somewhere else entirely.
 	 *
 	 * Checked here rather than relying on evdev's grab suppression above,
 	 * because the X.org evdev driver does not grab by default -- its
 	 * "Grab Device" option is off -- so the grab test is false for the one
 	 * case that matters most. */
-	if (!fbdev_display_owned()) {
+	if (!keyboard_kd_graphics()) {
 		console_handle_mouse_event(mouse_state.x, mouse_state.y,
 					   mouse_state.left_button ? 1 : 0);
 
@@ -791,7 +951,7 @@ static void mouse_vmmouse_report_locked(const struct vmmouse_packet *p)
 
 	if (z != 0) {
 		mouse_state.scroll_delta = z;
-		if (!fbdev_display_owned()) {
+		if (!keyboard_kd_graphics()) {
 			console_handle_mouse_wheel(z);
 			tty_mouse_report_scroll(mouse_state.x, mouse_state.y,
 						z);
@@ -802,8 +962,8 @@ static void mouse_vmmouse_report_locked(const struct vmmouse_packet *p)
 	    mouse_state.y != mouse_state.last_y)
 		mouse_update_cursor_internal();
 
-	// Same ownership rule as the PS/2 path (mouse_process_packet()).
-	if (!fbdev_display_owned()) {
+	// Same KD_GRAPHICS rule as the PS/2 path (mouse_process_packet()).
+	if (!keyboard_kd_graphics()) {
 		uint8_t cur_btns = (mouse_state.left_button ? 0x01 : 0) |
 				   (mouse_state.right_button ? 0x02 : 0) |
 				   (mouse_state.middle_button ? 0x04 : 0);
@@ -1071,6 +1231,18 @@ void mouse_init(void)
 			kprintf("Mouse: VMware absolute pointer\n");
 	}
 
+	/* The I2C touchpad preference starts from what answered on the
+	 * auxiliary port. */
+	{
+		uint64_t flags;
+
+		INIT_WORK(&g_aux_off_work, mouse_aux_off_work_fn);
+		spin_lock_irqsave(&mouse_lock, &flags);
+		mousedev_ps2_pref_init(&g_ps2_pref, g_aux_present,
+				       g_aux_trackpoint);
+		spin_unlock_irqrestore(&mouse_lock, flags);
+	}
+
 	kprintf("Mouse initialized successfully\n");
 	kprintf("  Position: (%d, %d)\n", mouse_state.x, mouse_state.y);
 	kprintf("  Screen size: %dx%d\n", mouse_state.screen_width,
@@ -1087,8 +1259,9 @@ void mouse_irq_handler(void)
 	uint64_t flags;
 	spin_lock_irqsave(&mouse_lock, &flags);
 
-	if (!mouse_state.enabled) {
-		// Clear the data port to prevent buffer overflow
+	if (!mouse_state.enabled || g_aux_off) {
+		// Clear the data port to prevent buffer overflow (and, with
+		// the port given up to an I2C touchpad, drop its bytes)
 		inb(PS2_DATA_PORT);
 		spin_unlock_irqrestore(&mouse_lock, flags);
 		return;
@@ -1145,7 +1318,7 @@ static void mouse_update_cursor_internal(void)
 		return;
 	}
 
-	/* Do not touch the screen while another program owns the framebuffer:
+	/* Do not touch the screen while another program owns the display:
 	 * it draws its own pointer, and two would be visible.
 	 *
 	 * The position still tracks (above), so the pointer is where the user
@@ -1153,7 +1326,7 @@ static void mouse_update_cursor_internal(void)
 	 * does not depend on the display server grabbing the device: it is true
 	 * whether it grabs or not, which is why it is checked here rather than
 	 * relying on evdev's grab suppression. */
-	if (fbdev_display_owned())
+	if (console_display_owned())
 		return;
 
 	/* Software path: the pointer is not drawn into the back buffer at all.
@@ -1347,7 +1520,7 @@ void mouse_inject_usb_movement(int dx, int dy, uint8_t buttons, int8_t wheel)
 	// --- Scroll wheel ---
 	if (wheel != 0) {
 		mouse_state.scroll_delta = wheel;
-		if (!fbdev_display_owned()) {
+		if (!keyboard_kd_graphics()) {
 			console_handle_mouse_wheel((int)wheel);
 			tty_mouse_report_scroll(mouse_state.x, mouse_state.y,
 						wheel);
@@ -1393,8 +1566,8 @@ void mouse_inject_usb_movement(int dx, int dy, uint8_t buttons, int8_t wheel)
 		mouse_update_cursor_internal();
 	}
 
-	// --- Forward events (same as PS/2 path, same ownership rule) ---
-	if (!fbdev_display_owned()) {
+	// --- Forward events (same as PS/2 path, same KD_GRAPHICS rule) ---
+	if (!keyboard_kd_graphics()) {
 		console_handle_mouse_event(mouse_state.x, mouse_state.y,
 					   mouse_state.left_button ? 1 : 0);
 

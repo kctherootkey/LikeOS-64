@@ -1,0 +1,16 @@
+garbage line without a prefix
+I: Bus=zz Vendor= Product=12345678901 Version=
+N: Name="unterminated
+S: Sysfs=
+H: Handlers=event event-1 eventx event4294967296 event7 
+B: KEY=ffffffffffffffffff 0
+B: ABS=0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+B: REL=3 g
+B: EV=7
+B: =1
+B: UNKNOWN=5
+
+N: Name="quoted "inner" name"
+H: Handlers=event9
+B: EV=3
+B: KEY=4000 0 0

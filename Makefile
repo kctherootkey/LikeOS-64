@@ -474,6 +474,8 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/vmw_pm.o \
               $(BUILD_DIR)/vmw_kms_atomic.o \
               $(BUILD_DIR)/evdev.o \
+              $(BUILD_DIR)/input_core.o \
+              $(BUILD_DIR)/input_mt.o \
               $(BUILD_DIR)/interrupt.o \
               $(BUILD_DIR)/interrupt_c.o \
               $(BUILD_DIR)/gdt.o \
@@ -482,6 +484,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/keymap.o \
 			  $(BUILD_DIR)/serial.o \
               $(BUILD_DIR)/mouse.o \
+              $(BUILD_DIR)/mousedev.o \
               $(BUILD_DIR)/vmmouse.o \
               $(BUILD_DIR)/memory.o \
 			  $(BUILD_DIR)/stack_switch.o \
@@ -523,6 +526,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/hrtimer.o \
 			  $(BUILD_DIR)/irq.o \
 			  $(BUILD_DIR)/irq_matrix.o \
+			  $(BUILD_DIR)/irq_gsi.o \
 			  $(BUILD_DIR)/irq_affinity.o \
 			  $(BUILD_DIR)/completion.o \
 			  $(BUILD_DIR)/mutex.o \
@@ -584,7 +588,6 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/futex.o \
 			  $(BUILD_DIR)/cred.o \
 			  $(BUILD_DIR)/task_path.o \
-			  $(BUILD_DIR)/i2c_hid.o \
 			  $(BUILD_DIR)/net.o \
 			  $(BUILD_DIR)/e1000.o \
 			  $(BUILD_DIR)/e1000e.o \
@@ -748,6 +751,86 @@ NVME_OBJS = $(BUILD_DIR)/nvme_core.o \
 	    $(BUILD_DIR)/nvme_pci_pm.o \
 	    $(BUILD_DIR)/nvme_pci_quirks.o
 KERNEL_OBJS += $(NVME_OBJS)
+
+# ACPI device layer (kernel/hal/acpi_dev.c), generic deferred work and
+# delays (kernel/ke/workqueue.c, delay.c), the GPIO core with its ACPI glue
+# (kernel/dev/gpio) and the GPIO/pin controller drivers (kernel/dev/gpio/
+# pinctrl: Intel community controllers with one table file per SoC or
+# the layout from _DSD, Lynx Point, Bay Trail, Cherry View, AMD) and the
+# platform identification they match quirks by (kernel/hal/dmi.c).
+# Contracts: acpi_dev.h, workqueue.h, delay.h, gpiolib.h, pinctrl-intel.h,
+# dmi.h.
+GPIO_OBJS = $(BUILD_DIR)/acpi_dev.o \
+	    $(BUILD_DIR)/dmi.o \
+	    $(BUILD_DIR)/dmi_id.o \
+	    $(BUILD_DIR)/workqueue.o \
+	    $(BUILD_DIR)/delay.o \
+	    $(BUILD_DIR)/gpiolib.o \
+	    $(BUILD_DIR)/gpiolib-acpi.o \
+	    $(BUILD_DIR)/gpiolib-acpi-quirks.o \
+	    $(BUILD_DIR)/pinctrl-core.o \
+	    $(BUILD_DIR)/pinctrl-intel.o \
+	    $(BUILD_DIR)/pinctrl-intel-platform.o \
+	    $(BUILD_DIR)/pinctrl-lynxpoint.o \
+	    $(BUILD_DIR)/pinctrl-sunrisepoint.o \
+	    $(BUILD_DIR)/pinctrl-cannonlake.o \
+	    $(BUILD_DIR)/pinctrl-cedarfork.o \
+	    $(BUILD_DIR)/pinctrl-denverton.o \
+	    $(BUILD_DIR)/pinctrl-lewisburg.o \
+	    $(BUILD_DIR)/pinctrl-emmitsburg.o \
+	    $(BUILD_DIR)/pinctrl-icelake.o \
+	    $(BUILD_DIR)/pinctrl-lakefield.o \
+	    $(BUILD_DIR)/pinctrl-tigerlake.o \
+	    $(BUILD_DIR)/pinctrl-jasperlake.o \
+	    $(BUILD_DIR)/pinctrl-elkhartlake.o \
+	    $(BUILD_DIR)/pinctrl-alderlake.o \
+	    $(BUILD_DIR)/pinctrl-meteorlake.o \
+	    $(BUILD_DIR)/pinctrl-meteorpoint.o \
+	    $(BUILD_DIR)/pinctrl-broxton.o \
+	    $(BUILD_DIR)/pinctrl-geminilake.o \
+	    $(BUILD_DIR)/pinctrl-baytrail.o \
+	    $(BUILD_DIR)/pinctrl-cherryview.o \
+	    $(BUILD_DIR)/pinctrl-amd.o
+KERNEL_OBJS += $(GPIO_OBJS)
+
+# The I2C core (kernel/dev/i2c: adapters, clients, drivers, ACPI
+# enumeration, SMBus, /dev/i2c-N) and the Synopsys DesignWare I2C
+# controller driver with its PCI (Intel LPSS) and ACPI glue
+# (kernel/dev/i2c/busses), with the firmware bus arbitration backends
+# it uses: the IOSF sideband mailbox and P-Unit semaphore of Bay Trail /
+# Cherry Trail (kernel/hal/iosf_mbi.c) and the AMD PSP platform access
+# mailbox (kernel/hal/amd_psp.c).  Contracts: i2c.h,
+# i2c-designware-core.h, iosf_mbi.h, amd_psp.h.
+I2C_OBJS = $(BUILD_DIR)/iosf_mbi.o \
+	   $(BUILD_DIR)/amd_psp.o \
+	   $(BUILD_DIR)/i2c-core-base.o \
+	   $(BUILD_DIR)/i2c-core-acpi.o \
+	   $(BUILD_DIR)/i2c-core-smbus.o \
+	   $(BUILD_DIR)/i2c-dev.o \
+	   $(BUILD_DIR)/i2c-designware-common.o \
+	   $(BUILD_DIR)/i2c-designware-master.o \
+	   $(BUILD_DIR)/i2c-designware-pcidrv.o \
+	   $(BUILD_DIR)/i2c-designware-platdrv.o \
+	   $(BUILD_DIR)/i2c-designware-baytrail.o \
+	   $(BUILD_DIR)/i2c-designware-amdpsp.o
+KERNEL_OBJS += $(I2C_OBJS)
+
+# HID core (kernel/dev/hid/core: report descriptor parser, report I/O,
+# driver binding, hid-input usage mapping, quirks) and hid-multitouch.
+# Transport-neutral; the I2C-HID transport registers devices through
+# hid.h.
+HID_OBJS = $(BUILD_DIR)/hid_core.o \
+	   $(BUILD_DIR)/hid_input.o \
+	   $(BUILD_DIR)/hid_quirks.o \
+	   $(BUILD_DIR)/hid_multitouch.o
+KERNEL_OBJS += $(HID_OBJS)
+
+# The I2C-HID transport (kernel/dev/hid/i2c-hid: HID over I2C, the ACPI
+# binding, per-machine descriptor overrides).  Contract: i2c-hid.h.
+I2C_HID_OBJS = $(BUILD_DIR)/i2c-hid-core.o \
+	       $(BUILD_DIR)/i2c-hid-acpi.o \
+	       $(BUILD_DIR)/i2c-hid-dmi-quirks.o
+KERNEL_OBJS += $(I2C_HID_OBJS)
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
@@ -837,12 +920,15 @@ ROOT_SBIN_LINKS = mkfs.ext2:mke2fs mkfs.ext3:mke2fs mkfs.ext4:mke2fs \
 	dosfslabel:fatlabel mkfs.ntfs:mkntfs
 ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so.3 \
 	libz.so.1 libnghttp2.so.14 libcurl.so.4 libtestlib.so libcrypt.so libpam.so \
-	libdlbase.so libdlchain.so libaudio.so
+	libdlbase.so libdlchain.so libaudio.so libudev.so.1
 # Audio tools -> /usr/bin, the audio service -> /usr/sbin
 USR_BIN_AUDIO_PROGS = audioctl audioplay audiotest audioinfo eventsound
 # The device manager's client -> /usr/bin, the device manager (devd) -> /usr/sbin
 USR_BIN_DEVICE_PROGS = devctl
-USR_SBIN_PROGS = audiod devd smartctl smartd partx addpart delpart resizepart nvme
+# likeos-input-devices -> /usr/sbin as well (started by init: keeps the X
+# server's touchpad configuration current).
+USR_SBIN_PROGS = audiod devd smartctl smartd partx addpart delpart resizepart nvme \
+	likeos-input-devices
 # Helpers -> /usr/libexec/<name>
 USR_LIBEXEC_PROGS = likeos-display-save likeos-keyboard-save
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
@@ -1203,6 +1289,12 @@ $(BUILD_DIR)/vmw_overlay.o: $(KERNEL_DIR)/dev/video/gpu/vmwgfx/vmw_overlay.c | $
 $(BUILD_DIR)/evdev.o: $(KERNEL_DIR)/dev/input/evdev.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/input_core.o: $(KERNEL_DIR)/dev/input/input.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/input_mt.o: $(KERNEL_DIR)/dev/input/input-mt.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/interrupt.o: $(KERNEL_DIR)/ke/interrupt.asm | $(BUILD_DIR)
 	nasm -f elf64 $< -o $@
 
@@ -1228,6 +1320,9 @@ $(BUILD_DIR)/mouse.o: $(KERNEL_DIR)/dev/input/mouse.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/vmmouse.o: $(KERNEL_DIR)/dev/input/vmmouse.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/mousedev.o: $(KERNEL_DIR)/dev/input/mousedev.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/memory.o: $(KERNEL_DIR)/mm/memory.c | $(BUILD_DIR)
@@ -1319,7 +1414,20 @@ $(BUILD_DIR)/usb_hid.o: $(KERNEL_DIR)/dev/hid/usb_hid.c | $(BUILD_DIR)
 $(BUILD_DIR)/ps2.o: $(KERNEL_DIR)/dev/hid/ps2.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/i2c_hid.o: $(KERNEL_DIR)/dev/hid/i2c_hid.c | $(BUILD_DIR)
+$(BUILD_DIR)/hid_core.o: $(KERNEL_DIR)/dev/hid/core/hid-core.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/hid_input.o: $(KERNEL_DIR)/dev/hid/core/hid-input.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/hid_quirks.o: $(KERNEL_DIR)/dev/hid/core/hid-quirks.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/hid_multitouch.o: $(KERNEL_DIR)/dev/hid/hid-multitouch.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# The I2C-HID transport.
+$(BUILD_DIR)/i2c-hid-%.o: $(KERNEL_DIR)/dev/hid/i2c-hid/i2c-hid-%.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # Networking stack
@@ -1644,6 +1752,56 @@ $(BUILD_DIR)/cpu_pstate.o: $(KERNEL_DIR)/hal/cpu_pstate.c | $(BUILD_DIR)
 $(BUILD_DIR)/acpi.o: $(KERNEL_DIR)/hal/acpi.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/acpi_dev.o: $(KERNEL_DIR)/hal/acpi_dev.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/dmi.o: $(KERNEL_DIR)/hal/dmi.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/dmi_id.o: $(KERNEL_DIR)/hal/dmi_id.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/iosf_mbi.o: $(KERNEL_DIR)/hal/iosf_mbi.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/amd_psp.o: $(KERNEL_DIR)/hal/amd_psp.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/workqueue.o: $(KERNEL_DIR)/ke/workqueue.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/delay.o: $(KERNEL_DIR)/ke/delay.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/gpiolib.o: $(KERNEL_DIR)/dev/gpio/gpiolib.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/gpiolib-acpi.o: $(KERNEL_DIR)/dev/gpio/gpiolib-acpi.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/gpiolib-acpi-quirks.o: $(KERNEL_DIR)/dev/gpio/gpiolib-acpi-quirks.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/pinctrl-core.o: $(KERNEL_DIR)/dev/gpio/pinctrl/pinctrl-core.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/pinctrl-amd.o: $(KERNEL_DIR)/dev/gpio/pinctrl/amd/pinctrl-amd.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# The I2C core and the DesignWare controller driver.
+$(BUILD_DIR)/i2c-core-%.o: $(KERNEL_DIR)/dev/i2c/i2c-core-%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/i2c-dev.o: $(KERNEL_DIR)/dev/i2c/i2c-dev.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/i2c-designware-%.o: $(KERNEL_DIR)/dev/i2c/busses/i2c-designware-%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# The Intel pin controllers: the core and one table file per SoC.
+$(BUILD_DIR)/pinctrl-%.o: $(KERNEL_DIR)/dev/gpio/pinctrl/intel/pinctrl-%.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
 # UEFI runtime services (kernel/hal/efi.c) and the device path / load
 # option code the kernel shares with the bootloader and likeos-efiboot.
 $(BUILD_DIR)/hal_efi.o: $(KERNEL_DIR)/hal/efi.c | $(BUILD_DIR)
@@ -1707,6 +1865,13 @@ userland-libcrypt: userland-libc
 userland-libaudio: userland-libc
 	$(MAKE) -C user/lib/libaudio
 
+# The libudev API on this system's device information: input device
+# classification (ID_INPUT_*) and hotplug for libinput, its tools and
+# likeos-input-devices.
+.PHONY: userland-libudev
+userland-libudev: userland-libc
+	$(MAKE) -C user/lib/libudev
+
 # Build minimal PAM library (depends on libcrypt for crypt())
 .PHONY: userland-libpam
 userland-libpam: userland-libc userland-libcrypt
@@ -1741,6 +1906,10 @@ $(BUILD_DIR)/libaudio.so: userland-libaudio | $(BUILD_DIR)
 	cp user/lib/libaudio/libaudio.so $@
 	$(USER_STRIP) --strip-unneeded $@
 
+$(BUILD_DIR)/libudev.so.1: userland-libudev | $(BUILD_DIR)
+	cp user/lib/libudev/libudev.so.1 $@
+	$(USER_STRIP) --strip-unneeded $@
+
 # Audio tools (user/bin, linked against libaudio) and the audio service.
 $(addprefix $(BUILD_DIR)/,$(USR_BIN_AUDIO_PROGS)): $(BUILD_DIR)/%: userland-libc userland-rtld userland-libaudio | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) $*
@@ -1759,6 +1928,14 @@ $(BUILD_DIR)/devd $(BUILD_DIR)/devctl: $(BUILD_DIR)/%: userland-libc userland-rt
 	cp user/sbin/devd/$* $@
 	$(USER_STRIP) --strip-unneeded $@
 
+# The X server's touchpad configuration keeper (started by init from
+# inittab): finds the touchpads through libudev and writes
+# /etc/X11/xorg.conf.d/50-likeos-touchpads.conf.
+$(BUILD_DIR)/likeos-input-devices: userland-libc userland-rtld userland-libudev | $(BUILD_DIR)
+	$(MAKE) -C user/sbin/likeos-input-devices
+	cp user/sbin/likeos-input-devices/likeos-input-devices $@
+	$(USER_STRIP) --strip-unneeded $@
+
 $(BUILD_DIR)/libpam.so: userland-libpam | $(BUILD_DIR)
 	cp user/lib/libpam/libpam.so $@
 	$(USER_STRIP) --strip-unneeded $@
@@ -1769,7 +1946,8 @@ $(BUILD_DIR)/user_test.elf: userland-libc userland-rtld | $(BUILD_DIR)
 	cp $(USER_DIR)/tests/test_syscalls $@
 	$(USER_STRIP) --strip-unneeded $@
 
-$(BUILD_DIR)/test_libc: userland-libc userland-rtld userland-libcrypt userland-libpam | $(BUILD_DIR)
+$(BUILD_DIR)/test_libc: userland-libc userland-rtld userland-libcrypt userland-libpam \
+		userland-libudev | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/test_libc
 	cp $(USER_DIR)/tests/test_libc $@
 	$(USER_STRIP) --strip-unneeded $@
@@ -2711,11 +2889,13 @@ XORG_SYSROOT = $(BUILD_DIR)/xorg-sysroot
 
 .PHONY: ports-xorg
 ports-xorg: userland-libc userland-rtld ports-openssl ports-zlib ports-ncurses \
-		ports-curl | $(BUILD_DIR)
+		ports-curl $(BUILD_DIR)/libudev.so.1 | $(BUILD_DIR)
 	ports/xorg/fetch.sh
 	ports/xorg/unpack.sh
 	ports/xorg/import-base-libs.sh
 	ports/xorg/import-egl-headers.sh
+	@# libudev (headers, library, .pc) for libinput and its X driver.
+	ports/xorg/import-libudev.sh
 	ports/xorg/build.sh
 
 # The GTK3 stack and Claws Mail.
@@ -3796,8 +3976,10 @@ clean:
 	$(MAKE) -C user/lib/libcrypt clean
 	$(MAKE) -C user/lib/libpam clean
 	$(MAKE) -C user/lib/libaudio clean
+	$(MAKE) -C user/lib/libudev clean
 	$(MAKE) -C user/sbin/audiod clean
 	$(MAKE) -C user/sbin/devd clean
+	$(MAKE) -C user/sbin/likeos-input-devices clean
 	$(MAKE) -C $(USER_DIR) clean
 	@# The shell's meson build directories (SHELL_MESON_PROGS).
 	rm -rf $(addsuffix /.likeos-build,$(addprefix $(SHELL_MESON_DIR)/,$(SHELL_MESON_PROGS)))
@@ -3983,7 +4165,9 @@ check-naming:
 #
 # A few section-1 pages are skipped by name because their programs are build
 # host tooling and are not staged onto the image; a manual page for a command
-# that does not exist is worse than no page.
+# that does not exist is worse than no page.  The libinput pages skipped
+# are its Python tools (measure, analyze, replay, list-kernel-devices) and its
+# test suite, none of which is staged (ports/xorg/stage.sh).
 #
 # Some packages install their page already gzipped, so the source is piped
 # through zcat where needed rather than handed to groff by name.
@@ -4000,7 +4184,14 @@ XORG_MAN_SKIP = bdftruncate ucs2any libevdev-tweak-device mouse-dpi-tool \
 		ffmpeg-all ffmpeg-bitstream-filters ffmpeg-codecs ffmpeg-filters \
 		ffmpeg-formats ffmpeg-protocols ffmpeg-resampler ffmpeg-scaler \
 		ffmpeg-utils ffprobe-all gst-stats-1.0 \
-		jpgicc linkicc psicc tificc transicc metaflac out123
+		jpgicc linkicc psicc tificc transicc metaflac out123 \
+		libinput-analyze libinput-analyze-buttons \
+		libinput-analyze-per-slot-delta libinput-analyze-recording \
+		libinput-analyze-touch-down-state libinput-measure \
+		libinput-measure-fuzz libinput-measure-touchpad-pressure \
+		libinput-measure-touchpad-size libinput-measure-touchpad-tap \
+		libinput-measure-touch-size libinput-list-kernel-devices \
+		libinput-replay libinput-test
 
 .PHONY: xorg-manpages
 xorg-manpages:

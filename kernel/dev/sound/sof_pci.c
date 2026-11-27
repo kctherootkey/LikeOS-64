@@ -275,7 +275,7 @@ static void sof_irq_setup(struct sof_host *h)
 		return;
 	}
 	h->gsi = (int)gsi;
-	h->s.irq_vector = 32 + (int)gsi;
+	h->s.irq_vector = irq_gsi_vector((int)gsi);
 	h->irq_registered = 1;
 }
 

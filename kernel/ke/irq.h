@@ -42,8 +42,35 @@ void irq_free_vector(int vector);
 
 int irq_request_vector(int vector, irq_handler_t fn, void *arg,
 		       const char *name);
+/* Route the GSI (its vector: irq_gsi_vector(), see kernel/ke/irq_gsi.c)
+ * and register the handler on that vector.  A GSI shared by several
+ * devices has one vector for all of them. */
 int irq_request_gsi(int gsi, irq_handler_t fn, void *arg, const char *name,
 		    int active_low, int level);
+
+/* ---- GSI -> vector (kernel/ke/irq_gsi.c, kernel/ke/irq.c) -------------- */
+
+#define IRQ_GSI_MAX 224 /* GSIs routable through this layer */
+/* GSIs 0..IRQ_GSI_NATURAL_LAST keep vector 32 + GSI where that is free. */
+#define IRQ_GSI_NATURAL_LAST 25
+/* The vectors with a fixed meaning no I/O APIC line may share. */
+#define IRQ_VEC_LAPIC_TIMER 32
+#define IRQ_VEC_LAPIC_ERROR 47
+#define IRQ_VEC_ACPI_SCI 58
+#define IRQ_VEC_E1000_MSI 59
+#define IRQ_VEC_E1000E_MSI 60
+#define IRQ_VEC_VMXNET3_MSI 61
+#define IRQ_VEC_HRTIMER 62
+int irq_vector_is_fixed(int vector);
+/* The policy: the vector a GSI that has none yet gets, given which
+ * vectors are taken (`busy'); -1 when none is free. */
+int irq_gsi_choose_vector(int gsi, int (*busy)(int vector, void *ctx),
+			  void *ctx);
+/* The vector a GSI is routed to, -1 when it is not routed. */
+int irq_gsi_vector(int gsi);
+/* Record that the I/O APIC routes `gsi' to `vector' (called by the
+ * routing itself, ioapic_configure_legacy_irq).  Any context. */
+void irq_note_gsi_route(int gsi, int vector);
 /* An I/O APIC line is about to be routed to `vector' (its fixed vector,
  * 32 + GSI): take it on every CPU for good, so the per-CPU allocator never
  * hands it out.  0, or -EBUSY when a per-CPU interrupt holds it already.
@@ -154,10 +181,62 @@ struct irq_chip_ops {
 	 * the last one freed (source masked, before the vector goes). */
 	void (*startup)(int irq, void *data);
 	void (*shutdown)(int irq, void *data);
+	/* Optional, for sources behind a demultiplexing interrupt
+	 * controller (GPIO pads).  Called with the descriptor's lock held
+	 * and interrupts off, so they must not sleep:
+	 *   set_type   program the trigger (IRQ_TYPE_*); 0 or -errno;
+	 *   set_wake   arm/disarm the source as a wake-up source (called
+	 *              on the first enable_irq_wake / last disable);
+	 *   retrigger  an interrupt that arrived while the descriptor was
+	 *              disabled was consumed: deliver it once more (edge
+	 *              sources whose controller cannot hold the event). */
+	int (*set_type)(int irq, void *data, unsigned int type);
+	int (*set_wake)(int irq, void *data, unsigned int on);
+	void (*retrigger)(int irq, void *data);
+	unsigned int flags; /* IRQ_CHIP_* */
 };
+/* A thread-only handler (request_threaded_irq with fn NULL) on such a
+ * source must ask for IRQF_ONESHOT, and keeps it: the source is masked
+ * until the thread ran, as for a level-triggered I/O APIC line. */
+#define IRQ_CHIP_ONESHOT_REQUIRED (1u << 0)
 int irq_alloc_desc(const struct irq_chip_ops *ops, void *data,
 		   const cpumask_t *affinity, int managed);
 void irq_free_desc(int irq);
+
+/* ---- trigger type and wake-up ------------------------------------------ */
+
+#define IRQ_TYPE_NONE 0x0u
+#define IRQ_TYPE_EDGE_RISING 0x1u
+#define IRQ_TYPE_EDGE_FALLING 0x2u
+#define IRQ_TYPE_EDGE_BOTH (IRQ_TYPE_EDGE_RISING | IRQ_TYPE_EDGE_FALLING)
+#define IRQ_TYPE_LEVEL_HIGH 0x4u
+#define IRQ_TYPE_LEVEL_LOW 0x8u
+#define IRQ_TYPE_LEVEL_MASK (IRQ_TYPE_LEVEL_LOW | IRQ_TYPE_LEVEL_HIGH)
+#define IRQ_TYPE_SENSE_MASK 0xfu
+
+/* Program the trigger of an interrupt whose source supports it
+ * (ops->set_type).  0, -EINVAL (no such interrupt or bad type), -ENOSYS
+ * (the source has a fixed trigger: an I/O APIC line, a message), or the
+ * source's error.  Any context. */
+int irq_set_irq_type(int irq, unsigned int type);
+/* The trigger last programmed (IRQ_TYPE_NONE when never set; an I/O
+ * APIC line reports its routing). */
+unsigned int irq_get_trigger_type(int irq);
+/* Mark an interrupt as a wake-up source (on != 0) or undo it; nests.
+ * The source's set_wake is called on the first enable and the last
+ * disable; a source without one only keeps the count (there is no
+ * system sleep state that would use it).  0 or -errno.  Any context. */
+int irq_set_irq_wake(int irq, unsigned int on);
+static inline int enable_irq_wake(int irq)
+{
+	return irq_set_irq_wake(irq, 1);
+}
+static inline int disable_irq_wake(int irq)
+{
+	return irq_set_irq_wake(irq, 0);
+}
+/* Is the interrupt armed as a wake-up source. */
+int irq_is_wake_enabled(int irq);
 
 /* ---- affinity spreading ------------------------------------------------- */
 

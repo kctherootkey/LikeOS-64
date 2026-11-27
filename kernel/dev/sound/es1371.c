@@ -2502,7 +2502,7 @@ static void es_release(struct es_card *es)
 			es_is1370(es) ? ES1370_CTRL_CDC_EN : 0);
 	}
 	if (!es->irq_polling && es->irq_gsi >= 0)
-		irq_free(32 + es->irq_gsi, es_irq, es);
+		irq_free(irq_gsi_vector(es->irq_gsi), es_irq, es);
 	if (es->card)
 		snd_card_free(es->card);
 	if (es->phantom)

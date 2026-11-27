@@ -1,0 +1,75 @@
+Build on LikeOS: the evdev interface header, and the machine's DMI identity.
+
+include/linux/input.h picks the platform's evdev header by operating system
+and names none for LikeOS, so nothing defined struct input_event or a single
+event code.  LikeOS keeps that interface in <sys/input.h> -- the header
+libevdev.h already includes here (patches/libevdev) -- so the structures and
+codes libinput is compiled with are the ones libevdev was.
+
+src/quirks.c knows how to find the machine's DMI modalias -- which the model
+quirks (MatchDMIModalias=dmi:*svnHP*...) are matched against -- on two other
+systems only, and answers "no DMI" everywhere else.  On LikeOS it is read the
+same way as on the first of them: through libudev, from the uevent file of
+/sys/devices/virtual/dmi/id, which LikeOS's libudev answers like any other
+/sys directory.  While the kernel publishes no such directory the lookup
+fails and libinput uses "dmi:*", so DMI-keyed quirks simply do not apply.
+
+--- a/include/linux/input.h
++++ b/include/linux/input.h
+@@ -2,4 +2,13 @@
+ #include "linux/input.h"
+ #elif __FreeBSD__
+ #include "freebsd/input.h"
++#elif defined(__LIKEOS__)
++/* LikeOS: the system's evdev interface header.  libevdev.h includes it as
++ * well, so the structures and codes are the ones libevdev was built with.
++ * The headers the bundled copies bring in first come along, as there:
++ * the tools call ioctl() having included nothing else for it. */
++#include <sys/time.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/input.h>
+ #endif
+--- a/src/quirks.c
++++ b/src/quirks.c
+@@ -512,6 +512,31 @@
+ }
+ #endif
+ 
++#ifdef __LIKEOS__
++/* The DMI modalias from the uevent file of /sys/devices/virtual/dmi/id,
++ * through libudev, which answers for that directory like any other. */
++static inline char *
++init_dmi_likeos(void)
++{
++	const char *modalias = NULL;
++
++	_unref_(udev) *udev = udev_new();
++	if (!udev)
++		return NULL;
++
++	_unref_(udev_device) *udev_device =
++		udev_device_new_from_syspath(udev, "/sys/devices/virtual/dmi/id");
++	if (udev_device)
++		modalias = udev_device_get_property_value(udev_device, "MODALIAS");
++
++	/* No DMI table published: match no DMI quirk. */
++	if (!modalias)
++		modalias = "dmi:*";
++
++	return safe_strdup(modalias);
++}
++#endif
++
+ static inline char *
+ init_dmi(void)
+ {
+@@ -522,6 +547,8 @@
+ 	return init_dmi_linux();
+ #elif defined(__FreeBSD__)
+ 	return init_dmi_freebsd();
++#elif defined(__LIKEOS__)
++	return init_dmi_likeos();
+ #else
+ 	return NULL;
+ #endif

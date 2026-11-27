@@ -34,8 +34,31 @@ void keyboard_buffer_add(uint8_t scan_code);
 // keyboards whose LEDs are set from elsewhere (USB HID).
 uint8_t keyboard_led_state(void);
 
+// A client of /dev/input/event0 changed the lock LEDs (EV_LED): shown while
+// the console does not have the keyboard.  Called by the input core under
+// the device's event lock (interrupts off).
+void keyboard_client_leds(int num, int caps, int scroll);
+
 // The KD* ioctls (<kernel/uapi/kd.h>) of the console terminal.  -ENOTTY for
-// a request that is not one of them.
-int keyboard_kd_ioctl(unsigned long req, void *argp, struct task *cur);
+// a request that is not one of them.  `token' identifies the open file of
+// the console the request came through (keyboard_console_file_token()), 0
+// for none.
+int keyboard_kd_ioctl(unsigned long req, void *argp, struct task *cur,
+		      uint64_t token);
+
+// A token for a new open file of the console terminal: never 0, never
+// reused.  The file that switched the console to KD_GRAPHICS or K_OFF is
+// remembered by it.
+uint64_t keyboard_console_file_token(void);
+
+// The final close of the console file with that token: if it was the last
+// to switch the console away from KD_TEXT / its keyboard mode, both are put
+// back (keys released, console LEDs, redraw).  Process context.
+void keyboard_console_file_closed(uint64_t token);
+
+// The console is in KD_GRAPHICS: another program draws on the screen, and
+// the console's pointer (scrollbar, wheel scrollback, terminal mouse
+// reports) stays out of its way.  Any context.
+int keyboard_kd_graphics(void);
 
 #endif // _KERNEL_KEYBOARD_H_

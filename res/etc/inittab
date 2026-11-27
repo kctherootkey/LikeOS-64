@@ -28,6 +28,15 @@
 # nothing usable in it, init starts a getty on the console anyway, so a
 # mistake here cannot lock you out of the machine.
 
+# The touchpad configuration of the X server, brought up to date (or removed)
+# once before anything else starts: the file survives reboots, and an X server
+# started before the daemon below has looked would read last boot's event
+# node numbers -- which can name a different device this time.  "wait" entries
+# all run before every other entry, so no getty, session or installer can
+# start an X server ahead of it.  A touchpad that the kernel only finds later
+# is added by the daemon below.
+wait	/usr/sbin/likeos-input-devices
+
 # Login prompt on the system console.  respawn is what puts a fresh prompt up
 # after every logout.
 respawn	/sbin/getty /dev/console
@@ -55,3 +64,10 @@ respawn	/usr/sbin/audiod -f
 # logged in at the console only).  -f keeps it in the foreground for init.
 # It runs as root: mounting and formatting need it.
 respawn	/usr/sbin/devd -f
+
+# Touchpads for the X server: writes /etc/X11/xorg.conf.d/50-likeos-touchpads.conf
+# for the touchpads the kernel reports (and removes it when there is none),
+# then keeps it current as input devices come and go.  -f keeps it in the
+# foreground for init.  It runs as root: the file is part of the setuid X
+# server's configuration, which nobody else may write.
+respawn	/usr/sbin/likeos-input-devices -f

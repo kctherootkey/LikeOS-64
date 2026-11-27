@@ -447,41 +447,9 @@ AcpiOsPhysicalTableOverride(ACPI_TABLE_HEADER *ExistingTable,
 }
 
 /*
- * Timing
+ * Timing, locking, semaphores, threads and deferred execution:
+ * oslikeos_sync.c.
  */
-void
-AcpiOsStall(UINT32 Microseconds)
-{
-    /* Busy-wait using I/O port delay (~1.2µs per iteration) */
-    while (Microseconds > 0) {
-        outb(0x80, 0);
-        if (Microseconds > 1)
-            Microseconds -= 1;
-        else
-            break;
-    }
-}
-
-void
-AcpiOsSleep(UINT64 Milliseconds)
-{
-    /* Busy-wait — no scheduler sleep in early kernel init */
-    UINT64 us = Milliseconds * 1000;
-    while (us > 0) {
-        outb(0x80, 0);
-        if (us > 1)
-            us -= 1;
-        else
-            break;
-    }
-}
-
-UINT64
-AcpiOsGetTimer(void)
-{
-    /* Return 100ns units. timer_ticks() returns ~1000 Hz ticks. */
-    return (UINT64)timer_ticks() * 10000;
-}
 
 ACPI_STATUS
 AcpiOsEnterSleep(UINT8 SleepState, UINT32 RegaValue, UINT32 RegbValue)
@@ -490,99 +458,6 @@ AcpiOsEnterSleep(UINT8 SleepState, UINT32 RegaValue, UINT32 RegbValue)
     (void)RegaValue;
     (void)RegbValue;
     return (AE_OK);
-}
-
-/*
- * Locking (single-threaded stubs)
- */
-ACPI_STATUS
-AcpiOsCreateLock(ACPI_SPINLOCK *OutHandle)
-{
-    *OutHandle = (ACPI_SPINLOCK)1;  /* Non-NULL dummy */
-    return (AE_OK);
-}
-
-void
-AcpiOsDeleteLock(ACPI_SPINLOCK Handle)
-{
-    (void)Handle;
-}
-
-ACPI_CPU_FLAGS
-AcpiOsAcquireLock(ACPI_SPINLOCK Handle)
-{
-    (void)Handle;
-    return (0);
-}
-
-void
-AcpiOsReleaseLock(ACPI_SPINLOCK Handle, ACPI_CPU_FLAGS Flags)
-{
-    (void)Handle;
-    (void)Flags;
-}
-
-ACPI_STATUS
-AcpiOsCreateSemaphore(UINT32 MaxUnits, UINT32 InitialUnits,
-                      ACPI_HANDLE *OutHandle)
-{
-    (void)MaxUnits;
-    (void)InitialUnits;
-    *OutHandle = (ACPI_HANDLE)1;
-    return (AE_OK);
-}
-
-ACPI_STATUS
-AcpiOsDeleteSemaphore(ACPI_HANDLE Handle)
-{
-    (void)Handle;
-    return (AE_OK);
-}
-
-ACPI_STATUS
-AcpiOsWaitSemaphore(ACPI_HANDLE Handle, UINT32 Units, UINT16 Timeout)
-{
-    (void)Handle;
-    (void)Units;
-    (void)Timeout;
-    return (AE_OK);
-}
-
-ACPI_STATUS
-AcpiOsSignalSemaphore(ACPI_HANDLE Handle, UINT32 Units)
-{
-    (void)Handle;
-    (void)Units;
-    return (AE_OK);
-}
-
-/*
- * Mutex functions are NOT defined here because ACPI_MUTEX_TYPE defaults to
- * ACPI_BINARY_SEMAPHORE, which causes actypes.h to #define AcpiOsCreateMutex
- * etc. as macros redirecting to the semaphore functions above.
- */
-
-ACPI_THREAD_ID
-AcpiOsGetThreadId(void)
-{
-    return (ACPI_THREAD_ID)1;
-}
-
-ACPI_STATUS
-AcpiOsExecute(ACPI_EXECUTE_TYPE Type, ACPI_OSD_EXEC_CALLBACK Function,
-              void *Context)
-{
-    (void)Type;
-    /* Single-threaded: just call it directly */
-    if (Function)
-        Function(Context);
-    return (AE_OK);
-}
-
-void
-AcpiOsWaitEventsComplete(void)
-{
-    /* Nothing — single-threaded */
 }
 
 /*
@@ -599,8 +474,7 @@ AcpiOsWaitEventsComplete(void)
 #include <kernel/hal/ioapic.h>
 #include <kernel/hal/lapic.h>
 
-// SCI vector in the IDT — pick an unused vector
-#define ACPI_SCI_VECTOR  58
+// SCI vector in the IDT: ACPI_SCI_VECTOR (kernel/ke/interrupt.h)
 
 // Saved ACPICA SCI handler
 static ACPI_OSD_HANDLER acpi_sci_handler;
@@ -655,6 +529,31 @@ AcpiOsRemoveInterruptHandler(UINT32 InterruptNumber,
     return (AE_OK);
 }
 
+// SCI handlers running right now, on any CPU (AcpiOsWaitEventsComplete
+// waits for them).  The handler runs ACPICA's fixed event and GPE
+// detection only: every method it wants run is deferred
+// (AcpiOsExecute, oslikeos_sync.c), the EC's queries likewise
+// (kernel/hal/acpi.c).
+static volatile int acpi_sci_running;
+
+static UINT32 acpi_sci_call(void)
+{
+    ACPI_OSD_HANDLER h = __atomic_load_n(&acpi_sci_handler, __ATOMIC_ACQUIRE);
+    UINT32 r = 0;
+
+    __atomic_add_fetch(&acpi_sci_running, 1, __ATOMIC_ACQ_REL);
+    if (h)
+        r = h(acpi_sci_context);
+    __atomic_sub_fetch(&acpi_sci_running, 1, __ATOMIC_ACQ_REL);
+    return r;
+}
+
+void acpi_osl_sci_sync(void)
+{
+    while (__atomic_load_n(&acpi_sci_running, __ATOMIC_ACQUIRE))
+        __asm__ volatile("pause" ::: "memory");
+}
+
 // Called from the kernel's irq_handler dispatch for the SCI vector.
 // Returns 1 if handled, 0 otherwise.
 static int acpi_sci_count = 0;
@@ -664,7 +563,7 @@ int acpi_sci_dispatch(void)
         acpi_sci_count++;
         if (acpi_sci_count <= 10)
             kprintf("ACPI SCI: dispatch #%d\n", acpi_sci_count);
-        acpi_sci_handler(acpi_sci_context);
+        (void)acpi_sci_call();
         return 1;
     }
     return 0;
@@ -678,13 +577,19 @@ uint32_t acpi_get_sci_gsi(void)
 
 // Manually invoke ACPICA's SCI handler to process pending GPE/PM events.
 // Use when SCI interrupt delivery may not work (x2APIC IOAPIC routing issues).
+// Thread context only.  At boot (before the ACPI work queues) the methods
+// the handler deferred run here, after it returned -- never inside it,
+// where ACPICA holds its GPE lock.
 void acpi_poll_events(void)
 {
+    extern void acpi_os_run_boot_deferred(void);
+
     if (acpi_sci_handler) {
-        UINT32 result = acpi_sci_handler(acpi_sci_context);
+        UINT32 result = acpi_sci_call();
         if (result)
             kprintf("ACPI SCI: polled, result=%d\n", result);
     }
+    acpi_os_run_boot_deferred();
 }
 
 /*

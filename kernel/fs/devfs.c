@@ -15,6 +15,7 @@
 #include <kernel/dev/rand/random.h>
 #include <kernel/dev/video/fbdev.h>
 #include <kernel/dev/input/evdev.h>
+#include <kernel/dev/input/keyboard.h>
 #include <kernel/fs/device.h>
 #include <kernel/fs/devevent.h>
 #include <kernel/uapi/anonfd.h>
@@ -54,6 +55,9 @@ typedef struct {
 	unsigned dir_pos;
 	uint64_t fpos; // byte position (framebuffer device)
 	int evdev_id; // input device unit (DEVFS_TYPE_EVDEV)
+	/* The descriptor's own event queue on that unit: every open of an
+	 * event node is a separate client that receives every event. */
+	struct evdev_client *evdev_client;
 	shm_object_t *shm; // shared memory object (DEVFS_TYPE_SHM)
 	/* Registered device nodes and anonymous device files: the node (NULL
 	 * for anonymous), the operations, and the driver's per-open state. */
@@ -74,6 +78,10 @@ typedef struct {
 	 * so the type alone cannot say which node a descriptor refers to — and
 	 * that is exactly what a /dev/fd/N symlink has to report. */
 	char path[32];
+	/* DEVFS_TYPE_TTY on the console: this open's token for the console's
+	 * KD* modes (keyboard_console_file_token()), which are put back when
+	 * the file that last changed them is closed.  0 for other terminals. */
+	uint64_t kd_token;
 } devfs_file_t;
 
 static vfs_ops_t g_devfs_ops;
@@ -829,6 +837,8 @@ static int devfs_open_tty(tty_t *tty, vfs_file_t **out)
 		return ST_NOMEM;
 	df->type = DEVFS_TYPE_TTY;
 	df->tty = tty;
+	if (tty == tty_get_console())
+		df->kd_token = keyboard_console_file_token();
 	*out = &df->vfs;
 	return ST_OK;
 }
@@ -1072,11 +1082,18 @@ static int devfs_open_impl(const char *path, int flags, unsigned int cmode,
 			id = id * 10 + (*p - '0');
 			p++;
 		}
-		if (id >= EVDEV_NUM_UNITS)
+		if (id >= EVDEV_MINORS)
 			return ST_NOT_FOUND;
 		devfs_file_t *df = devfs_alloc_file();
 		if (!df)
 			return ST_NOMEM;
+		/* Only nodes of registered devices exist; one whose device is
+		 * going away is gone as far as a new open is concerned. */
+		int erc = evdev_open(id, &df->evdev_client);
+		if (erc) {
+			kfree(df);
+			return erc == -ENOMEM ? ST_NOMEM : ST_NOT_FOUND;
+		}
 		df->type = DEVFS_TYPE_EVDEV;
 		df->evdev_id = id;
 		*out = &df->vfs;
@@ -1314,10 +1331,10 @@ int devfs_stat(const char *path, struct kstat *st)
 		perm = 0660, gid = DEVFS_GID_VIDEO, rmaj = 29, rmin = 0;
 	} else if (is_prefix(path, "/dev/input/event")) {
 		int id = devfs_parse_unit(path + 16);
-		if (id < 0)
+		if (id < 0 || !evdev_unit_exists(id))
 			return ST_NOT_FOUND;
-		perm = 0660, gid = DEVFS_GID_INPUT, rmaj = 13;
-		rmin = 64 + (uint32_t)id;
+		perm = 0660, gid = DEVFS_GID_INPUT, rmaj = EVDEV_MAJOR;
+		rmin = EVDEV_MINOR_BASE + (uint32_t)id;
 	} else if (is_prefix(path, "/dev/pts/")) {
 		int id = devfs_parse_unit(path + 9);
 		if (id < 0)
@@ -1409,8 +1426,10 @@ int devfs_path_for_rdev(int is_blk, uint64_t rdev, char *out, size_t cap)
 			out[cap - 1] = 0;
 			return ST_OK;
 		}
-		if (ma == 13 && mi >= 64) {
-			ksnprintf(out, cap, "/dev/input/event%u", mi - 64);
+		if (ma == EVDEV_MAJOR && mi >= EVDEV_MINOR_BASE &&
+		    evdev_unit_exists((int)(mi - EVDEV_MINOR_BASE))) {
+			ksnprintf(out, cap, "/dev/input/event%u",
+				  mi - EVDEV_MINOR_BASE);
 			return ST_OK;
 		}
 		if (ma == 136) {
@@ -1520,7 +1539,7 @@ long devfs_read(vfs_file_t *f, void *buf, long bytes)
 		return r;
 	}
 	if (df->type == DEVFS_TYPE_EVDEV) {
-		return evdev_read(df->evdev_id, buf, bytes, nonblock);
+		return evdev_read(df->evdev_client, buf, bytes, nonblock);
 	}
 	return -EINVAL;
 }
@@ -1571,7 +1590,7 @@ long devfs_write(vfs_file_t *f, const void *buf, long bytes)
 		return r;
 	}
 	if (df->type == DEVFS_TYPE_EVDEV)
-		return evdev_write(df->evdev_id, buf, bytes);
+		return evdev_write(df->evdev_client, buf, bytes);
 	return -EINVAL;
 }
 
@@ -1648,6 +1667,8 @@ static unsigned devfs_write_dirent64(char *out, unsigned out_size,
 /* devfs_file_t.dir_pos: 0 not started, 1 finished, DEVFS_DIRPOS_REG + i
  * resume a listing of registered nodes at child i. */
 #define DEVFS_DIRPOS_REG 0x1000u
+/* A /dev/input listing resumed at unit dir_pos - DEVFS_DIRPOS_INPUT. */
+#define DEVFS_DIRPOS_INPUT 0x2000u
 
 long devfs_readdir(vfs_file_t *f, void *buf, long bytes)
 {
@@ -1694,10 +1715,27 @@ long devfs_readdir(vfs_file_t *f, void *buf, long bytes)
 		return (long)out_off;
 	}
 	if (df->type == DEVFS_TYPE_INPUT_DIR) {
-		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
-				     "event0", 200, 2);
-		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
-				     "event1", 201, 2);
+		/* The event nodes of the registered input devices, resumable:
+		 * dir_pos holds DEVFS_DIRPOS_INPUT + the next unit to look
+		 * at, so a device that comes or goes between two calls moves
+		 * nobody else. */
+		int u = df->dir_pos >= DEVFS_DIRPOS_INPUT ?
+				(int)(df->dir_pos - DEVFS_DIRPOS_INPUT) :
+				0;
+		char nm[16];
+
+		while ((u = evdev_next_unit(u)) >= 0) {
+			ksnprintf(nm, sizeof(nm), "event%d", u);
+			if (!devfs_write_dirent64((char *)buf, (unsigned)bytes,
+						  &out_off, nm, 200 + (unsigned)u,
+						  2)) {
+				if (out_off == 0)
+					return -EINVAL;
+				df->dir_pos = DEVFS_DIRPOS_INPUT + (unsigned)u;
+				return (long)out_off;
+			}
+			u++;
+		}
 		df->dir_pos = 1;
 		return (long)out_off;
 	}
@@ -2008,18 +2046,24 @@ int devfs_close(vfs_file_t *f)
 				0); /* PTY slave close with negative pty_id: state corruption */
 			tty_pty_slave_close(df->pty_id);
 		} else if (df->type == DEVFS_TYPE_EVDEV) {
-			/* Release an exclusive grab held through THIS handle.
-			 * Keyed on the handle, not on the closing task: a
-			 * descriptor is not always closed by the task that
-			 * opened it, and matching on the task left the grab in
-			 * place -- which suppressed every pointer event from
-			 * then on. */
-			evdev_release_grab_by_owner(df->evdev_id, f);
+			/* The handle's queue goes, and with it an exclusive
+			 * grab held through THIS handle -- whoever closes it:
+			 * a descriptor is not always closed by the task that
+			 * opened it, and a grab left in place suppressed every
+			 * pointer event from then on. */
+			evdev_release(df->evdev_client);
+			df->evdev_client = NULL;
+		} else if (df->type == DEVFS_TYPE_TTY) {
+			/* A display server that dies with the console in
+			 * KD_GRAPHICS / K_OFF must not leave it that way. */
+			keyboard_console_file_closed(df->kd_token);
 		} else if (df->type == DEVFS_TYPE_FB0) {
 			/* On the last close, put the console back on screen:
-			 * whoever had the framebuffer mapped has been drawing
+			 * whoever had the framebuffer mapped may have drawn
 			 * over it, and with no virtual terminals there is no
-			 * other point at which the console would be redrawn. */
+			 * other point at which the console would be redrawn
+			 * (unless the display is owned -- KD_GRAPHICS or a DRM
+			 * master -- whose release repaints instead). */
 			fbdev_closed();
 		} else if (df->type == DEVFS_TYPE_SHM) {
 			/* Drops this handle's reference; an already-unlinked
@@ -2075,7 +2119,7 @@ int devfs_ioctl(vfs_file_t *f, unsigned long req, void *argp, task_t *cur)
 		return (int)ops->ioctl(f, req, argp, cur);
 	}
 	if (df->type == DEVFS_TYPE_TTY || df->type == DEVFS_TYPE_PTY_SLAVE) {
-		return tty_ioctl(df->tty, req, argp, cur);
+		return tty_ioctl_file(df->tty, req, argp, cur, df->kd_token);
 	}
 	if (df->type == DEVFS_TYPE_PTY_MASTER) {
 		WARN_ON(df->pty_id <
@@ -2098,20 +2142,20 @@ int devfs_ioctl(vfs_file_t *f, unsigned long req, void *argp, task_t *cur)
 		return fbdev_ioctl(req, argp, cur);
 	}
 	if (df->type == DEVFS_TYPE_EVDEV) {
-		return evdev_ioctl(df->evdev_id, req, argp, cur, f);
+		return evdev_ioctl(df->evdev_client, req, argp);
 	}
 	return -ENOTTY;
 }
 
-/* Event-device unit of an evdev handle, or -1 (poll dispatch helper). */
-int devfs_evdev_unit(vfs_file_t *f)
+/* The event queue of an evdev handle, or NULL (poll dispatch helper). */
+struct evdev_client *devfs_evdev_client(vfs_file_t *f)
 {
 	if (!f || f->ops != &g_devfs_ops)
-		return -1;
+		return NULL;
 	devfs_file_t *df = (devfs_file_t *)f->fs_private;
 	if (!df || df->type != DEVFS_TYPE_EVDEV)
-		return -1;
-	return df->evdev_id;
+		return NULL;
+	return df->evdev_client;
 }
 
 int devfs_fstat(vfs_file_t *f, struct kstat *st)
@@ -2219,8 +2263,8 @@ int devfs_fstat(vfs_file_t *f, struct kstat *st)
 		perm = 0660, gid = DEVFS_GID_VIDEO, rmaj = 29, rmin = 0;
 		break;
 	case DEVFS_TYPE_EVDEV:
-		perm = 0660, gid = DEVFS_GID_INPUT, rmaj = 13;
-		rmin = 64 + (uint32_t)df->evdev_id;
+		perm = 0660, gid = DEVFS_GID_INPUT, rmaj = EVDEV_MAJOR;
+		rmin = EVDEV_MINOR_BASE + (uint32_t)df->evdev_id;
 		break;
 	/* The directory handles (/dev, /dev/pts, /dev/input, /dev/fd) are not
 	 * character devices; without these cases fstat() fell through to the

@@ -1,0 +1,163 @@
+Take the console's keyboard and display modes while the server runs.
+
+The "stub" os-support backend has xf86OpenConsole()/xf86CloseConsole() as
+no-ops, because there are no virtual terminals.  But the console has the KD
+modes, and they are how a display server tells the kernel that the screen and
+the keyboard are its own now:
+
+  - KD_GRAPHICS: the console's pointer (scrollbar, wheel scrollback, terminal
+    mouse reports) stays out of the way;
+  - K_OFF: keys are no longer also typed into the console -- into the shell
+    that started the server, unseen, to run when the session ends.  The event
+    devices the input drivers read still get every key.
+
+So xf86OpenConsole() now opens the console (/dev/tty0, else /dev/console),
+saves KDGETMODE and KDGKBMODE, and sets KD_GRAPHICS and K_OFF (K_RAW with the
+console drained if K_OFF is refused), as the VT console layer upstream ships
+does -- without its VT switch and terminal attributes.  xf86CloseConsole(),
+called from ddxGiveUp() on a normal exit and on AbortServer() (FatalError,
+fatal signals), puts both modes back and closes the descriptor.
+
+The descriptor is opened while the server is still root (InitOutput, before
+patch 0005 drops privileges) and stays open; the kernel lets the file that
+changed the modes change them back after the drop.  A server that dies
+without reaching xf86CloseConsole() (SIGKILL) is covered by the kernel: it
+restores both modes when the file that set them is finally closed.  O_CLOEXEC
+so that a child (xkbcomp, the session) never holds the console in its place.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/hw/xfree86/os-support/stub/stub_init.c
++++ b/hw/xfree86/os-support/stub/stub_init.c
+@@ -4,6 +4,123 @@
+ 
+ #include "xf86_OSlib.h"
+ 
++#ifdef __LIKEOS__
++#include <fcntl.h>
++#include <string.h>
++#include <termios.h>
++#include <unistd.h>
++#include <sys/kd.h>
++
++#include "xf86.h"
++#include "xf86Priv.h"
++
++/*
++ * The console's keyboard and display modes (LikeOS).
++ *
++ * There are no virtual terminals here, but the console has the KD modes, and
++ * they are how a display server tells the kernel the screen and the keyboard
++ * are its own now: KD_GRAPHICS keeps the console's pointer (scrollbar, wheel
++ * scrollback, terminal mouse reports) out of the way, K_OFF stops every key
++ * from also being typed into the console -- into the shell that started the
++ * server, unseen, to run when the session ends.  The keys still reach the
++ * event devices the input drivers read.
++ *
++ * Done as the VT console layer upstream ships does it, minus the VT switch
++ * and the terminal attributes (K_OFF delivers nothing to the terminal):
++ * KD_GRAPHICS, then K_OFF, falling back to K_RAW with the console drained;
++ * both modes as they were are put back on the way out.  The descriptor stays
++ * open for the server's lifetime -- it is opened as root, before privileges
++ * are dropped, and the kernel lets the file that changed the modes change
++ * them back.  If the server dies without getting here, the kernel restores
++ * both when this descriptor is finally closed.
++ *
++ * Portions Copyright 1992 by Orest Zborowski, 1993 by David Wexelblat
++ * Copyright (C) 2026 The LikeOS Project
++ */
++
++static int likeos_saved_kbmode = K_UNICODE; /* keyboard mode to restore */
++static int likeos_saved_dispmode = KD_TEXT; /* display mode to restore */
++
++static void
++likeos_drain_console(int fd, void *closure)
++{
++    errno = 0;
++    if (tcflush(fd, TCIOFLUSH) == -1 && errno == EIO) {
++        xf86SetConsoleHandler(NULL, NULL);
++    }
++}
++
++void
++xf86OpenConsole(void)
++{
++    static const char *const names[] = { "/dev/tty0", "/dev/console", NULL };
++    int i, ret;
++
++    if (serverGeneration != 1 || xf86Info.consoleFd >= 0)
++        return;
++
++    for (i = 0; names[i] != NULL; i++) {
++        xf86Info.consoleFd = open(names[i],
++                                  O_RDWR | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
++        if (xf86Info.consoleFd >= 0)
++            break;
++    }
++    if (xf86Info.consoleFd < 0)
++        FatalError("xf86OpenConsole: Cannot open the console (%s)\n",
++                   strerror(errno));
++
++    SYSCALL(ret = ioctl(xf86Info.consoleFd, KDGETMODE, &likeos_saved_dispmode));
++    if (ret < 0)
++        likeos_saved_dispmode = KD_TEXT;
++
++    SYSCALL(ret = ioctl(xf86Info.consoleFd, KDSETMODE, KD_GRAPHICS));
++    if (ret < 0)
++        FatalError("xf86OpenConsole: KDSETMODE KD_GRAPHICS failed %s\n",
++                   strerror(errno));
++
++    SYSCALL(ret = ioctl(xf86Info.consoleFd, KDGKBMODE, &likeos_saved_kbmode));
++    if (ret < 0 || likeos_saved_kbmode == K_OFF)
++        likeos_saved_kbmode = K_UNICODE;
++
++    /* disable the console's keyboard */
++    SYSCALL(ret = ioctl(xf86Info.consoleFd, KDSKBMODE, K_OFF));
++    if (ret < 0) {
++        /* fine, just keep the console's own key handling out */
++        SYSCALL(ret = ioctl(xf86Info.consoleFd, KDSKBMODE, K_RAW));
++        if (ret < 0)
++            FatalError("xf86OpenConsole: KDSKBMODE K_RAW failed %s\n",
++                       strerror(errno));
++
++        /* ... and drain what the terminal is typed */
++        xf86SetConsoleHandler(likeos_drain_console, NULL);
++    }
++}
++
++void
++xf86CloseConsole(void)
++{
++    int ret;
++
++    if (xf86Info.consoleFd < 0)
++        return;
++
++    xf86SetConsoleHandler(NULL, NULL);
++
++    /* Back to the modes the console had ... */
++    SYSCALL(ret = ioctl(xf86Info.consoleFd, KDSETMODE, likeos_saved_dispmode));
++    if (ret < 0)
++        xf86Msg(X_WARNING, "xf86CloseConsole: KDSETMODE failed: %s\n",
++                strerror(errno));
++
++    SYSCALL(ret = ioctl(xf86Info.consoleFd, KDSKBMODE, likeos_saved_kbmode));
++    if (ret < 0)
++        xf86Msg(X_WARNING, "xf86CloseConsole: KDSKBMODE failed: %s\n",
++                strerror(errno));
++
++    close(xf86Info.consoleFd);
++    xf86Info.consoleFd = -1;
++}
++#else
+ void
+ xf86OpenConsole(void)
+ {
+@@ -13,6 +130,7 @@
+ xf86CloseConsole(void)
+ {
+ }
++#endif /* __LIKEOS__ */
+ 
+ int
+ xf86ProcessArgument(int argc, char *argv[], int i)

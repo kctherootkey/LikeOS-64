@@ -128,6 +128,17 @@ font      font-isas-misc     1.0.4    -  xorg/font/isas-misc
 # working fallback -- so it is made optional by a patch instead of ported.
 lib       libevdev           1.13.6   libevdev
 lib       mtdev              1.1.7    mtdev
+# libinput: the input stack of current desktops -- touchpad tapping, two-finger
+# and edge scrolling, clickpad buttons, palm and thumb detection, disable-
+# while-typing, pointer acceleration, pinch and swipe gestures -- over
+# libevdev and mtdev.  The X server reaches it through xf86-input-libinput
+# (below) for the keyboard and the touchpads likeos-input-devices names in its
+# configuration.
+# It describes devices through libudev, which here is this system's own
+# library (user/lib/libudev, put into the sysroot by import-libudev.sh before
+# this script runs).  Not an X.Org package: the explicit URL is the project's
+# release tag.  Meson; options in build.sh.
+-         libinput           1.31.3   https://gitlab.freedesktop.org/libinput/libinput/-/archive/%VERSION%/libinput-%VERSION%.tar.gz
 
 # ---- client-side fonts, and the X bitmaps ----
 # The chain is expat -> fontconfig -> libXft: fontconfig parses its XML config
@@ -146,9 +157,14 @@ data      xbitmaps           1.1.1    xbitmaps
 -         fontconfig         2.15.0   fontconfig
 lib       libXft             2.3.9    libxft
 
-# ---- the server and its two drivers ----
+# ---- the server and its drivers ----
 xserver   xorg-server        21.1.23  xorg-server
 driver    xf86-input-evdev   2.11.0   xserver-xorg-input-evdev
+# The libinput driver, for the keyboard (Keyboard0 in the shipped xorg.conf
+# files) and the touchpads (likeos-input-devices writes their InputDevice
+# sections): one stack, so a touchpad pauses while typing.  The mouse stays
+# on evdev.
+driver    xf86-input-libinput 1.5.0   xserver-xorg-input-libinput
 driver    xf86-video-fbdev   0.5.0    xserver-xorg-video-fbdev
 
 # ---- session ----

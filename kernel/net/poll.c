@@ -356,12 +356,15 @@ short poll_entry(void *entry, int fd, short events, struct poll_table *pt,
 		}
 	}
 
-	// Event devices (/dev/input/eventN): readable when events are queued.
+	// Event devices (/dev/input/eventN): readable when a whole packet is
+	// queued for this descriptor, writable while the device exists,
+	// POLLHUP|POLLERR once it is gone or the descriptor was revoked.
 	{
-		int unit = devfs_evdev_unit((vfs_file_t *)entry);
-		if (unit >= 0) {
-			poll_wait(pt, entry, evdev_pollq(unit));
-			return evdev_poll(unit, events);
+		struct evdev_client *ec =
+			devfs_evdev_client((vfs_file_t *)entry);
+		if (ec) {
+			poll_wait(pt, entry, evdev_pollq(ec));
+			return evdev_poll(ec, events);
 		}
 	}
 

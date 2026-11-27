@@ -28,6 +28,8 @@
 #include <kernel/ke/userinit.h>
 #include <kernel/uapi/dirent.h>
 #include <kernel/ke/storage.h> /* the root device for /proc/mounts */
+#include <kernel/dev/input/input.h>
+#include <kernel/dev/i2c/i2c.h>
 
 /* /proc/partitions and /proc/diskstats (kernel/dev/block/blk_sysfs.c) */
 long blk_proc_partitions_show(struct pfs_node *n, char *buf, long cap);
@@ -868,6 +870,23 @@ void procfs_init(void)
 	pfs_add_file(&g_procfs, "diskstats", blk_proc_diskstats_show, NULL, 0);
 	/* The major registry (kernel/fs/chrdev.c): built-in and dynamic. */
 	pfs_add_file(&g_procfs, "devices", chrdev_proc_devices_show, NULL, 0);
+	/* The input core's devices (kernel/dev/input/input.c). */
+	pfs_add_file(&g_procfs, "bus/input/devices", input_proc_devices_show,
+		     NULL, 0);
+	/* I2C adapters and clients (kernel/dev/i2c), and the bus list in the
+	 * form bus listing tools read. */
+	{
+		/* Written by root to run the suspend test ("suspend-test
+		 * [ms]"); read by everyone. */
+		struct pfs_node t;
+
+		kmemset(&t, 0, sizeof(t));
+		t.show = i2c_proc_show;
+		t.store = i2c_proc_store;
+		t.mode = 0644;
+		pfs_add_node(&g_procfs, "i2c", PFS_FILE, &t);
+	}
+	pfs_add_file(&g_procfs, "bus/i2c", i2c_proc_bus_show, NULL, 0);
 	vfs_register_mount("/proc", pfs_ops(&g_procfs), "proc", &g_procfs,
 			   /* Shown as the conventional options, but not
 			    * enforced: a program re-executes itself through

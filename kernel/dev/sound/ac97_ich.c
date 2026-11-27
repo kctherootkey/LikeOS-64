@@ -982,7 +982,7 @@ static void ich_free_irq(struct ich_chip *c)
 {
 	if (c->irq_ok && c->gsi >= 0) {
 		c->irq_armed = 0;
-		irq_free(32 + c->gsi, ich_irq, c);
+		irq_free(irq_gsi_vector(c->gsi), ich_irq, c);
 	}
 	c->irq_ok = 0;
 	c->gsi = -1;

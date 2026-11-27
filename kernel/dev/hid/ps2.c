@@ -34,6 +34,11 @@
 #define KBD_VECTOR 33 // IRQ1  -> vector 33
 #define AUX_VECTOR 44 // IRQ12 -> vector 44
 
+#define CMD_AUX_DISABLE 0xA7 // disable the auxiliary port
+
+/* ps2_init() found a controller and set it up. */
+static int g_ps2_present;
+
 static inline void udelay50(void)
 {
 	for (int i = 0; i < 50; i++)
@@ -168,5 +173,19 @@ int ps2_init(void)
 	i8042_flush();
 
 	kprintf("PS2: initialized (CTR=0x%02x)\n", i8042_ctr);
+	g_ps2_present = 1;
+	return 0;
+}
+
+int ps2_disable_aux_port(void)
+{
+	if (!g_ps2_present || inb(PS2_STATUS) == 0xFF)
+		return -1;
+	/* A command byte goes in once the input buffer is empty; the
+	 * command has no reply, so nothing is read and no keyboard byte can
+	 * be taken for one. */
+	if (i8042_wait_write())
+		return -1;
+	outb(PS2_CMD, CMD_AUX_DISABLE);
 	return 0;
 }
