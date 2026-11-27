@@ -106,6 +106,7 @@ static const char *const g_reserved[] = {
 	"root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail",
 	"news", "uucp", "proxy", "www-data", "backup", "list", "irc", "gnats",
 	"nobody", "nogroup", "sshd", "audiod", "messagebus", "dbus", "polkitd",
+	"lightdm",
 	"tty", "disk", "cdrom", "audio", "video", "input", "render", "users",
 	"wheel", "adm", "operator", "kmem", "dialout", "floppy", "tape",
 	"plugdev", "netdev", "staff", "shadow", "utmp", "kvm", "sgx", "lpadmin",

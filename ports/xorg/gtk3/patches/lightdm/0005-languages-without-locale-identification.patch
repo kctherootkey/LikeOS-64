@@ -1,0 +1,63 @@
+Name languages without the GNU locale identification category.
+
+lightdm_language_get_name() and lightdm_language_get_territory() look a
+language's English name up through LC_IDENTIFICATION and
+nl_langinfo(_NL_IDENTIFICATION_LANGUAGE/_TERRITORY), a GNU C library
+extension, after finding an installed locale with "locale -a".  Where the
+C library has no such category (LikeOS's has one built-in locale and no
+locale program) the build stopped on the undeclared names.  The lookup is
+now compiled only where the category exists; elsewhere both functions use
+the fallback they already had -- the language and territory codes.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/liblightdm-gobject/language.c
++++ b/liblightdm-gobject/language.c
+@@ -99,6 +99,7 @@
+ }
+ 
+ /* Get a valid locale name that can be passed to setlocale(), so we always can use nl_langinfo() to get language and country names. */
++#ifdef LC_IDENTIFICATION
+ static gchar *
+ get_locale_name (const gchar *code)
+ {
+@@ -137,6 +138,7 @@
+ 
+     return NULL;
+ }
++#endif
+ 
+ /**
+  * lightdm_get_language:
+@@ -210,6 +212,7 @@
+ 
+     if (!priv->name)
+     {
++#ifdef LC_IDENTIFICATION
+         g_autofree gchar *locale = get_locale_name (priv->code);
+         if (locale)
+         {
+@@ -223,6 +226,7 @@
+ 
+             setlocale (LC_ALL, current);
+         }
++#endif
+         if (!priv->name)
+         {
+             g_auto(GStrv) tokens = g_strsplit_set (priv->code, "_.@", 2);
+@@ -250,6 +254,7 @@
+ 
+     if (!priv->territory && strchr (priv->code, '_'))
+     {
++#ifdef LC_IDENTIFICATION
+         g_autofree gchar *locale = get_locale_name (priv->code);
+         if (locale)
+         {
+@@ -263,6 +268,7 @@
+ 
+             setlocale (LC_ALL, current);
+         }
++#endif
+         if (!priv->territory)
+         {
+             g_auto(GStrv) tokens = g_strsplit_set (priv->code, "_.@", 3);

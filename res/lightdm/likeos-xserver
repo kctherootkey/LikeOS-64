@@ -1,0 +1,28 @@
+#!/bin/sh
+#
+# likeos-xserver - the X server command of the graphical login
+# (xserver-command in /etc/lightdm/lightdm.conf).
+#
+# LightDM runs this as root with the server arguments it chose -- the
+# display, -seat, -auth with the authorization file it wrote, -nolisten tcp
+# -- and the server has to come up exactly as startx brings it up: with the
+# configuration matching the machine's display driver (i915 or VMware with
+# 3D: glamor on the GPU; any other display driver: software; no display
+# driver: the boot framebuffer), and -noreset, without which the server
+# would reset when the greeter's last client disconnects.  That choice is
+# made in one place, startx's /etc/X11/xinit/xserverrc, which picks the
+# configuration and then runs
+#
+#	/usr/bin/Xorg -noreset -nolisten tcp <config> "$@"
+#
+# so this runs it with LightDM's arguments instead of repeating it.  Started
+# by root, the server is not elevated and keeps nothing it would have to
+# give up; the console is still put in graphics mode while it runs and given
+# back when it exits, so the boot messages show until the login screen does.
+#
+# Copyright (C) 2026 The LikeOS Project
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+exec /bin/sh /etc/X11/xinit/xserverrc "$@"

@@ -1395,6 +1395,33 @@ static int task_is_dying(task_t *task)
 	return task && (task->has_exited || task->state == TASK_ZOMBIE);
 }
 
+/* True when `task`'s process is already ending: exit_group() set
+ * group_exiting and sent every other thread SIGKILL before the exiting
+ * thread gave up the address space.  The process's region table and page
+ * tables are kept with its leader, so a sibling still running on another
+ * processor in that window has its next demand fault refused -- a fault of
+ * the teardown, not of the program.  The thread is dead already: it ends
+ * the way the SIGKILL it has would end it, with no crash report and no
+ * fault signal. */
+static int task_group_exiting(task_t *task)
+{
+	task_t *leader;
+
+	if (!task)
+		return 0;
+	leader = task->group_leader ? task->group_leader : task;
+	return leader != task && leader->group_exiting;
+}
+
+static void task_end_as_killed(task_t *task)
+{
+	if (!task->has_exited && task->state != TASK_ZOMBIE) {
+		task->term_sig = SIGKILL;
+		sched_mark_task_exited(task, 128 + SIGKILL);
+	}
+	sched_exit_park();
+}
+
 /* Will this fault signal actually end the process?
  *
  * A program that installs a handler for a fault signal is using the fault
@@ -1866,6 +1893,9 @@ static void exception_handler_body(uint64_t *regs)
 			 * runnable. */
 			sched_exit_park();
 		}
+		/* Its process is ending around it (task_group_exiting). */
+		if (int_no == 14 && task_group_exiting(cur))
+			task_end_as_killed(cur);
 		/* A trap that belongs to a debugger rather than to the process.
 		 *
 		 * #BP is a planted breakpoint and #DB is a completed single

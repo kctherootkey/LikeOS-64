@@ -1,0 +1,86 @@
+Run a local seat without virtual terminals on kernels that have none.
+
+vt.c only issues the VT ioctls where the kernel has them (where their
+header is included), but vt_get_unused() still handed out VT numbers
+everywhere, so
+every X server of the seat was started with "vt1 -novtswitch" -- an option
+a server built without VT support rejects, and the seat never comes up.
+Elsewhere the seat now runs its display servers without a VT:
+
+  - vt_supported() says whether the kernel has VTs (VT_ACTIVATE known);
+  - vt_get_unused() returns -1 without them, so X gets no vtN argument;
+  - the seat does not offer multiple sessions (user switching would start
+    a second display server on the one screen);
+  - the active session is the one LightDM activated, as on seats that
+    have no VTs by nature, instead of "none" from the VT lookup.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/vt.h
++++ b/src/vt.h
+@@ -14,6 +14,8 @@
+ 
+ #include <glib-object.h>
+ 
++gboolean vt_supported (void);
++
+ gboolean vt_can_multi_seat (void);
+ 
+ gint vt_get_active (void);
+--- a/src/vt.c
++++ b/src/vt.c
+@@ -34,6 +34,21 @@
+     return fd;
+ }
+ 
++/* Whether this kernel has virtual terminals at all: whether the VT ioctls
++   are known (their header is only included for kernels that have them);
++   elsewhere a local seat runs its
++   display servers without a VT: no vtN argument for X, no VT switching, and
++   one display server on the seat at a time. */
++gboolean
++vt_supported (void)
++{
++#ifdef VT_ACTIVATE
++    return TRUE;
++#else
++    return FALSE;
++#endif
++}
++
+ gboolean
+ vt_can_multi_seat (void)
+ {
+@@ -137,7 +152,7 @@
+ gint
+ vt_get_unused (void)
+ {
+-    if (getuid () != 0)
++    if (getuid () != 0 || !vt_supported ())
+         return -1;
+ 
+     gint number = vt_get_min ();
+--- a/src/seat-local.c
++++ b/src/seat-local.c
+@@ -31,7 +31,9 @@
+ static void
+ seat_local_setup (Seat *seat)
+ {
+-    seat_set_supports_multi_session (seat, TRUE);
++    /* Without VTs there is one display server on the seat at a time, so
++       no second session can be started beside the running one. */
++    seat_set_supports_multi_session (seat, vt_supported ());
+     seat_set_share_display_server (seat, seat_get_boolean_property (seat, "xserver-share"));
+     SEAT_CLASS (seat_local_parent_class)->setup (seat);
+ }
+@@ -263,6 +265,10 @@
+ static Session *
+ seat_local_get_active_session (Seat *seat)
+ {
++    /* Without VTs the active session is the one LightDM activated */
++    if (!vt_supported ())
++        return seat_get_expected_active_session (seat);
++
+     gint vt = vt_get_active ();
+     if (vt < 0)
+         return NULL;

@@ -1,0 +1,31 @@
+Make the iso-codes package optional.
+
+configure stops with "You must have iso-codes." when the package is not
+installed, but the tables are only used to translate country and language
+names (xkl_get_country_name, xkl_get_language_name), which read them at run
+time and already cope with their absence (a warning, no name).  The layout
+registry -- all liblightdm-gobject uses this library for -- does not touch
+them.  Without the package configure now goes on and looks for the tables
+under the install prefix.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/configure.ac
++++ b/configure.ac
+@@ -186,8 +186,14 @@
+    iso_codes_pkgconfig=iso-codes
+    have_iso_codes=yes
+ else
+-   AC_MSG_RESULT([no])
+-   AC_MSG_ERROR([You must have iso-codes.])
++   dnl The ISO code tables only translate country and language names
++   dnl (xkl_get_country_name, xkl_get_language_name); the layout registry
++   dnl does not need them.  Without the package the tables are looked for
++   dnl under this package's own prefix, and a lookup finds no name.
++   AC_MSG_RESULT([no, country and language names stay untranslated])
++   iso_codes_prefix="$prefix"
++   test "x$iso_codes_prefix" = xNONE && iso_codes_prefix="$ac_default_prefix"
++   have_iso_codes=no
+ fi
+ 
+ AC_DEFINE_UNQUOTED([ISO_CODES_PREFIX],["$iso_codes_prefix"],[ISO codes prefix])

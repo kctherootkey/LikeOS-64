@@ -1,0 +1,58 @@
+#!/bin/sh
+#
+# likeos-greeter-session - starts the login screen (greeter-wrapper in
+# /etc/lightdm/lightdm.conf): runs the greeter ("$@") as the `lightdm'
+# account, with the environment a desktop session gives its programs.
+#
+# The greeter is a WebKit page, and WebKit renders the way the desktop's
+# browser does, so it has to be told the same things xinitrc tells a
+# session -- asking the GPU the same questions, so the greeter, the server
+# (likeos-xserver) and a desktop session always agree:
+#
+#   GPU that renders 3D, and its render node usable by this account (the
+#   greeter is the console's login while it runs, so the node is granted
+#   to it): GL on the GPU, frames between WebKit's processes as DMA-BUFs.
+#   Anything else: GL pinned to llvmpipe, frames in shared memory.
+#
+# and the rest a session sets: the cursor theme, the time zone and
+# language (/etc/profile), a private runtime directory, and an in-memory
+# GSettings backend -- the greeter keeps no settings of its own (the last
+# user signed in is kept by the page, in WebKit's storage under the
+# account's home, /var/lib/lightdm).
+#
+# Copyright (C) 2026 The LikeOS Project
+
+if [ -r /etc/profile ]; then
+	. /etc/profile >/dev/null 2>&1
+fi
+GSETTINGS_BACKEND=memory
+export GSETTINGS_BACKEND
+
+# The same decisions as in /etc/X11/xinit/xinitrc; see the comments there.
+LIKEOS_GPU_DRIVER=$(drminfo --driver /dev/dri/card0 2>/dev/null)
+export LIKEOS_GPU_DRIVER
+LIKEOS_GPU_3D=0
+if [ -e /dev/dri/card0 ] && drminfo --has-display /dev/dri/card0 &&
+	drminfo --has-3d /dev/dri/card0 &&
+	[ -r /dev/dri/renderD128 ] && [ -w /dev/dri/renderD128 ]; then
+	LIKEOS_GPU_3D=1
+fi
+export LIKEOS_GPU_3D
+if [ "$LIKEOS_GPU_3D" != "1" ]; then
+	LIBGL_ALWAYS_SOFTWARE=1
+	WEBKIT_DMABUF_RENDERER_FORCE_SHM=1
+	export LIBGL_ALWAYS_SOFTWARE WEBKIT_DMABUF_RENDERER_FORCE_SHM
+fi
+
+if [ -r /etc/X11/Xresources ]; then
+	XENVIRONMENT=/etc/X11/Xresources
+	export XENVIRONMENT
+fi
+XCURSOR_THEME=LikeOS
+XCURSOR_SIZE=32
+export XCURSOR_THEME XCURSOR_SIZE
+
+# The root window's default pattern and pointer until the page is drawn.
+xsetroot -solid "#000000" -cursor_name left_ptr 2>/dev/null
+
+exec "$@"

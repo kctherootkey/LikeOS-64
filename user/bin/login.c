@@ -20,26 +20,10 @@
 #include <getopt.h>
 #include <pwd.h>
 #include <grp.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <security/pam_appl.h>
 
 #define MAX_TRIES 3
-
-static void set_loginuid(uid_t uid)
-{
-	char buf[16];
-	int fd, n, ok = 0;
-
-	n = snprintf(buf, sizeof(buf), "%u", (unsigned)uid);
-	fd = open("/proc/self/loginuid", O_WRONLY | O_CLOEXEC);
-	if (fd >= 0) {
-		ok = write(fd, buf, (size_t)n) == n;
-		close(fd);
-	}
-	if (!ok)
-		fprintf(stderr, "login: cannot record the login\n");
-}
 
 /* Read one line from fd into a malloc'd, NUL-terminated string (newline
  * stripped).  Returns NULL on EOF with no data. */
@@ -244,13 +228,15 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	pam_open_session(pamh, 0);
+	/* Opening the session records the login while still root (libpam
+	 * writes /proc/self/loginuid for the "login" service): this process,
+	 * and everything it starts, becomes pw's login with a session id of
+	 * its own -- what tells the console's login apart from any other
+	 * (power commands).  A login that could not be recorded still goes
+	 * ahead, as before. */
+	if (pam_open_session(pamh, 0) != PAM_SUCCESS)
+		fprintf(stderr, "login: cannot record the login\n");
 	pam_setcred(pamh, PAM_ESTABLISH_CRED);
-
-	/* Record the login while still root: this process, and everything it
-	 * starts, becomes pw's login with a session id of its own -- what
-	 * tells the console's login apart from any other (power commands). */
-	set_loginuid(pw->pw_uid);
 
 	/* Switch credentials: groups, then gid, then uid (never the reverse). */
 	if (initgroups(pw->pw_name, pw->pw_gid) != 0)

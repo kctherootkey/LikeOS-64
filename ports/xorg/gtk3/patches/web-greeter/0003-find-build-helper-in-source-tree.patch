@@ -1,0 +1,22 @@
+Find the build helper in the source tree, not in the build directory.
+
+src/meson.build runs build/utils.sh to assemble the JavaScript bundle the
+greeter embeds, but names it relative to the BUILD directory -- which is
+only right when that directory is the source tree's build/, where the
+script happens to live.  Any other build directory fails at configure time
+with the helper not found.  The script belongs to the source tree, so name
+it there.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -9,7 +9,7 @@
+ 
+ gresources_dir = include_directories('gresource')
+ gnome = import('gnome')
+-utils = '@0@/utils.sh'.format(meson.build_root())
++utils = join_paths(meson.source_root(), 'build', 'utils.sh')
+ 
+ # Can't do it the right way until GLib 2.52 is released
+ # js_sources = run_command(utils, 'get-js-files').stdout().split()

@@ -1,0 +1,36 @@
+#!/bin/sh
+#
+# likeos-display-setup - run by LightDM as root once the X server is up and
+# before the login screen starts on it (display-setup-script in
+# /etc/lightdm/lightdm.conf).
+#
+# Gives the server what a desktop session gives it at its start:
+#
+#   - the resolution saved in Display settings (/etc/likeos/display.conf,
+#     through likeos-display-settings --restore).  A size saved during a
+#     session is the one the screen has when the session ends, and the
+#     login screen that follows must come up in it too: in a virtual
+#     machine the host's window keeps that size, and a login screen in the
+#     server's first mode would fill only a corner of it.
+#   - the keyboard layout chosen in Settings > Keyboard
+#     (/etc/likeos/keyboard.conf, through likeos-xkb-apply), so a password
+#     is typed with the layout it was set with.
+#
+# LightDM stops the display when this script fails, so it never does: what
+# cannot be applied leaves the server's own (its first mode, US layout) and
+# says why in LightDM's log, which is better than no login screen at all.
+#
+# Copyright (C) 2026 The LikeOS Project
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+if [ -x /usr/bin/likeos-display-settings ]; then
+	/usr/bin/likeos-display-settings --restore ||
+		echo "likeos-display-setup: the saved resolution could not be set" >&2
+fi
+if [ -x /usr/bin/likeos-xkb-apply ]; then
+	/usr/bin/likeos-xkb-apply ||
+		echo "likeos-display-setup: the keyboard layout could not be applied" >&2
+fi
+exit 0

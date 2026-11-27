@@ -1,0 +1,96 @@
+Keep no login records where the C library has no utmp database.
+
+The session helper writes utmp, wtmp and btmp records through
+<utmp.h>/<utmpx.h> (setutxent, pututxline, updwtmp), which LikeOS's C
+library does not have: it keeps no login records at all, and who is logged
+in at the console is the kernel's to say.  The record keeping is compiled
+only where the C library provides it.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/session-child.c
++++ b/src/session-child.c
+@@ -13,9 +13,18 @@
+ #include <grp.h>
+ #include <glib.h>
+ #include <security/pam_appl.h>
++#include <sys/mman.h>
++
++/* Login records (utmp, wtmp, btmp) where the C library keeps them; LikeOS's
++   has no utmp database. */
++#ifndef __LIKEOS__
++#define WITH_UTMP 1
++#endif
++
++#ifdef WITH_UTMP
+ #include <utmp.h>
+ #include <utmpx.h>
+-#include <sys/mman.h>
++#endif
+ 
+ #if HAVE_LIBAUDIT
+ #include <libaudit.h>
+@@ -193,6 +202,7 @@
+     return x_authority_new (x_authority_family, x_authority_address, x_authority_address_length, x_authority_number, x_authority_name, x_authority_data, x_authority_data_length);
+ }
+ 
++#ifdef WITH_UTMP
+ /* GNU provides this but we can't rely on that so let's make our own version */
+ static void
+ updwtmpx (const gchar *wtmp_file, struct utmpx *ut)
+@@ -214,6 +224,7 @@
+ 
+     updwtmp (wtmp_file, &u);
+ }
++#endif
+ 
+ #if HAVE_LIBAUDIT
+ static void
+@@ -342,6 +353,7 @@
+         g_free (username);
+         username = g_strdup (new_username);
+ 
++#ifdef WITH_UTMP
+         /* Write record to btmp database */
+         if (authentication_result == PAM_AUTH_ERR)
+         {
+@@ -370,6 +382,7 @@
+             audit_event (AUDIT_USER_LOGIN, username, -1, remote_host_name, tty, FALSE);
+ #endif
+         }
++#endif
+ 
+         /* Check account is valid */
+         if (authentication_result == PAM_SUCCESS)
+@@ -683,6 +696,7 @@
+     /* Wait for the command to complete (blocks) */
+     if (child_pid > 0)
+     {
++#ifdef WITH_UTMP
+         /* Log to utmp */
+         if (g_strcmp0 (pam_getenv (pam_handle, "XDG_SESSION_CLASS"), "greeter") != 0)
+         {
+@@ -715,6 +729,7 @@
+             audit_event (AUDIT_USER_LOGIN, username, uid, remote_host_name, tty, TRUE);
+ #endif
+         }
++#endif
+ 
+         int child_status;
+         waitpid (child_pid, &child_status, 0);
+@@ -724,6 +739,7 @@
+         else
+             return_code = EXIT_FAILURE;
+ 
++#ifdef WITH_UTMP
+         /* Log to utmp */
+         if (g_strcmp0 (pam_getenv (pam_handle, "XDG_SESSION_CLASS"), "greeter") != 0)
+         {
+@@ -756,6 +772,7 @@
+             audit_event (AUDIT_USER_LOGOUT, username, uid, remote_host_name, tty, TRUE);
+ #endif
+         }
++#endif
+     }
+ 
+     /* Remove X authority */

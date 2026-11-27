@@ -926,11 +926,12 @@ USR_BIN_AUDIO_PROGS = audioctl audioplay audiotest audioinfo eventsound
 # The device manager's client -> /usr/bin, the device manager (devd) -> /usr/sbin
 USR_BIN_DEVICE_PROGS = devctl
 # likeos-input-devices -> /usr/sbin as well (started by init: keeps the X
-# server's touchpad configuration current).
+# server's touchpad configuration current), and likeos-dm (started by init:
+# the graphical login or a text login on the console).
 USR_SBIN_PROGS = audiod devd smartctl smartd partx addpart delpart resizepart nvme \
-	likeos-input-devices
+	likeos-input-devices likeos-dm
 # Helpers -> /usr/libexec/<name>
-USR_LIBEXEC_PROGS = likeos-display-save likeos-keyboard-save
+USR_LIBEXEC_PROGS = likeos-display-save likeos-keyboard-save likeos-session-switch
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
 	netstress openssltest usbtest ext4test permbench fbtest pmap ttydump \
 	cxxprobe forkstress oncetest shmtest dirtest tlstest souptest snifftest \
@@ -956,6 +957,7 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 	$(wildcard res/xorg/gtk3/skel-claws-mail/*) \
 	$(wildcard res/xorg/gtk3/adblock/*.txt) \
 	$(shell find res/xorg/icons -type f -o -type l 2>/dev/null) \
+	$(shell find res/lightdm -type f -o -type l 2>/dev/null) \
 	res/firmware/i915.list res/firmware/sof.list \
 	$(wildcard res/firmware/i915/*.bin res/firmware/xe/*.bin) \
 	$(shell find res/firmware/intel -type f 2>/dev/null) \
@@ -996,13 +998,14 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 #
 # The file it names is the LAST program the manifest builds, which is what
 # makes its presence mean "the whole stack".  That was Claws Mail, then
-# PCManFM, then LikeOS Explorer, and is now luakit, the last package of
-# gtk3/packages.list -- a sentinel left at an earlier package would go on
-# being satisfied by a port that stopped before the packages added after it.
+# PCManFM, then LikeOS Explorer, then luakit, and is now the LightDM greeter
+# (web-greeter), the last package of gtk3/packages.list -- a sentinel left at
+# an earlier package would go on being satisfied by a port that stopped
+# before the packages added after it.
 # (Explorer, the media player, the image viewer, Task Viewer and the
 # GStreamer audio sink are the shell's own programs, built after the port:
 # SHELL_MESON_PROGS.)
-GTK3_SENTINEL = $(BUILD_DIR)/xorg-sysroot/usr/bin/luakit
+GTK3_SENTINEL = $(BUILD_DIR)/xorg-sysroot/usr/bin/lightdm-webkit2-greeter
 GTK3_TESTCXX = $(BUILD_DIR)/testcxx
 # The desktop bar widgets; built like testcxx, against the GTK3 sysroot.
 GTK3_BAR_PROGS = $(BUILD_DIR)/datetime $(BUILD_DIR)/load $(BUILD_DIR)/taskbar \
@@ -1934,6 +1937,19 @@ $(BUILD_DIR)/devd $(BUILD_DIR)/devctl: $(BUILD_DIR)/%: userland-libc userland-rt
 $(BUILD_DIR)/likeos-input-devices: userland-libc userland-rtld userland-libudev | $(BUILD_DIR)
 	$(MAKE) -C user/sbin/likeos-input-devices
 	cp user/sbin/likeos-input-devices/likeos-input-devices $@
+	$(USER_STRIP) --strip-unneeded $@
+
+# The console's display manager (started by init from inittab): runs LightDM,
+# or a text login, and switches between them on request.  Its setuid helper
+# likeos-session-switch is built from the same directory.
+$(BUILD_DIR)/likeos-dm: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C user/sbin/likeos-dm likeos-dm
+	cp user/sbin/likeos-dm/likeos-dm $@
+	$(USER_STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/likeos-session-switch: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C user/sbin/likeos-dm likeos-session-switch
+	cp user/sbin/likeos-dm/likeos-session-switch $@
 	$(USER_STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/libpam.so: userland-libpam | $(BUILD_DIR)
@@ -2908,7 +2924,7 @@ ports-xorg: userland-libc userland-rtld ports-openssl ports-zlib ports-ncurses \
 # Ordered after ports-xorg for the same reason its own manifest is ordered:
 # GTK's X11 backend cannot be configured until the X libraries are installed.
 .PHONY: ports-gtk3
-ports-gtk3: ports-xorg $(BUILD_DIR)/libaudio.so | $(BUILD_DIR)
+ports-gtk3: ports-xorg $(BUILD_DIR)/libaudio.so $(BUILD_DIR)/libpam.so | $(BUILD_DIR)
 	@# Checked HERE rather than left to the package that needs it.  GLib is
 	@# the fifth thing this target builds and the first to require a meson
 	@# newer than Ubuntu 24.04 ships, so without this the build spends
@@ -2929,6 +2945,8 @@ ports-gtk3: ports-xorg $(BUILD_DIR)/libaudio.so | $(BUILD_DIR)
 	ports/xorg/gtk3/unpack.sh
 	@# libaudio (headers, library, .pc) for the GStreamer audio sink.
 	ports/xorg/import-libaudio.sh
+	@# libpam (headers, library) for LightDM.
+	ports/xorg/import-libpam.sh
 	ports/xorg/gtk3/build.sh
 	@# The X server, a SECOND time.
 	@#
@@ -3274,10 +3292,11 @@ $(KEYMAPS_STAMP): host/gen-keymaps.pl host/ckbcomp/ckbcomp res/keyboard/layouts.
 .PHONY: keymaps
 keymaps: $(KEYMAPS_STAMP)
 
-# The same sentinel for the GTK3 stack.  luakit is the last package its
-# manifest builds and sits on top of nearly everything below it, so its presence
-# means the whole stack -- GLib, GTK, Cairo, Pango, the C++ runtime, libetpan,
-# GtkSourceView, libfm, menu-cache, GStreamer and WebKit -- is installed in the
+# The same sentinel for the GTK3 stack.  The LightDM greeter is the last
+# package its manifest builds and sits on top of nearly everything below it
+# (WebKit, GTK, LightDM's library), so its presence means the whole stack --
+# GLib, GTK, Cairo, Pango, the C++ runtime, libetpan, GtkSourceView, libfm,
+# menu-cache, GStreamer, WebKit, luakit and LightDM -- is installed in the
 # sysroot.
 #
 # Checks rather than assumes, for the reason given above: without a recipe that
@@ -3381,7 +3400,18 @@ $(EXT4_STAGING_STAMP): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER
 		$(EXT4_STAGING)/root $(EXT4_STAGING)/home \
 		$(EXT4_STAGING)/var/empty $(EXT4_STAGING)/var/run \
 		$(EXT4_STAGING)/var/log $(EXT4_STAGING)/tmp \
-		$(EXT4_STAGING)/var/tmp $(EXT4_STAGING)/var/lib/dbus
+		$(EXT4_STAGING)/var/tmp $(EXT4_STAGING)/var/lib/dbus \
+		$(EXT4_STAGING)/run/dbus $(EXT4_STAGING)/var/lib/lightdm \
+		$(EXT4_STAGING)/var/cache/lightdm
+	# /run holds what lives only while the system runs: the system
+	# message bus's socket (/run/dbus, where dbus-daemon --system
+	# listens), LightDM's state and likeos-dm's requests.  It is not a
+	# memory file system here, so the directory dbus-daemon needs (it
+	# makes no directories) ships in the image; likeos-dm makes it again
+	# should it be missing.  /var/lib/lightdm is the login screen's home
+	# (the `lightdm' account's: the greeter keeps the last user there) and
+	# /var/cache/lightdm LightDM's cache; likeos-dm gives the home to its
+	# account at every start, as the image's files are all root's.
 	# /var/lib/dbus holds the machine id, which dbus-daemon refuses to
 	# start without.  xinitrc writes it with dbus-uuidgen on the first
 	# session -- it identifies the INSTALLATION, so it is generated on the
@@ -3435,6 +3465,10 @@ $(EXT4_STAGING_STAMP): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) $(ADD_USER
 	cp $(BUILD_DIR)/likeos-keyboard-settings $(EXT4_STAGING)/usr/bin/likeos-keyboard-settings
 	for b in $(USR_LIBEXEC_PROGS); do cp $(BUILD_DIR)/$$b $(EXT4_STAGING)/usr/libexec/$$b; done
 	chmod 4755 $(EXT4_STAGING)/usr/libexec/likeos-display-save
+	# likeos-session-switch: setuid root, asks likeos-dm (above, in
+	# /usr/sbin) to switch the console between the graphical login and a
+	# console login, for the user logged in at the console only.
+	chmod 4755 $(EXT4_STAGING)/usr/libexec/likeos-session-switch
 	mkdir -p $(EXT4_STAGING)/etc/likeos
 	# Keyboard: the setting (/etc/likeos/keyboard.conf, US until Settings
 	# or loadkeys changes it), its setuid-root helper, the layout
@@ -3980,6 +4014,7 @@ clean:
 	$(MAKE) -C user/sbin/audiod clean
 	$(MAKE) -C user/sbin/devd clean
 	$(MAKE) -C user/sbin/likeos-input-devices clean
+	$(MAKE) -C user/sbin/likeos-dm clean
 	$(MAKE) -C $(USER_DIR) clean
 	@# The shell's meson build directories (SHELL_MESON_PROGS).
 	rm -rf $(addsuffix /.likeos-build,$(addprefix $(SHELL_MESON_DIR)/,$(SHELL_MESON_PROGS)))

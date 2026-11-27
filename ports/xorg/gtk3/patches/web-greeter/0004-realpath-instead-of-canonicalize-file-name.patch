@@ -1,0 +1,20 @@
+Use realpath() instead of canonicalize_file_name().
+
+canonicalize_file_name() is a GNU C library extension; realpath() with a
+NULL buffer is the POSIX.1-2008 function it is documented to be equivalent
+to, and is what C libraries without the extension (LikeOS's) offer.  The
+result is still a malloc'd string freed by the caller.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/webkit2-extension.c
++++ b/src/webkit2-extension.c
+@@ -1846,7 +1846,7 @@
+ 		return result;
+ 	}
+ 
+-	canonical_path = canonicalize_file_name(file_path);
++	canonical_path = realpath(file_path, NULL);
+ 
+ 	if (NULL != canonical_path) {
+ 		for (iter = paths; iter; iter = iter->next) {

@@ -302,28 +302,62 @@ void keyboard_client_leds(int num, int caps, int scroll)
 // state of the one console, and a display server that dies without putting
 // them back would leave the machine without a keyboard: K_OFF stays, and
 // KD_GRAPHICS keeps the console's pointer dead.  So the kernel remembers
-// which open file of the console last switched it away from its normal
-// state -- KD_GRAPHICS, or K_OFF -- and when that file is finally closed
-// (the program exited, crashed or was killed: the descriptor table goes
-// either way) the console gets KD_TEXT and the keyboard mode from before
-// back, with no key left held, its own LEDs and a full redraw.
+// which open files of the console asked for what, and when such a file is
+// finally closed (the program exited, crashed or was killed: the descriptor
+// table goes either way) what it asked for is withdrawn, with no key left
+// held, the console's own LEDs and a full redraw when the console gets the
+// screen back.
 //
-// Only the LAST file to change a mode owns the restore: another file that
-// sets a mode afterwards takes it over (inheriting the mode to go back to),
-// and the earlier file's close then changes nothing.  A file that puts both
-// modes back to normal itself leaves nothing to restore.
+// The display mode is a request: the console is in KD_GRAPHICS while any
+// open file of it has asked for that, and in KD_TEXT once none has.
+// KD_GRAPHICS adds the file's request, KD_TEXT withdraws it, a close
+// withdraws it too.  A display manager can so keep the console out of sight
+// for as long as its graphical login runs -- across the moment between two
+// display servers, and across a display server's exit that puts back the
+// KD_TEXT it found when it started -- while every display server still sets
+// and restores the mode as it always does.  KDGETMODE reports the mode in
+// effect.
+//
+// The keyboard mode is a chain of claims, oldest first.  A file that changes
+// the keyboard mode while another file's claim is the newest adds a claim of
+// its own, recording the mode it found -- the one to go back to when it
+// goes.
+//
+//   - The newest claim's file closes: the mode goes back to what that file
+//     found -- or, if no claim is left under it, to the mode the console had
+//     when its keyboard was last its own.
+//   - An older claim's file closes: its claim goes, and the claim after it
+//     inherits what it would have gone back to.
+//   - A file that puts back what it found withdraws its claim; setting the
+//     mode already in effect claims nothing.
+//   - A mode that gives the console its keyboard (K_XLATE, K_UNICODE), or a
+//     change made without a file, leaves no claim: there is nothing a close
+//     should undo.
+//
+// A request without a file (token 0: a console descriptor of a task's stdio
+// markers) belongs to nobody: its KD_GRAPHICS stays until KD_TEXT is set the
+// same way, and that KD_TEXT ends every request -- the way out of a console
+// left in graphics mode.
 //
 // Files are told apart by a token handed out at open (never reused), not by
-// address: a closed file's memory can be the next open's.  Token 0 is a
-// request that came without a file (a console descriptor of a task's stdio
-// markers); it owns nothing.
-//
-// The owner may also always change the modes back, even when it would no
+// address: a closed file's memory can be the next open's.  A file with a
+// request or a claim may always change the modes, even when it would no
 // longer pass kd_permitted(): the display server opens the console as root
 // and drops its privileges before it exits.
 
-static uint64_t kd_owner; // token of the owning file, 0 none (kb_lock)
-static uint8_t kd_saved_kbdmode = K_UNICODE; // to go back to (kb_lock)
+#define KD_FILES_MAX 8
+
+struct kd_claim {
+	uint64_t token;        // the file that changed the keyboard mode
+	uint8_t before_kbdmode; // the mode it found, to go back to
+};
+
+static struct kd_claim kd_claims[KD_FILES_MAX]; // oldest first (kb_lock)
+static int kd_nclaims;                          // (kb_lock)
+static uint64_t kd_gfx[KD_FILES_MAX];   // files asking for KD_GRAPHICS (kb_lock)
+static int kd_ngfx;                     // (kb_lock)
+static int kd_gfx_anon;                 // asked for without a file (kb_lock)
+static uint8_t kd_saved_kbdmode = K_UNICODE; // the console's own (kb_lock)
 static uint64_t kd_next_token = 1;
 
 uint64_t keyboard_console_file_token(void)
@@ -336,28 +370,123 @@ int keyboard_kd_graphics(void)
 	return __atomic_load_n(&g_km.kdmode, __ATOMIC_ACQUIRE) == KD_GRAPHICS;
 }
 
-// Both modes as the console normally has them.  Caller holds kb_lock.
-static int kd_state_normal(void)
+// A keyboard mode that leaves the console its keyboard.
+static int kd_kbd_console(uint8_t m)
 {
-	return g_km.kdmode == KD_TEXT && g_km.kbdmode != K_OFF;
+	return m == K_XLATE || m == K_UNICODE;
 }
 
-// Record who changed a mode, after the change.  was_normal and prev_kbdmode
-// describe the state before it.  Caller holds kb_lock.
-static void kd_note_change_locked(uint64_t token, int was_normal,
-				  uint8_t prev_kbdmode)
+// The claim of `token', or -1.  Caller holds kb_lock.
+static int kd_claim_find(uint64_t token)
 {
-	if (kd_state_normal()) {
-		kd_owner = 0;
+	if (!token)
+		return -1;
+	for (int i = 0; i < kd_nclaims; i++)
+		if (kd_claims[i].token == token)
+			return i;
+	return -1;
+}
+
+// Remove claim i; the claim after it inherits what it would have gone back
+// to.  Caller holds kb_lock.
+static void kd_claim_remove(int i)
+{
+	if (i + 1 < kd_nclaims)
+		kd_claims[i + 1].before_kbdmode = kd_claims[i].before_kbdmode;
+	for (int k = i; k + 1 < kd_nclaims; k++)
+		kd_claims[k] = kd_claims[k + 1];
+	kd_nclaims--;
+}
+
+// The display request of `token', or -1.  Caller holds kb_lock.
+static int kd_gfx_find(uint64_t token)
+{
+	if (!token)
+		return -1;
+	for (int i = 0; i < kd_ngfx; i++)
+		if (kd_gfx[i] == token)
+			return i;
+	return -1;
+}
+
+static void kd_gfx_remove(int i)
+{
+	for (int k = i; k + 1 < kd_ngfx; k++)
+		kd_gfx[k] = kd_gfx[k + 1];
+	kd_ngfx--;
+}
+
+// The display mode the requests make, stored.  Returns the output gate's
+// change.  Caller holds kb_lock.
+static int kd_display_update_locked(void)
+{
+	uint8_t m = (kd_ngfx > 0 || kd_gfx_anon) ? KD_GRAPHICS : KD_TEXT;
+
+	__atomic_store_n(&g_km.kdmode, m, __ATOMIC_SEQ_CST);
+	// The console's output gate follows the display mode in the order
+	// the modes are set: noted here, under kb_lock.
+	return console_display_kd_note(m == KD_GRAPHICS);
+}
+
+// KDSETMODE.  Caller holds kb_lock.
+static int kd_display_request_locked(uint64_t token, int kdmode)
+{
+	int i = kd_gfx_find(token);
+
+	if (kdmode == KD_GRAPHICS) {
+		if (!token) {
+			kd_gfx_anon = 1;
+		} else if (i < 0) {
+			if (kd_ngfx == KD_FILES_MAX) {
+				// More files than any real use makes: the
+				// oldest request goes.
+				WARN_ON_ONCE(1);
+				kd_gfx_remove(0);
+			}
+			kd_gfx[kd_ngfx++] = token;
+		}
+	} else if (!token) {
+		kd_ngfx = 0; // the way out: every request ends
+		kd_gfx_anon = 0;
+	} else if (i >= 0) {
+		kd_gfx_remove(i);
+	}
+	return kd_display_update_locked();
+}
+
+// Record who changed the keyboard mode, after the change.  prev is the mode
+// before it.  Caller holds kb_lock.
+static void kd_kbd_note_change_locked(uint64_t token, uint8_t prev)
+{
+	uint8_t now = g_km.kbdmode;
+	int i;
+
+	if (now == prev)
+		return; // nothing changed: nothing claimed
+	// Leaving the console: the mode it goes back to in the end.
+	if (kd_kbd_console(prev) && !kd_kbd_console(now))
+		kd_saved_kbdmode = prev;
+	if (kd_kbd_console(now) || !token) {
+		kd_nclaims = 0;
 		return;
 	}
-	// Leaving the normal state: what to come back to is the mode in
-	// effect now -- never K_OFF, which is not normal.  Otherwise the
-	// earlier owner's saved mode is kept.
-	if (was_normal)
-		kd_saved_kbdmode = prev_kbdmode;
-	WARN_ON(kd_saved_kbdmode == K_OFF);
-	kd_owner = token;
+	i = kd_claim_find(token);
+	if (i >= 0 && i == kd_nclaims - 1) {
+		// The newest claim's own file again: put back what it found
+		// and the claim is withdrawn.
+		if (now == kd_claims[i].before_kbdmode)
+			kd_nclaims--;
+		return;
+	}
+	if (i >= 0)
+		kd_claim_remove(i); // an older claim's file: it is newest now
+	if (kd_nclaims == KD_FILES_MAX) {
+		WARN_ON_ONCE(1);
+		kd_claim_remove(0);
+	}
+	kd_claims[kd_nclaims].token = token;
+	kd_claims[kd_nclaims].before_kbdmode = prev;
+	kd_nclaims++;
 }
 
 void keyboard_console_file_closed(uint64_t token)
@@ -366,30 +495,48 @@ void keyboard_console_file_closed(uint64_t token)
 	uint64_t flags;
 	int restored = 0;
 	int change = 0;
+	int i, g;
 
 	if (!token)
 		return;
 	grabbed = evdev_kbd_grabbed();
 	spin_lock_irqsave(&kb_lock, &flags);
-	if (kd_owner == token) {
-		kd_owner = 0;
-		(void)keymap_set_kbdmode(&g_km, kd_saved_kbdmode);
-		__atomic_store_n(&g_km.kdmode, (uint8_t)KD_TEXT,
-				 __ATOMIC_SEQ_CST);
-		change = console_display_kd_note(0);
+	i = kd_claim_find(token);
+	if (i >= 0 && i < kd_nclaims - 1) {
+		// An older claim: a newer file has the keyboard; it now goes
+		// back to what this one found when it goes.
+		kd_claim_remove(i);
+	} else if (i >= 0) {
+		uint8_t m = i > 0 ? kd_claims[i].before_kbdmode :
+				    kd_saved_kbdmode;
+
+		if (i == 0 && kd_kbd_console(kd_claims[i].before_kbdmode))
+			m = kd_claims[i].before_kbdmode;
+		kd_nclaims--;
+		(void)keymap_set_kbdmode(&g_km, m);
+		if (kd_kbd_console(m))
+			kd_nclaims = 0;
+		restored = 1;
+	}
+	g = kd_gfx_find(token);
+	if (g >= 0) {
+		kd_gfx_remove(g);
+		change = kd_display_update_locked();
+		restored = 1;
+	}
+	if (restored) {
 		// Whatever was held when the owner went is not held now.
 		keymap_reset_keys(&g_km);
 		(void)keyboard_owner_update_locked(grabbed);
 		keyboard_leds_update_locked();
-		restored = 1;
 	}
 	spin_unlock_irqrestore(&kb_lock, flags);
 	if (!restored)
 		return;
 	kprintf("console: keyboard and display modes restored (their owner closed the console)\n");
 	// The screen: whatever that program left on it goes -- if this ended
-	// the display's ownership.  While a DRM master still holds it, its
-	// drop repaints instead.
+	// the display's ownership.  While a DRM master or another request
+	// still holds it, nothing is painted.
 	console_display_settle(change);
 }
 
@@ -740,43 +887,39 @@ static int kd_set_func(void *argp)
 }
 
 // KDSKBMODE (kbdmode >= 0) and KDSETMODE (kdmode >= 0), with the record of
-// who changed them ("The console's modes and who set them").
+// who asked for them ("The console's modes and who set them").
 static int kd_set_modes(task_t *cur, uint64_t token, int kbdmode, int kdmode)
 {
 	int grabbed = evdev_kbd_grabbed();
-	int was_normal, change = 0, r = 0;
+	int change = 0, r = 0;
 	uint8_t prev_kbdmode;
 	uint64_t flags;
 
 	spin_lock_irqsave(&kb_lock, &flags);
-	// Permission is checked under the lock: whether the caller owns the
-	// modes can change under it.
-	if (!kd_permitted(cur) && !(token && token == kd_owner)) {
+	// Permission is checked under the lock: whether the caller holds a
+	// request or a claim can change under it.
+	if (!kd_permitted(cur) && kd_claim_find(token) < 0 &&
+	    kd_gfx_find(token) < 0) {
 		spin_unlock_irqrestore(&kb_lock, flags);
 		return -EPERM;
 	}
-	was_normal = kd_state_normal();
 	prev_kbdmode = g_km.kbdmode;
-	if (kbdmode >= 0)
+	if (kbdmode >= 0) {
 		r = keymap_set_kbdmode(&g_km, (unsigned)kbdmode);
-	if (!r && kdmode >= 0) {
-		__atomic_store_n(&g_km.kdmode, (uint8_t)kdmode,
-				 __ATOMIC_SEQ_CST);
-		// The console's output gate follows the display mode in the
-		// order the modes are set: noted here, under kb_lock.
-		change = console_display_kd_note(kdmode == KD_GRAPHICS);
+		if (!r)
+			kd_kbd_note_change_locked(token, prev_kbdmode);
 	}
-	if (!r) {
-		kd_note_change_locked(token, was_normal, prev_kbdmode);
+	if (!r && kdmode >= 0)
+		change = kd_display_request_locked(token, kdmode);
+	if (!r)
 		(void)keyboard_owner_update_locked(grabbed);
-	}
 	spin_unlock_irqrestore(&kb_lock, flags);
 
 	// KD_GRAPHICS: the console stops painting (and its hardware cursor
 	// goes) -- if this took the display.  Back to text: the console's
 	// pointer works again and what the graphics program left is
 	// repainted -- if this ended the display's ownership; while a DRM
-	// master still holds it, its drop repaints instead.
+	// master or another request still holds it, nothing is painted.
 	console_display_settle(change);
 	return r;
 }

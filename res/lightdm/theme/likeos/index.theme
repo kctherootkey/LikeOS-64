@@ -1,0 +1,8 @@
+# LikeOS sign-in screen theme for lightdm-webkit2-greeter.
+# Copyright (C) 2026 The LikeOS Project
+[theme]
+name=LikeOS
+description=LikeOS lock and sign-in screen
+engine=lightdm-webkit2-greeter
+url=index.html
+session=likeos

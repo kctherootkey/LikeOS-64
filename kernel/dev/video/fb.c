@@ -960,6 +960,39 @@ void fb_flush_dirty_regions(void)
 	fb_flush_hook_run();
 }
 
+/* Black on the screen, the console's picture kept.
+ *
+ * For a display the console does not own, where nobody draws: a display
+ * manager holds the console in graphics mode between two display servers,
+ * and the display hardware has to be pointed at the console's buffer again
+ * because the server that left took its own with it.  That buffer still
+ * shows what the console last put there -- old text, the scrollbar -- which
+ * is not what belongs on the screen while it is somebody else's.  Only the
+ * front buffer is cleared: the back buffer keeps everything, and the whole
+ * screen is marked dirty so the full redraw when the console gets the
+ * display back paints all of it. */
+void fb_front_clear(void)
+{
+	uint64_t flags;
+	size_t n;
+
+	spin_lock_irqsave(&fb_lock, &flags);
+	if (!g_initialized || !g_double_buffer.front_buffer) {
+		spin_unlock_irqrestore(&fb_lock, flags);
+		return;
+	}
+	n = (size_t)g_double_buffer.height * g_double_buffer.pitch;
+	for (size_t i = 0; i < n; i++)
+		g_double_buffer.front_buffer[i] = 0;
+	__asm__ volatile("sfence" ::: "memory");
+	g_double_buffer.full_screen_dirty = 1;
+	g_double_buffer.num_dirty_regions = 0;
+	hook_accumulate(0, 0, g_double_buffer.width - 1,
+			g_double_buffer.height - 1);
+	spin_unlock_irqrestore(&fb_lock, flags);
+	fb_flush_hook_run();
+}
+
 void fb_flush_barrier(void)
 {
 	uint64_t flags;

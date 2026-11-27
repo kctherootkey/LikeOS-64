@@ -521,6 +521,36 @@ pkg_opts() {
 		      --enable-gnutls --enable-enchant --enable-libetpan \
 		      --enable-fancy-plugin"
 		;;
+	libxklavier)
+		# The keyboard-layout registry liblightdm-gobject links.  XKB
+		# only: the xmodmap backend reads /usr/share/xmodmap, which this
+		# system does not have.  The XKB data and xkbcomp are where the
+		# X port installs them on the target -- stated, because the
+		# defaults are asked of the build host (its xkbcomp) or of the
+		# sysroot's pkg-config.  Introspection, Vala bindings and the
+		# reference manual need generators that would have to run here.
+		echo "--disable-introspection --disable-vala --disable-gtk-doc \
+		      --disable-xmodmap-support \
+		      --with-xkb-base=/usr/share/X11/xkb --with-xkb-bin-base=/usr/bin"
+		;;
+	lightdm)
+		# The display manager.  PAM is the system's own libpam (published
+		# into the sysroot by ../import-libpam.sh before this port runs).
+		# The greeter is the WebKit one built after it, the default
+		# session is LikeOS's desktop (/usr/share/xsessions/likeos.desktop)
+		# and the greeter runs as the system account `lightdm'.
+		#
+		# Off: the regression tests (they build a fake X server and
+		# a fake logind for the build host), introspection and Vala
+		# (generators that run the target library), the Qt5 client
+		# library (no Qt here), libaudit (no audit subsystem) and the
+		# reference manual.
+		echo "--disable-tests --disable-introspection --disable-vala \
+		      --disable-liblightdm-qt5 --disable-libaudit \
+		      --disable-gtk-doc \
+		      --with-greeter-session=lightdm-webkit2-greeter \
+		      --with-user-session=likeos --with-greeter-user=lightdm"
+		;;
 	pcre2)
 		# The JIT on, as distributions ship it: GRegex and VTE compile
 		# their patterns to machine code, and VTE reports a library
@@ -656,6 +686,15 @@ pkg_env() {
 		# than gpg-error: asking the host about a library that is not
 		# in this sysroot can only produce a wrong yes.
 		echo "$common GPGRT_CONFIG=$SYSROOT/usr/bin/gpgrt-config"
+		;;
+	lightdm)
+		# The user guide (help/) is a yelp document, and configure's
+		# YELP_HELP_INIT insists on finding xmllint for it even though
+		# only that directory's rules run it -- and help/ is not built
+		# here (make_dirs).  Naming a tool that does nothing answers the
+		# check without pretending the guide could be built: nothing in
+		# the directories that ARE built calls it.
+		echo "$common XMLLINT=true"
 		;;
 	startup-notification)
 		# "Does realloc(NULL, n) behave as malloc(n)?"  Answered by
@@ -1112,6 +1151,13 @@ meson_opts() {
 		      -Ddoc=false -Dintrospection=false -Dvapi=false \
 		      -Dgudev=disabled"
 		;;
+	web-greeter)
+		# LightDM's WebKit greeter (lightdm-webkit2-greeter).  Its themes
+		# live under /usr/share/lightdm-webkit2-greeter/themes; the image
+		# ships LikeOS's own there (stage.sh), not the two this tree
+		# installs into the sysroot.
+		echo "-Dwith-theme-dir=/usr/share/lightdm-webkit2-greeter/themes"
+		;;
 	libsecret)
 		# WebKit's USE_LIBSECRET (persistent HTTP credential storage).
 		echo "-Dmanpage=false -Dcrypto=libgcrypt -Dvapi=false \
@@ -1317,6 +1363,17 @@ make_dirs() {
 	# compiled for the target could not be run by the thing that needs it.
 	# libtextstyle exists only to make those tools' output colourful.
 	gettext) echo "-C gettext-runtime" ;;
+	# libxklavier: the library.  doc/ is the API manual (gtk-doc)
+	# and tests/ a program for the library's own developers; the .pc file
+	# is generated at the top level and installed by post_install().
+	libxklavier) echo "-C libxklavier" ;;
+	# LightDM: the daemon and its helper (src), the greeter library
+	# (liblightdm-gobject) and what both are built from (common), the
+	# D-Bus policy and the default configuration (data) and the
+	# translations (po).  Not the Qt library, the tests, the API manual
+	# (doc) nor the user guide (help), whose build wants yelp's
+	# tools.
+	lightdm) echo "-C common -C liblightdm-gobject -C data -C po -C src" ;;
 	*) echo "" ;;
 	esac
 }
@@ -1401,6 +1458,11 @@ post_install() {
 				      "$SYSROOT/usr/lib/gio/modules/${other%.so}.la"
 			fi
 		fi
+		;;
+	libxklavier)
+		# The .pc file is generated at the top level, as for libXpm
+		# below: liblightdm-gobject finds the library through it.
+		make install-pkgconfigDATA DESTDIR="$SYSROOT" || return 1
 		;;
 	libXpm)
 		# The .pc file is generated at the top level, so building only

@@ -3350,22 +3350,120 @@ static void test_keyboard(void)
 	led_write(kc, LED_NUML, 0);
 	kb_drain(kc);
 
-	/* Taken over: the last file to change a mode owns the restore, and
-	 * inherits the mode to go back to. */
+	/* Each mode goes back with the file that asked for it: t1's keyboard
+	 * mode with t1, t2's graphics with t2. */
 	CHECK(kd(NULL, t1, KDSKBMODE, K_XLATE) == 0, "K_XLATE");
 	CHECK(kd(NULL, t1, KDSKBMODE, K_OFF) == 0, "K_OFF by t1");
 	CHECK(kd(NULL, t2, KDSETMODE, KD_GRAPHICS) == 0, "KD_GRAPHICS by t2");
 	keyboard_console_file_closed(t1);
-	expect_modes(K_OFF, KD_GRAPHICS);
+	expect_modes(K_XLATE, KD_GRAPHICS);
 	keyboard_console_file_closed(t2);
+	expect_modes(K_XLATE, KD_TEXT);
+
+	/* Keyboard taken over: the newest claim goes back to what it found,
+	 * and an older claim's close hands its way back on. */
+	CHECK(kd(NULL, t1, KDSKBMODE, K_OFF) == 0, "K_OFF by t1");
+	CHECK(kd(NULL, t2, KDSKBMODE, K_RAW) == 0, "K_RAW by t2");
+	keyboard_console_file_closed(t1);
+	expect_modes(K_RAW, KD_TEXT);
+	keyboard_console_file_closed(t2);
+	expect_modes(K_XLATE, KD_TEXT);
+	CHECK(kd(NULL, t1, KDSKBMODE, K_OFF) == 0, "K_OFF by t1");
+	CHECK(kd(NULL, t2, KDSKBMODE, K_RAW) == 0, "K_RAW by t2");
+	keyboard_console_file_closed(t2);
+	expect_modes(K_OFF, KD_TEXT);
+	keyboard_console_file_closed(t1);
 	expect_modes(K_XLATE, KD_TEXT);
 	kb_tap(SC_A);
 	expect_typed("a");
+
+	/* A display manager keeps the console in graphics mode for its whole
+	 * graphical login.  The display servers it starts one after another
+	 * set and restore the modes as always; the console stays out of sight
+	 * between them, and also when a server started from a console login
+	 * (which found KD_TEXT and puts it back) ends after the display
+	 * manager has asked for graphics. */
+	{
+		uint64_t dm = keyboard_console_file_token();
+		uint64_t x1 = keyboard_console_file_token();
+		uint64_t x2 = keyboard_console_file_token();
+		int takes = test_display_takes();
+		uint8_t kb0;
+
+		kb0 = (uint8_t)kd_kbdmode();
+		redraws = test_console_redraws();
+		CHECK(kd(NULL, dm, KDSETMODE, KD_GRAPHICS) == 0, "dm graphics");
+		expect_modes(kb0, KD_GRAPHICS);
+		CHECK(console_display_owned() &&
+			      test_display_takes() == takes + 1,
+		      "dm takes the display");
+		/* X under the display manager: finds KD_GRAPHICS, switches the
+		 * keyboard off, puts both back and closes. */
+		CHECK(kd_dispmode() == KD_GRAPHICS, "x1 finds graphics");
+		CHECK(kd(NULL, x1, KDSETMODE, KD_GRAPHICS) == 0, "x1 graphics");
+		CHECK(kd(NULL, x1, KDSKBMODE, K_OFF) == 0, "x1 K_OFF");
+		expect_modes(K_OFF, KD_GRAPHICS);
+		CHECK(kd(NULL, x1, KDSETMODE, KD_GRAPHICS) == 0,
+		      "x1 puts back graphics");
+		CHECK(kd(NULL, x1, KDSKBMODE, kb0) == 0, "x1 puts back kbd");
+		keyboard_console_file_closed(x1);
+		expect_modes(kb0, KD_GRAPHICS);
+		CHECK(console_display_owned() &&
+			      test_console_redraws() == redraws,
+		      "x1 gone: still held, nothing painted");
+		/* X killed with the keyboard off: the keyboard comes back, the
+		 * console stays out of sight. */
+		CHECK(kd(NULL, x2, KDSETMODE, KD_GRAPHICS) == 0, "x2 graphics");
+		CHECK(kd(NULL, x2, KDSKBMODE, K_OFF) == 0, "x2 K_OFF");
+		keyboard_console_file_closed(x2);
+		expect_modes(kb0, KD_GRAPHICS);
+		CHECK(console_display_owned() &&
+			      test_console_redraws() == redraws,
+		      "x2 killed: still held, no repaint");
+		/* The display manager gives the console back: one repaint,
+		 * nothing left for its close. */
+		CHECK(kd(NULL, dm, KDSETMODE, KD_TEXT) == 0, "dm text");
+		expect_modes(kb0, KD_TEXT);
+		CHECK(!console_display_owned() &&
+			      test_console_redraws() == redraws + 1,
+		      "released: one repaint");
+		keyboard_console_file_closed(dm);
+		CHECK(test_console_redraws() == redraws + 1,
+		      "dm close: nothing left");
+
+		/* startx from a console login: X finds KD_TEXT.  Signing out
+		 * of it, the display manager asks for graphics first; X then
+		 * puts back the KD_TEXT it found and exits -- the console
+		 * stays out of sight until the display manager lets go. */
+		redraws = test_console_redraws();
+		CHECK(kd_dispmode() == KD_TEXT, "x1 finds text");
+		CHECK(kd(NULL, x1, KDSETMODE, KD_GRAPHICS) == 0, "x1 graphics");
+		CHECK(kd(NULL, x1, KDSKBMODE, K_OFF) == 0, "x1 K_OFF");
+		CHECK(kd(NULL, dm, KDSETMODE, KD_GRAPHICS) == 0, "dm asks too");
+		CHECK(kd(NULL, x1, KDSETMODE, KD_TEXT) == 0, "x1 text");
+		CHECK(kd(NULL, x1, KDSKBMODE, kb0) == 0, "x1 kbd back");
+		keyboard_console_file_closed(x1);
+		expect_modes(kb0, KD_GRAPHICS);
+		CHECK(console_display_owned() &&
+			      test_console_redraws() == redraws,
+		      "x1 out: the display manager still holds it");
+		/* The display manager dies holding it: text again. */
+		keyboard_console_file_closed(dm);
+		expect_modes(kb0, KD_TEXT);
+		CHECK(!console_display_owned() &&
+			      test_console_redraws() == redraws + 1,
+		      "dm gone: one repaint");
+		kb_tap(SC_A);
+		expect_typed("a");
+	}
 
 	/* A mode set without a file (stdio markers) owns nothing: a close
 	 * does not undo it, and setting it back is the way out. */
 	CHECK(kd(NULL, t1, KDSKBMODE, K_OFF) == 0, "K_OFF by t1");
 	CHECK(kd(NULL, 0, KDSETMODE, KD_GRAPHICS) == 0, "graphics, no file");
+	keyboard_console_file_closed(t1);
+	expect_modes(K_XLATE, KD_GRAPHICS);
+	CHECK(kd(NULL, 0, KDSKBMODE, K_OFF) == 0, "K_OFF, no file");
 	keyboard_console_file_closed(t1);
 	expect_modes(K_OFF, KD_GRAPHICS);
 	CHECK(kd(NULL, 0, KDSETMODE, KD_TEXT) == 0, "text, no file");

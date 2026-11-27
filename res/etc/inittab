@@ -32,14 +32,31 @@
 # once before anything else starts: the file survives reboots, and an X server
 # started before the daemon below has looked would read last boot's event
 # node numbers -- which can name a different device this time.  "wait" entries
-# all run before every other entry, so no getty, session or installer can
-# start an X server ahead of it.  A touchpad that the kernel only finds later
+# all run before every other entry, so no login screen, getty, session or
+# installer can start an X server ahead of it.  A touchpad that the kernel only finds later
 # is added by the daemon below.
 wait	/usr/sbin/likeos-input-devices
 
-# Login prompt on the system console.  respawn is what puts a fresh prompt up
-# after every logout.
-respawn	/sbin/getty /dev/console
+# The system message bus: how the login screen (LightDM) and the sessions it
+# starts talk to each other.  --nofork keeps it in the foreground for init,
+# and --nopidfile leaves out the pid file, which init has no use for and a
+# crash would leave behind (the bus refuses to start while one exists).  It
+# starts as root to make its socket (/run/dbus/system_bus_socket), then runs
+# as the unprivileged user `messagebus'.
+respawn	/usr/bin/dbus-daemon --system --nofork --nopidfile
+
+# The console: the graphical login screen, or a text login.  likeos-dm runs
+# LightDM once the message bus above answers, and a login prompt (getty)
+# instead when the user leaves the desktop for the console, after that
+# console login ends, or when the login screen cannot be started at all --
+# so a broken login screen never locks you out.  Typing
+# "likeos-session-switch graphical" at a console login brings the login
+# screen back.  To have only the text login prompt, as before, comment the
+# two lines out and use
+#
+#	respawn	/sbin/getty /dev/console
+#
+respawn	/usr/sbin/likeos-dm
 
 # SSH host keys: makes the ones missing in /etc/ssh and does nothing when
 # they are there.  The system image an installation is made from carries

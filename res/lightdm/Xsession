@@ -1,0 +1,32 @@
+#!/bin/sh
+#
+# /etc/lightdm/Xsession - LightDM's session wrapper (session-wrapper in
+# /etc/lightdm/lightdm.conf): runs the session's command ("$@", the Exec of
+# its .desktop file) as the user who signed in, in the environment a console
+# login gives.
+#
+# A console login's shell reads /etc/profile and then ~/.profile; that is
+# where PATH, LANG, TZ (the browser's clock depends on it), the runtime
+# directory (XDG_RUNTIME_DIR) and the GSettings backend come from.  LightDM
+# starts the session with only the bare variables it sets itself, so the
+# same two files are read here, quietly, before the session runs.
+#
+# Copyright (C) 2026 The LikeOS Project
+
+for f in /etc/profile "$HOME/.profile"; do
+	if [ -r "$f" ]; then
+		. "$f" >/dev/null 2>&1
+	fi
+done
+
+# What LightDM said about the session, for the programs in it.
+if [ -n "$GDMSESSION" ] && [ -z "$DESKTOP_SESSION" ]; then
+	DESKTOP_SESSION=$GDMSESSION
+	export DESKTOP_SESSION
+fi
+
+if [ $# -eq 0 ]; then
+	echo "Xsession: no session command" >&2
+	exit 1
+fi
+exec "$@"

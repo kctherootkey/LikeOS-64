@@ -1,0 +1,107 @@
+Power off and restart with the system's commands without logind/ConsoleKit.
+
+The greeter's shut-down and restart buttons go through liblightdm-gobject,
+which only knows logind and ConsoleKit over the system bus.  A system with
+neither (LikeOS) had no way to power off from the login screen: both
+lightdm_get_can_shutdown() and lightdm_get_can_restart() said no.
+
+When neither service answers, the library now falls back to /bin/poweroff
+and /bin/reboot: available when they are installed, and run (waited for,
+with their exit status checked) to act.  They decide themselves whom they
+act for -- on LikeOS root and the user logged in at the console, which the
+greeter's user is while the greeter runs.  Suspend and hibernate keep
+saying no.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/liblightdm-gobject/power.c
++++ b/liblightdm-gobject/power.c
+@@ -28,6 +28,30 @@
+ static GDBusProxy *ck_proxy = NULL;
+ static GDBusProxy *login1_proxy = NULL;
+ 
++/* Without logind or ConsoleKit on the system bus, the system's own power
++   commands, which decide themselves whom they act for (on LikeOS: root and
++   the user logged in at the console -- which the greeter's user is while
++   the greeter runs). */
++#define POWEROFF_COMMAND "/bin/poweroff"
++#define REBOOT_COMMAND "/bin/reboot"
++
++static gboolean
++power_command_available (const gchar *path)
++{
++    return g_file_test (path, G_FILE_TEST_IS_EXECUTABLE);
++}
++
++static gboolean
++run_power_command (const gchar *path, GError **error)
++{
++    gchar *argv[] = { (gchar *) path, NULL };
++    gint wait_status = 0;
++
++    if (!g_spawn_sync (NULL, argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL, NULL, NULL, &wait_status, error))
++        return FALSE;
++    return g_spawn_check_wait_status (wait_status, error);
++}
++
+ static GVariant *
+ upower_call_function (const gchar *function, GError **error)
+ {
+@@ -272,6 +296,8 @@
+         r = ck_call_function ("CanRestart", NULL, NULL);
+         if (r && g_variant_is_of_type (r, G_VARIANT_TYPE ("(b)")))
+             g_variant_get (r, "(b)", &can_restart);
++        else if (!r)
++            can_restart = power_command_available (REBOOT_COMMAND);
+     }
+ 
+     return can_restart;
+@@ -293,8 +319,18 @@
+     if (login1_result)
+         return TRUE;
+ 
+-    g_autoptr(GVariant) ck_result = ck_call_function ("Restart", NULL, error);
+-    return ck_result != NULL;
++    g_autoptr(GError) ck_error = NULL;
++    g_autoptr(GVariant) ck_result = ck_call_function ("Restart", NULL, &ck_error);
++    if (ck_result)
++        return TRUE;
++
++    if (!power_command_available (REBOOT_COMMAND))
++    {
++        g_propagate_error (error, g_steal_pointer (&ck_error));
++        return FALSE;
++    }
++    g_debug ("Can't restart using logind or ConsoleKit; running %s: %s", REBOOT_COMMAND, ck_error->message);
++    return run_power_command (REBOOT_COMMAND, error);
+ }
+ 
+ /**
+@@ -323,6 +359,8 @@
+         r = ck_call_function ("CanStop", NULL, NULL);
+         if (r && g_variant_is_of_type (r, G_VARIANT_TYPE ("(b)")))
+             g_variant_get (r, "(b)", &can_shutdown);
++        else if (!r)
++            can_shutdown = power_command_available (POWEROFF_COMMAND);
+     }
+ 
+     return can_shutdown;
+@@ -344,6 +382,16 @@
+     if (login1_result)
+         return TRUE;
+ 
+-    g_autoptr(GVariant) ck_result = ck_call_function ("Stop", NULL, error);
+-    return ck_result != NULL;
++    g_autoptr(GError) ck_error = NULL;
++    g_autoptr(GVariant) ck_result = ck_call_function ("Stop", NULL, &ck_error);
++    if (ck_result)
++        return TRUE;
++
++    if (!power_command_available (POWEROFF_COMMAND))
++    {
++        g_propagate_error (error, g_steal_pointer (&ck_error));
++        return FALSE;
++    }
++    g_debug ("Can't shut down using logind or ConsoleKit; running %s: %s", POWEROFF_COMMAND, ck_error->message);
++    return run_power_command (POWEROFF_COMMAND, error);
+ }

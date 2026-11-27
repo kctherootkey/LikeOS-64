@@ -573,6 +573,18 @@ static int drm_console_resize(struct drm_device *dev,
 	return 0;
 }
 
+/* The display server has gone but the console is still held in graphics
+ * mode -- by the display manager, whose next server is on its way.  The
+ * screen is the console's buffer again, which holds the console's picture
+ * from before the server came; it is shown black until the console gets the
+ * display back (its release repaints everything), so the moment between
+ * two servers is a black screen and not old console text. */
+static void drm_console_blank_while_held(void)
+{
+	if (console_display_owned())
+		fb_front_clear();
+}
+
 void drm_console_resume(struct drm_device *dev)
 {
 	/* Said the first few times: where the screen goes when a display
@@ -606,6 +618,7 @@ void drm_console_resume(struct drm_device *dev)
 	if (want && (want->hdisplay != g_con.w || want->vdisplay != g_con.h) &&
 	    drm_console_resize(dev, want) == 0) {
 		g_con.suspended = 0;
+		drm_console_blank_while_held();
 		console_push_all();
 		if (drm_console_verify(dev) == 0)
 			kprintf("[drm] %s: console back on KMS at the saved %ux%u\n",
@@ -621,6 +634,7 @@ void drm_console_resume(struct drm_device *dev)
 		drm_console_fallback(dev, "mode set failed after the display manager exited");
 		return;
 	}
+	drm_console_blank_while_held();
 	console_push_all();
 	if (drm_console_verify(dev) == 0 && said < 8) {
 		said++;

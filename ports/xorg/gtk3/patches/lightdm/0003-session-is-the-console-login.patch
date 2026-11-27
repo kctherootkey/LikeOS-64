@@ -1,0 +1,118 @@
+Make a session on the local display the console's login.
+
+On LikeOS the kernel names the user logged in at the console: the leader of
+the session whose controlling terminal is the console, when it is a
+recorded login (/proc/self/loginuid) of the user it runs as.  That user is
+granted the seat's devices (the GPU render node), has drives mounted for
+it by the device manager and may power the machine off or restart it.  A
+console login gets all of that from getty and login; a graphical one did
+not, so a desktop started by LightDM ran without the GPU and could not shut
+the machine down, and neither could the greeter.
+
+So the forked session process -- the greeter's as well as the user's, on
+the local display only -- records the login and takes the console as its
+controlling terminal, as root, after setsid() and before it becomes the
+user.  The login has to be recorded there and not only by PAM: the kernel
+ends the login a privileged process belongs to when it starts a session,
+so what pam_open_session() recorded for the session helper does not
+survive the setsid().  Only the forked process runs this, with only
+async-signal-safe calls.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/session-child.c
++++ b/src/session-child.c
+@@ -26,6 +26,10 @@
+ #include <utmpx.h>
+ #endif
+ 
++#ifdef __LIKEOS__
++#include <sys/ioctl.h>
++#endif
++
+ #if HAVE_LIBAUDIT
+ #include <libaudit.h>
+ #endif
+@@ -226,6 +230,69 @@
+ }
+ #endif
+ 
++#ifdef __LIKEOS__
++static void
++write_error (const char *message)
++{
++    /* Async-signal-safe: this runs in the forked session process */
++    ssize_t unused = write (STDERR_FILENO, message, strlen (message));
++    (void) unused;
++}
++
++/* Make the session process that is about to run the session the login at
++   the console, the way a console login is: the kernel's console user -- to
++   whom the seat's devices are granted (the GPU render node), whom the
++   device manager mounts drives for and who may power the machine off -- is
++   the leader of the session whose controlling terminal is the console,
++   when it is a recorded login of the user it runs as.
++
++   Called as root, in the new session (after setsid(), which ends the login
++   a privileged process belonged to), before changing to the user:
++
++     - write the user's uid to /proc/self/loginuid, which makes this
++       process, and everything it starts, that user's login;
++     - make the console the controlling terminal, taking it from the
++       session that had it, if any (it is the display manager's seat). */
++static void
++take_console (uid_t uid)
++{
++    char buf[16];
++    int n = 0;
++    unsigned int v = uid;
++
++    /* The uid in decimal, without stdio */
++    char digits[16];
++    int nd = 0;
++    do
++    {
++        digits[nd++] = '0' + v % 10;
++        v /= 10;
++    } while (v && nd < (int) sizeof (digits));
++    while (nd > 0)
++        buf[n++] = digits[--nd];
++
++    int fd = open ("/proc/self/loginuid", O_WRONLY | O_CLOEXEC);
++    if (fd >= 0)
++    {
++        if (write (fd, buf, n) != n)
++            write_error ("Failed to record the login in /proc/self/loginuid\n");
++        close (fd);
++    }
++    else if (errno != ENOENT)
++        write_error ("Failed to open /proc/self/loginuid\n");
++
++    fd = open ("/dev/console", O_RDWR | O_CLOEXEC);
++    if (fd < 0)
++    {
++        write_error ("Failed to open /dev/console\n");
++        return;
++    }
++    if (ioctl (fd, TIOCSCTTY, 1) < 0)
++        write_error ("Failed to make /dev/console the controlling terminal\n");
++    close (fd);
++}
++#endif
++
+ #if HAVE_LIBAUDIT
+ static void
+ audit_event (int type, const gchar *username, uid_t uid, const gchar *remote_host_name, const gchar *tty, gboolean success)
+@@ -650,6 +717,12 @@
+         if (setsid () < 0)
+             _exit (errno);
+ 
++#ifdef __LIKEOS__
++        /* A session on the local display is the console's login */
++        if (getuid () == 0 && xdisplay && !remote_host_name)
++            take_console (uid);
++#endif
++
+         /* Change to this user */
+         if (getuid () == 0)
+         {

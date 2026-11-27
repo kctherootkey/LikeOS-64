@@ -1,0 +1,136 @@
+Make sure the page can reach LightDM.
+
+The greeter object (__LightDMGreeter) reaches the theme only through the web
+extension, which WebKit loads into each web process.  A page whose web
+process came up without it still shows the theme, but nobody can sign in
+from it and the power menu stays empty -- and nothing said why.
+
+  - The extension notes in the greeter log when it has connected to
+    LightDM (or why not) and when it has put the greeter object on the
+    page.
+  - Once the page has loaded, the greeter looks for the object; a page
+    without it is given a new web process (the extension is loaded again
+    with it), twice at most, and the log says what happened.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/greeter.c
++++ b/src/greeter.c
+@@ -93,6 +93,79 @@
+ }
+ 
+ 
++/* Whether the page reached LightDM: the web extension, loaded into each web
++ * process, puts the greeter object (__LightDMGreeter) on every page it
++ * attaches to.  A page without it can show the theme but never sign anyone
++ * in, nor shut down -- so it is looked for once the page has loaded, and a
++ * page without it gets a new web process (the extension is loaded again with
++ * it) before the greeter gives up and says so in its log. */
++#define GREETER_OBJECT_CHECK_SECONDS 3
++#define GREETER_OBJECT_RETRIES 2
++
++static guint greeter_object_retries;
++static guint greeter_object_check_source;
++
++static void
++greeter_object_checked_cb(GObject *object, GAsyncResult *result, gpointer user_data) {
++	WebKitJavascriptResult *js_result;
++	GError *error = NULL;
++	gboolean present = FALSE;
++
++	js_result = webkit_web_view_run_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
++	if (NULL != error) {
++		g_warning("could not look for the greeter object on the page: %s", error->message);
++		g_error_free(error);
++		return;
++	}
++	present = JSValueToBoolean(webkit_javascript_result_get_global_context(js_result),
++							   webkit_javascript_result_get_value(js_result));
++	webkit_javascript_result_unref(js_result);
++
++	if (present) {
++		if (greeter_object_retries > 0)
++			g_message("the page reached LightDM after %u new web process(es)", greeter_object_retries);
++		return;
++	}
++
++	if (greeter_object_retries >= GREETER_OBJECT_RETRIES) {
++		g_critical("the page still has no connection to LightDM after %u new web processes: "
++				   "the web extension in %s did not attach; nobody can sign in from this screen",
++				   greeter_object_retries, WEBEXT_DIR);
++		return;
++	}
++
++	greeter_object_retries++;
++	g_warning("the page has no connection to LightDM (the web extension in %s did not attach); "
++			  "starting it in a new web process (%u of %u)",
++			  WEBEXT_DIR, greeter_object_retries, GREETER_OBJECT_RETRIES);
++	webkit_web_view_terminate_web_process(WEBKIT_WEB_VIEW(web_view));
++	webkit_web_view_reload(WEBKIT_WEB_VIEW(web_view));
++}
++
++static gboolean
++check_greeter_object_cb(gpointer user_data) {
++	greeter_object_check_source = 0;
++	webkit_web_view_run_javascript(
++		WEBKIT_WEB_VIEW(web_view),
++		"'__LightDMGreeter' in window",
++		NULL,
++		greeter_object_checked_cb,
++		NULL
++	);
++	return G_SOURCE_REMOVE;
++}
++
++static void
++load_changed_cb(WebKitWebView *view, WebKitLoadEvent load_event, gpointer user_data) {
++	if (WEBKIT_LOAD_FINISHED != load_event)
++		return;
++	if (greeter_object_check_source)
++		g_source_remove(greeter_object_check_source);
++	greeter_object_check_source =
++		g_timeout_add_seconds(GREETER_OBJECT_CHECK_SECONDS, check_greeter_object_cb, NULL);
++}
++
++
+ static gboolean
+ context_menu_cb(WebKitWebView *view,
+ 				WebKitContextMenu *context_menu,
+@@ -480,6 +553,9 @@
+ 	/* Maybe disable the context (right-click) menu. */
+ 	g_signal_connect(WEBKIT_WEB_VIEW(web_view), "context-menu", G_CALLBACK(context_menu_cb), NULL);
+ 
++	/* Make sure the page can reach LightDM once it has loaded */
++	g_signal_connect(WEBKIT_WEB_VIEW(web_view), "load-changed", G_CALLBACK(load_changed_cb), NULL);
++
+ 	/* Register callback to check if theme loaded successfully */
+ 	g_timeout_add_seconds(10, (GSourceFunc) maybe_show_theme_fallback_dialog, NULL);
+ 
+--- a/src/webkit2-extension.c
++++ b/src/webkit2-extension.c
+@@ -1629,6 +1629,9 @@
+ 	jsContext = webkit_frame_get_javascript_context_for_script_world(frame, world);
+ 	globalObject = JSContextGetGlobalObject(jsContext);
+ 
++	if (webkit_frame_is_main_frame(frame))
++		g_message("web extension: greeter object attached to %s", webkit_frame_get_uri(frame));
++
+ 	gettext_class = JSClassCreate(&gettext_definition);
+ 	lightdm_greeter_class = JSClassCreate(&lightdm_greeter_definition);
+ 	lightdm_user_class = JSClassCreate(&lightdm_user_definition);
+@@ -2056,7 +2059,14 @@
+ 	 * New function is lightdm_greeter_connect_to_daemon_sync
+ 	 * Wait until it makes it into Debian Stable before making the change.
+ 	 */
+-	lightdm_greeter_connect_sync(greeter, NULL);
++	GError *connect_error = NULL;
++	if (!lightdm_greeter_connect_sync(greeter, &connect_error)) {
++		g_warning("web extension: cannot connect to LightDM: %s",
++				  connect_error ? connect_error->message : "unknown error");
++		g_clear_error(&connect_error);
++	} else {
++		g_message("web extension: connected to LightDM");
++	}
+ }
+ 
+ /* vim: set ts=4 sw=4 tw=0 noet : */

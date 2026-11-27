@@ -118,6 +118,9 @@ void fb_flush_dirty_regions(void);
 // Returns once no flush that started before the call is still blitting:
 // for whoever has just closed the console's output gate.
 void fb_flush_barrier(void);
+/* Black in the front buffer only (the back buffer and the console's picture
+ * stay), for a display nobody draws on while the console does not own it. */
+void fb_front_clear(void);
 void fb_clear_dirty_regions(void);
 
 // Optimized pixel operations (these replace direct framebuffer access)

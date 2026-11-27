@@ -6011,6 +6011,378 @@ static void test_session_creation(void)
 			    strcmp(getenv("SHELL"), "/bin/sh") == 0);
 }
 
+/* ---- PAM: the services the display manager uses -------------------- */
+
+static int g_pam_delay_calls;
+static unsigned g_pam_delay_usec;
+static void test_pam_delay_fn(int retval, unsigned usec, void *appdata)
+{
+	(void)retval;
+	(void)appdata;
+	g_pam_delay_calls++;
+	g_pam_delay_usec = usec;
+}
+
+static int g_pam_cleanups;
+static int g_pam_cleanup_status;
+static void test_pam_cleanup(pam_handle_t *pamh, void *data, int status)
+{
+	(void)pamh;
+	(void)data;
+	g_pam_cleanups++;
+	g_pam_cleanup_status = status;
+}
+
+/* The per-service policies: lightdm (password), lightdm-greeter (no
+ * password, no account check), lightdm-autologin (no password; the shell
+ * must allow a login). */
+static void test_pam_services(int toor_is_current)
+{
+	struct pam_conv conv = { test_pam_conv, NULL };
+	pam_handle_t *pamh = NULL;
+
+	printf("\n[TEST] PAM services (lightdm, lightdm-greeter, lightdm-autologin)\n");
+
+	g_test_password = "toor";
+	if (pam_start("lightdm", "root", &conv, &pamh) == PAM_SUCCESS) {
+		int rc = pam_authenticate(pamh, 0);
+		if (toor_is_current)
+			test_result("lightdm: pam_authenticate (password 'toor')",
+				    rc == PAM_SUCCESS);
+		test_result("lightdm: pam_acct_mgmt root",
+			    pam_acct_mgmt(pamh, 0) == PAM_SUCCESS);
+		pam_end(pamh, PAM_SUCCESS);
+	} else
+		test_fail("pam_start(lightdm)");
+
+	g_test_password = "definitely-not-the-password-xyz";
+	if (pam_start("lightdm", "root", &conv, &pamh) == PAM_SUCCESS) {
+		test_result("lightdm: wrong password -> PAM_AUTH_ERR",
+			    pam_authenticate(pamh, 0) == PAM_AUTH_ERR);
+		pam_end(pamh, 0);
+	}
+
+	/* A locked system account (sshd: '!') cannot log in with a password,
+	 * whatever is typed. */
+	g_test_password = "";
+	if (getpwnam("sshd") &&
+	    pam_start("lightdm", "sshd", &conv, &pamh) == PAM_SUCCESS) {
+		test_result("lightdm: locked account -> PAM_AUTH_ERR",
+			    pam_authenticate(pamh, 0) == PAM_AUTH_ERR);
+		test_result("lightdm: locked account acct_mgmt -> PAM_AUTH_ERR",
+			    pam_acct_mgmt(pamh, 0) == PAM_AUTH_ERR);
+		pam_end(pamh, 0);
+	}
+
+	/* The greeter's service: no password asked, the locked greeter
+	 * account passes the account check. */
+	g_test_password = "definitely-not-the-password-xyz";
+	if (pam_start("lightdm-greeter",
+		      getpwnam("lightdm") ? "lightdm" : "sshd", &conv,
+		      &pamh) == PAM_SUCCESS) {
+		test_result("lightdm-greeter: pam_authenticate (no password)",
+			    pam_authenticate(pamh, 0) == PAM_SUCCESS);
+		test_result("lightdm-greeter: pam_acct_mgmt (locked account)",
+			    pam_acct_mgmt(pamh, 0) == PAM_SUCCESS);
+		pam_end(pamh, PAM_SUCCESS);
+	} else
+		test_fail("pam_start(lightdm-greeter)");
+
+	/* Autologin: no password for an account with a login shell ... */
+	if (pam_start("lightdm-autologin", "root", &conv, &pamh) ==
+	    PAM_SUCCESS) {
+		test_result("lightdm-autologin: root (no password)",
+			    pam_authenticate(pamh, 0) == PAM_SUCCESS);
+		pam_end(pamh, PAM_SUCCESS);
+	}
+	/* ... refused for one whose shell says no ... */
+	if (getpwnam("sshd") &&
+	    pam_start("lightdm-autologin", "sshd", &conv, &pamh) ==
+		    PAM_SUCCESS) {
+		test_result("lightdm-autologin: nologin shell -> PAM_AUTH_ERR",
+			    pam_authenticate(pamh, 0) == PAM_AUTH_ERR);
+		pam_end(pamh, 0);
+	}
+	/* ... and for an unknown one. */
+	if (pam_start("lightdm-autologin", "no_such_user_xyz", &conv,
+		      &pamh) == PAM_SUCCESS) {
+		test_result("lightdm-autologin: unknown user -> PAM_USER_UNKNOWN",
+			    pam_authenticate(pamh, 0) == PAM_USER_UNKNOWN);
+		pam_end(pamh, 0);
+	}
+
+	/* The failure delay: handed to the PAM_FAIL_DELAY function after a
+	 * failure, the largest request winning, used up by that attempt. */
+	if (pam_start("lightdm", "no_such_user_xyz", &conv, &pamh) ==
+	    PAM_SUCCESS) {
+		g_pam_delay_calls = 0;
+		test_result("pam_set_item(PAM_FAIL_DELAY)",
+			    pam_set_item(pamh, PAM_FAIL_DELAY,
+					 (const void *)test_pam_delay_fn) ==
+				    PAM_SUCCESS);
+		test_result("pam_fail_delay",
+			    pam_fail_delay(pamh, 300000) == PAM_SUCCESS &&
+				    pam_fail_delay(pamh, 1000) == PAM_SUCCESS);
+		pam_authenticate(pamh, 0);
+		test_result("fail delay: largest request, once",
+			    g_pam_delay_calls == 1 &&
+				    g_pam_delay_usec == 300000);
+		pam_authenticate(pamh, 0);
+		test_result("fail delay: used up", g_pam_delay_calls == 1);
+		pam_end(pamh, 0);
+	}
+	test_result("pam_fail_delay(NULL) -> PAM_SYSTEM_ERR",
+		    pam_fail_delay(NULL, 1) == PAM_SYSTEM_ERR);
+}
+
+/* Items, the session environment and data kept with the handle. */
+static void test_pam_items_env_data(void)
+{
+	struct pam_conv conv = { test_pam_conv, NULL };
+	pam_handle_t *pamh = NULL;
+	const void *v = NULL;
+	char **list;
+	int n, a = 1, b = 2;
+
+	printf("\n[TEST] PAM items, environment and data\n");
+	if (pam_start("lightdm", "root", &conv, &pamh) != PAM_SUCCESS) {
+		test_fail("pam_start(lightdm)");
+		return;
+	}
+
+	test_result("PAM_XDISPLAY set/get",
+		    pam_set_item(pamh, PAM_XDISPLAY, ":0") == PAM_SUCCESS &&
+			    pam_get_item(pamh, PAM_XDISPLAY, &v) ==
+				    PAM_SUCCESS &&
+			    v && strcmp(v, ":0") == 0);
+	test_result("PAM_AUTHTOK_TYPE set/get",
+		    pam_set_item(pamh, PAM_AUTHTOK_TYPE, "UNIX") ==
+				    PAM_SUCCESS &&
+			    pam_get_item(pamh, PAM_AUTHTOK_TYPE, &v) ==
+				    PAM_SUCCESS &&
+			    v && strcmp(v, "UNIX") == 0);
+	{
+		char cookie[] = { 7, 0, 9 };
+		struct pam_xauth_data x = { 18, (char *)"MIT-MAGIC-COOKIE-1",
+					    3, cookie };
+		const struct pam_xauth_data *got;
+
+		test_result("PAM_XAUTHDATA set",
+			    pam_set_item(pamh, PAM_XAUTHDATA, &x) ==
+				    PAM_SUCCESS);
+		cookie[0] = 1; /* the handle has its own copy */
+		got = NULL;
+		pam_get_item(pamh, PAM_XAUTHDATA, (const void **)&got);
+		test_result("PAM_XAUTHDATA copied",
+			    got && got != &x && got->namelen == 18 &&
+				    memcmp(got->name, "MIT-MAGIC-COOKIE-1",
+					   18) == 0 &&
+				    got->datalen == 3 && got->data[0] == 7 &&
+				    got->data[2] == 9);
+		x.datalen = -1;
+		test_result("PAM_XAUTHDATA negative length -> PAM_BAD_ITEM",
+			    pam_set_item(pamh, PAM_XAUTHDATA, &x) ==
+				    PAM_BAD_ITEM);
+	}
+	test_result("unknown item -> PAM_BAD_ITEM",
+		    pam_set_item(pamh, 4242, "x") == PAM_BAD_ITEM &&
+			    pam_get_item(pamh, 4242, &v) == PAM_BAD_ITEM);
+
+	/* The environment the session is started with. */
+	test_result("pam_putenv set",
+		    pam_putenv(pamh, "PATH=/usr/bin:/bin") == PAM_SUCCESS &&
+			    pam_putenv(pamh, "XDG_SEAT=seat0") ==
+				    PAM_SUCCESS &&
+			    pam_putenv(pamh, "EMPTY=") == PAM_SUCCESS);
+	test_result("pam_getenv",
+		    pam_getenv(pamh, "PATH") &&
+			    strcmp(pam_getenv(pamh, "PATH"), "/usr/bin:/bin") ==
+				    0 &&
+			    pam_getenv(pamh, "EMPTY") &&
+			    pam_getenv(pamh, "EMPTY")[0] == '\0');
+	test_result("pam_getenv: prefix/unknown -> NULL",
+		    pam_getenv(pamh, "PAT") == NULL &&
+			    pam_getenv(pamh, "NOPE") == NULL &&
+			    pam_getenv(pamh, "PATH=") == NULL);
+	test_result("pam_putenv replace",
+		    pam_putenv(pamh, "PATH=/bin") == PAM_SUCCESS &&
+			    strcmp(pam_getenv(pamh, "PATH"), "/bin") == 0);
+	list = pam_getenvlist(pamh);
+	for (n = 0; list && list[n]; n++)
+		free(list[n]);
+	free(list);
+	test_result("pam_getenvlist: 3 entries", list && n == 3);
+	test_result("pam_putenv remove",
+		    pam_putenv(pamh, "XDG_SEAT") == PAM_SUCCESS &&
+			    pam_getenv(pamh, "XDG_SEAT") == NULL);
+	test_result("pam_putenv remove missing -> PAM_BAD_ITEM",
+		    pam_putenv(pamh, "XDG_SEAT") == PAM_BAD_ITEM);
+	test_result("pam_putenv bad -> errors",
+		    pam_putenv(pamh, "=x") == PAM_BAD_ITEM &&
+			    pam_putenv(pamh, NULL) == PAM_PERM_DENIED &&
+			    pam_putenv(NULL, "A=b") == PAM_PERM_DENIED);
+	test_result("pam_getenvlist(NULL) -> NULL",
+		    pam_getenvlist(NULL) == NULL);
+
+	/* Data kept with the handle. */
+	g_pam_cleanups = 0;
+	test_result("pam_get_data unset -> PAM_NO_MODULE_DATA",
+		    pam_get_data(pamh, "k", &v) == PAM_NO_MODULE_DATA);
+	test_result("pam_set_data/pam_get_data",
+		    pam_set_data(pamh, "k", &a, test_pam_cleanup) ==
+				    PAM_SUCCESS &&
+			    pam_get_data(pamh, "k", &v) == PAM_SUCCESS &&
+			    v == &a);
+	test_result("pam_set_data replace calls cleanup (PAM_DATA_REPLACE)",
+		    pam_set_data(pamh, "k", &b, test_pam_cleanup) ==
+				    PAM_SUCCESS &&
+			    g_pam_cleanups == 1 &&
+			    (g_pam_cleanup_status & PAM_DATA_REPLACE) &&
+			    pam_get_data(pamh, "k", &v) == PAM_SUCCESS &&
+			    v == &b);
+	test_result("pam_set_data NULL name -> PAM_SYSTEM_ERR",
+		    pam_set_data(pamh, NULL, &a, NULL) == PAM_SYSTEM_ERR);
+	pam_end(pamh, PAM_ABORT);
+	test_result("pam_end calls cleanup with its status",
+		    g_pam_cleanups == 2 && g_pam_cleanup_status == PAM_ABORT);
+}
+
+/* Open a session for `service' and `user' in a child (opening a login
+ * session changes the caller's login) and report what the child's
+ * /proc/self/loginuid and sessionid say afterwards.  Returns the
+ * pam_open_session result, or -1 when the child could not run. */
+static int pam_session_in_child(const char *service, const char *user,
+				char *loginuid, size_t lcap,
+				char *sessionid, size_t scap)
+{
+	int fds[2], status;
+	pid_t pid;
+	char buf[96];
+	ssize_t got;
+
+	loginuid[0] = sessionid[0] = '\0';
+	if (pipe(fds) != 0)
+		return -1;
+	pid = fork();
+	if (pid < 0) {
+		close(fds[0]);
+		close(fds[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		struct pam_conv conv = { test_pam_conv, NULL };
+		pam_handle_t *h = NULL;
+		char l[32] = "", s[32] = "";
+		int rc = -1, fd;
+		ssize_t r;
+
+		close(fds[0]);
+		if (pam_start(service, user, &conv, &h) == PAM_SUCCESS) {
+			rc = pam_open_session(h, 0);
+			pam_close_session(h, 0);
+			pam_end(h, PAM_SUCCESS);
+		}
+		fd = open("/proc/self/loginuid", O_RDONLY);
+		if (fd >= 0) {
+			r = read(fd, l, sizeof(l) - 1);
+			l[r > 0 ? r : 0] = '\0';
+			close(fd);
+		}
+		fd = open("/proc/self/sessionid", O_RDONLY);
+		if (fd >= 0) {
+			r = read(fd, s, sizeof(s) - 1);
+			s[r > 0 ? r : 0] = '\0';
+			close(fd);
+		}
+		dprintf(fds[1], "%d %s %s", rc, l[0] ? l : "-",
+			s[0] ? s : "-");
+		_exit(0);
+	}
+	close(fds[1]);
+	got = read(fds[0], buf, sizeof(buf) - 1);
+	close(fds[0]);
+	waitpid(pid, &status, 0);
+	if (got <= 0)
+		return -1;
+	buf[got] = '\0';
+	{
+		int rc;
+		char l[32], s[32];
+
+		if (sscanf(buf, "%d %31s %31s", &rc, l, s) != 3)
+			return -1;
+		snprintf(loginuid, lcap, "%s", l);
+		snprintf(sessionid, scap, "%s", s);
+		return rc;
+	}
+}
+
+/* Opening a session of a login service records the login (loginuid = the
+ * user, a fresh login session id); other services leave the caller's
+ * login alone. */
+static void test_pam_sessions(void)
+{
+	char l[32], s[32], mine_l[32] = "", mine_s[32] = "";
+	char want[16];
+	struct passwd *pw;
+	int fd, rc;
+	ssize_t r;
+
+	printf("\n[TEST] PAM sessions (loginuid)\n");
+	fd = open("/proc/self/loginuid", O_RDONLY);
+	if (fd >= 0) {
+		r = read(fd, mine_l, sizeof(mine_l) - 1);
+		mine_l[r > 0 ? r : 0] = '\0';
+		close(fd);
+	}
+	fd = open("/proc/self/sessionid", O_RDONLY);
+	if (fd >= 0) {
+		r = read(fd, mine_s, sizeof(mine_s) - 1);
+		mine_s[r > 0 ? r : 0] = '\0';
+		close(fd);
+	}
+
+	if (geteuid() != 0) {
+		rc = pam_session_in_child("login", "root", l, sizeof(l), s,
+					  sizeof(s));
+		test_result("not root: login session records nothing",
+			    rc == PAM_SUCCESS && strcmp(l, mine_l) == 0 &&
+				    strcmp(s, mine_s) == 0);
+		return;
+	}
+
+	rc = pam_session_in_child("login", "root", l, sizeof(l), s, sizeof(s));
+	test_result("login: pam_open_session", rc == PAM_SUCCESS);
+	test_result("login: loginuid is root's", strcmp(l, "0") == 0);
+	test_result("login: a new login session",
+		    strcmp(s, "-") != 0 && strcmp(s, "4294967295") != 0 &&
+			    strcmp(s, mine_s) != 0);
+
+	pw = getpwnam("sshd");
+	if (pw) {
+		snprintf(want, sizeof(want), "%u", (unsigned)pw->pw_uid);
+		rc = pam_session_in_child("lightdm-greeter", "sshd", l,
+					  sizeof(l), s, sizeof(s));
+		test_result("lightdm-greeter: session records the login",
+			    rc == PAM_SUCCESS && strcmp(l, want) == 0 &&
+				    strcmp(s, mine_s) != 0);
+		rc = pam_session_in_child("lightdm", "sshd", l, sizeof(l), s,
+					  sizeof(s));
+		test_result("lightdm: session records the login",
+			    rc == PAM_SUCCESS && strcmp(l, want) == 0);
+	}
+
+	rc = pam_session_in_child("su", "root", l, sizeof(l), s, sizeof(s));
+	test_result("su: session leaves the login alone",
+		    rc == PAM_SUCCESS && strcmp(l, mine_l) == 0 &&
+			    strcmp(s, mine_s) == 0);
+
+	rc = pam_session_in_child("lightdm", "no_such_user_xyz", l, sizeof(l),
+				  s, sizeof(s));
+	test_result("lightdm: unknown user -> PAM_SESSION_ERR",
+		    rc == PAM_SESSION_ERR && strcmp(l, mine_l) == 0);
+}
+
 static void test_pam(void)
 {
 	printf("\n[TEST] PAM authentication (unix)\n");
@@ -6036,8 +6408,9 @@ static void test_pam(void)
 			printf("  root password changed from default;"
 			       " skipping positive auth assertion\n");
 		test_result("pam_acct_mgmt", pam_acct_mgmt(pamh, 0) == PAM_SUCCESS);
-		test_result("pam_open_session",
-			    pam_open_session(pamh, 0) == PAM_SUCCESS);
+		/* Opening a "login" session records a login (it writes
+		 * /proc/self/loginuid as root), which would make this test
+		 * run a login of its own: done in a child, see below. */
 		test_result("pam_close_session",
 			    pam_close_session(pamh, 0) == PAM_SUCCESS);
 		pam_end(pamh, PAM_SUCCESS);
@@ -6056,6 +6429,10 @@ static void test_pam(void)
 			    pam_authenticate(pamh, 0) == PAM_USER_UNKNOWN);
 		pam_end(pamh, 0);
 	}
+
+	test_pam_services(toor_is_current);
+	test_pam_items_env_data();
+	test_pam_sessions();
 }
 
 /* Copy a file's bytes to `dst` with the given mode.  Returns 0 on success. */

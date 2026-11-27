@@ -1,0 +1,38 @@
+Regenerate the build system without gtk-doc installed.
+
+autogen.sh stops when gtkdocize is missing, and autoreconf fails the same
+way, although gtk-doc is only needed to build the API manual (which
+--disable-gtk-doc leaves out) and gtk-doc.make, the one file gtkdocize
+would copy in, ships in the release tarball.  Without gtkdocize the script
+now keeps that file and has autoreconf skip gtkdocize (GTKDOCIZE=true).
+Needed here because 0001 changes configure.ac, so configure is regenerated.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/autogen.sh
++++ b/autogen.sh
+@@ -9,8 +9,13 @@
+ 
+ GTKDOCIZE=`which gtkdocize`
+ if test -z $GTKDOCIZE; then
+-        echo "*** No gtkdocize found, please install the gtk-doc package ***"
+-        exit 1
++        # No gtk-doc: the API manual cannot be built (configure with
++        # --disable-gtk-doc), but the build system can.  gtk-doc.make, the one
++        # file gtkdocize would provide, ships in the release tarball; tell
++        # autoreconf not to run gtkdocize for it either.
++        echo "*** No gtkdocize found, using the gtk-doc.make in the tree ***"
++        GTKDOCIZE=true
++        export GTKDOCIZE
+ fi
+ 
+ INTLTOOLIZE=`which intltoolize`
+@@ -26,7 +31,7 @@
+ fi
+ 
+ mkdir -p m4
+-gtkdocize
++$GTKDOCIZE
+ autoreconf --force --install --verbose || exit $?
+ 
+ cd "$olddir"

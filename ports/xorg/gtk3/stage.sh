@@ -265,6 +265,11 @@ for l in libavutil libavcodec libavformat libavfilter libswscale libswresample; 
 stage_lib libjavascriptcoregtk-4.1
 stage_lib libwebkit2gtk-4.1
 
+# The graphical login: the library a greeter talks to LightDM through, and
+# the keyboard-layout registry it links.
+stage_lib libxklavier
+stage_lib liblightdm-gobject-1
+
 # ---------------------------------------------------------------------------
 # Programs.
 # ---------------------------------------------------------------------------
@@ -337,7 +342,9 @@ done
 # id, which the daemon refuses to start without.
 #
 # NOT dbus-daemon-launch-helper: it is the setuid helper that starts SYSTEM
-# services as another user, and this image runs a session bus only.
+# services on demand as another user.  The system bus runs (init starts it
+# for the graphical login), but nothing on the image is started by it: its
+# one service, LightDM, is started by likeos-dm and only owns its name.
 for b in dbus-daemon dbus-launch dbus-run-session dbus-send dbus-monitor \
 	dbus-uuidgen dbus-cleanup-sockets dbus-update-activation-environment; do
 	[ -f "$SYSROOT/usr/bin/$b" ] || continue
@@ -560,6 +567,13 @@ fi
 #   .../dbus-1/services        one file per activatable service, naming the
 #                              program to run.  org.xfce.Xfconf.service is
 #                              what makes the settings daemon appear.
+#
+# The same for the system bus (dbus-daemon --system, which init starts for
+# the graphical login): /usr/share/dbus-1/system.conf is its configuration
+# (/etc/dbus-1/system.conf only a place for local additions) and both
+# system.d directories it includes are made; the login's policy goes into
+# /etc/dbus-1/system.d below.  It listens on /run/dbus/system_bus_socket,
+# whose directory the image ships (the top-level Makefile).
 # ---------------------------------------------------------------------------
 if [ -f "$SYSROOT/etc/dbus-1/session.conf" ]; then
 	mkdir -p "$DEST/etc/dbus-1/session.d" "$DEST/etc/dbus-1/system.d"
@@ -571,7 +585,8 @@ if [ -f "$SYSROOT/etc/dbus-1/session.conf" ]; then
 fi
 if [ -d "$SYSROOT/usr/share/dbus-1" ]; then
 	mkdir -p "$DEST/usr/share/dbus-1/services" \
-		"$DEST/usr/share/dbus-1/session.d"
+		"$DEST/usr/share/dbus-1/session.d" \
+		"$DEST/usr/share/dbus-1/system.d"
 	for f in "$SYSROOT"/usr/share/dbus-1/services/*.service; do
 		[ -f "$f" ] || continue
 		cp "$f" "$DEST/usr/share/dbus-1/services/"
@@ -1149,6 +1164,77 @@ if [ -d "$root/res/xorg/gtk3/skel-claws-mail" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# The graphical login: LightDM and its WebKit greeter with LikeOS's theme.
+#
+# likeos-dm (init's inittab) runs /usr/sbin/lightdm, which re-runs itself as
+# each session's helper (lightdm --session-child, found by that path).  It
+# reads /etc/lightdm/lightdm.conf; the greeter is named there and found
+# through /usr/share/xgreeters, the desktop through /usr/share/xsessions.
+# The X server command, the greeter's and the desktop's wrappers are
+# LikeOS's own (res/lightdm; see each file), as are both configuration
+# files.  The D-Bus policy that lets LightDM own its name on the system bus
+# comes from the package.  The greeter's web extension is loaded from the
+# directory compiled into it, and the theme goes to the theme directory
+# compiled in (build.sh, web-greeter) -- the theme alone: the two the
+# package installs into the sysroot are not shipped, nor is the theme's
+# generator (res/lightdm/tools).
+# ---------------------------------------------------------------------------
+if [ -f "$SYSROOT/usr/sbin/lightdm" ] &&
+	[ -f "$SYSROOT/usr/bin/lightdm-webkit2-greeter" ]; then
+	lres="$root/res/lightdm"
+	themes=/usr/share/lightdm-webkit2-greeter/themes
+	mkdir -p "$DEST/usr/bin" "$DEST/usr/sbin" "$DEST/usr/libexec" \
+		"$DEST/etc/lightdm" \
+		"$DEST/usr/share/xgreeters" "$DEST/usr/share/xsessions" \
+		"$DEST/usr/lib/lightdm-webkit2-greeter" "$DEST$themes" \
+		"$DEST/etc/dbus-1/system.d" "$DEST/usr/share/dbus-1/system.d"
+	install -m 0755 "$SYSROOT/usr/sbin/lightdm" "$DEST/usr/sbin/lightdm"
+	install -m 0755 "$SYSROOT/usr/bin/dm-tool" "$DEST/usr/bin/dm-tool"
+	install -m 0755 "$SYSROOT/usr/bin/lightdm-webkit2-greeter" \
+		"$DEST/usr/bin/lightdm-webkit2-greeter"
+	install -m 0755 \
+		"$SYSROOT/usr/lib/lightdm-webkit2-greeter/liblightdm-webkit2-greeter-webext.so" \
+		"$DEST/usr/lib/lightdm-webkit2-greeter/"
+	install -m 0644 \
+		"$SYSROOT/usr/share/xgreeters/lightdm-webkit2-greeter.desktop" \
+		"$DEST/usr/share/xgreeters/"
+	install -m 0644 \
+		"$SYSROOT/usr/share/dbus-1/system.d/org.freedesktop.DisplayManager.conf" \
+		"$DEST/etc/dbus-1/system.d/"
+	install -m 0644 "$lres/lightdm.conf" "$DEST/etc/lightdm/lightdm.conf"
+	install -m 0644 "$lres/lightdm-webkit2-greeter.conf" \
+		"$DEST/etc/lightdm/lightdm-webkit2-greeter.conf"
+	install -m 0755 "$lres/Xsession" "$DEST/etc/lightdm/Xsession"
+	install -m 0644 "$lres/likeos.desktop" \
+		"$DEST/usr/share/xsessions/likeos.desktop"
+	for f in likeos-session likeos-xserver likeos-greeter-session \
+		likeos-display-setup; do
+		install -m 0755 "$lres/$f" "$DEST/usr/libexec/$f"
+	done
+	if [ -f "$lres/theme/likeos/index.html" ]; then
+		rm -rf "$DEST$themes/likeos"
+		cp -R "$lres/theme/likeos" "$DEST$themes/likeos"
+		find "$DEST$themes/likeos" -type d -exec chmod 0755 {} +
+		find "$DEST$themes/likeos" -type f -exec chmod 0644 {} +
+	else
+		echo "stage.sh: no login screen theme in $lres/theme/likeos" >&2
+		exit 1
+	fi
+	# The greeter's own minimal theme, kept as the emergency fallback its
+	# recovery dialog loads when the LikeOS theme fails (patch 0005).
+	if [ -f "$SYSROOT$themes/simple/index.html" ]; then
+		rm -rf "$DEST$themes/simple"
+		cp -R "$SYSROOT$themes/simple" "$DEST$themes/simple"
+		find "$DEST$themes/simple" -type d -exec chmod 0755 {} +
+		find "$DEST$themes/simple" -type f -exec chmod 0644 {} +
+	else
+		echo "stage.sh: no fallback greeter theme in $SYSROOT$themes/simple" >&2
+		exit 1
+	fi
+	staged=$((staged + 1))
+fi
+
+# ---------------------------------------------------------------------------
 # Drop debug information.
 #
 # The single largest saving here: these libraries are 172MB with it and 31MB
@@ -1168,9 +1254,14 @@ if [ "${NO_STRIP:-0}" != "1" ] && [ "$staged" -gt 0 ]; then
 		"$DEST/usr/lib/claws-mail" "$DEST/usr/lib/lua" \
 		"$DEST/usr/lib/luakit" "$DEST/usr/lib/gstreamer-1.0" \
 		"$DEST/usr/lib/dri" "$DEST/usr/lib/gbm" "$DEST/usr/lib/xfce4" \
-		"$DEST/usr/lib/hexchat" -type f \
+		"$DEST/usr/lib/hexchat" "$DEST/usr/lib/lightdm-webkit2-greeter" \
+		-type f \
 		\( -name '*.so*' -o -perm -u+x \) \
 		-exec strip --strip-debug {} + 2>/dev/null || true
+	# LightDM is the one program here that lives in /usr/sbin, with the
+	# base system's own programs; only it is stripped there.
+	[ -f "$DEST/usr/sbin/lightdm" ] &&
+		strip --strip-debug "$DEST/usr/sbin/lightdm" 2>/dev/null || true
 fi
 
 exit 0

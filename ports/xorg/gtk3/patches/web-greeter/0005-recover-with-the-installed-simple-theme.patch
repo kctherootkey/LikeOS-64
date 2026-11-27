@@ -1,0 +1,38 @@
+Recover from a broken theme with a theme that is installed.
+
+The recovery dialog that appears when a theme fails to load offered the
+"antergos" theme for "Load Default Theme", and the same name was the
+fallback when no theme is configured at all.  Only the small "simple"
+theme is installed beside the system theme, so both now load "simple"
+instead of a missing directory, which would leave a blank login screen.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/src/greeter.c	2017-04-24 21:51:30.000000000 +0200
++++ b/src/greeter.c	2026-11-27 13:48:55.547852033 +0100
+@@ -165,12 +165,10 @@
+ 	gchar *log_msg = "[ERROR] :: A problem was detected with the current theme. Falling back to default theme...";
+ 	gchar *fallback_theme;
+ 
+-	if (GTK_RESPONSE_ACCEPT == response) {
+-		fallback_theme = "antergos";
+-
+-	} else {
+-		fallback_theme = "simple";
+-	}
++	/* Only the small "simple" theme is installed next to the system's own
++	 * theme, so both recovery choices load it: offering a theme that is not
++	 * there would leave a blank screen nobody can sign in from. */
++	fallback_theme = "simple";
+ 
+ 	g_warning("%s", log_msg);
+ 	gtk_widget_destroy(dialog);
+@@ -384,7 +382,7 @@
+ 
+ 		if ( NULL != err) {
+ 			g_clear_error(&err);
+-			theme = "antergos";
++			theme = "simple";
+ 		}
+ 	}
+ 

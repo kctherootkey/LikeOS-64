@@ -1,0 +1,28 @@
+Drop the dbus-glib dependency, which nothing uses.
+
+meson.build asks for dbus-glib-1 and links the greeter with it, but no
+source file includes a dbus-glib header or calls into it (the greeter
+talks to LightDM through liblightdm-gobject, which uses GDBus).  dbus-glib
+is a deprecated library, and requiring it means porting it for nothing.
+
+Copyright (C) 2026 The LikeOS Project
+
+--- a/meson.build
++++ b/meson.build
+@@ -17,7 +17,6 @@
+ # ------->>> Dependency Checks <<<------- #
+ # ======================================= #
+ 
+-dbus_glib       = dependency('dbus-glib-1')
+ lightdm_gobject = dependency('liblightdm-gobject-1')
+ x11             = dependency('x11')
+ 
+@@ -25,7 +24,7 @@
+ webkit2         = dependency('webkit2gtk-4.1',               version: '>=2.12')
+ webkit2_webext  = dependency('webkit2gtk-web-extension-4.1', version: '>=2.12')
+ 
+-greeter_deps = [dbus_glib, gtk3, webkit2, x11]
++greeter_deps = [gtk3, webkit2, x11]
+ webext_deps = [webkit2_webext, lightdm_gobject]
+ 
+ has_webkitgtk_2_14   = webkit2.version().version_compare('>=2.14')

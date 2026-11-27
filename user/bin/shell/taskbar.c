@@ -1754,6 +1754,7 @@ enum glyph {
 	GL_PIN,		/* a map pin: the panel's pinned buttons */
 	GL_STAR,	/* the launcher's favourites */
 	GL_ACTIVITY,	/* a pulse: the system monitor */
+	GL_CONSOLE,	/* a text screen with a prompt: leave for the console */
 };
 
 /* The network: a node at the top joined by a stem and a crossbar to two
@@ -2005,6 +2006,17 @@ static void glyph_draw(cairo_t *cr, enum glyph g, double x, double y,
 		cairo_line_to(cr, 9.5, 12.5);
 		cairo_line_to(cr, 11.5, 8.5);
 		cairo_line_to(cr, 14.5, 8.5);
+		cairo_stroke(cr);
+		break;
+	case GL_CONSOLE:
+		/* A text screen, wider than tall, with a prompt in its lower
+		 * left: a small angle and the cursor's bar after it. */
+		panel_round_rect(cr, 1.75, 2.75, 12.5, 10.5, 2);
+		cairo_move_to(cr, 4.5, 7);
+		cairo_line_to(cr, 6.5, 8.75);
+		cairo_line_to(cr, 4.5, 10.5);
+		cairo_move_to(cr, 8.25, 10.5);
+		cairo_line_to(cr, 11.5, 10.5);
 		cairo_stroke(cr);
 		break;
 	}
@@ -2831,7 +2843,8 @@ static const struct power_req g_reboot_req = { "/bin/reboot", "restarted" };
 static const struct power_req g_poweroff_req = { "/bin/poweroff", "shut down" };
 
 /* What a confirmation asks about. */
-enum confirm_kind { CONFIRM_SIGN_OUT, CONFIRM_RESTART, CONFIRM_SHUT_DOWN };
+enum confirm_kind { CONFIRM_SIGN_OUT, CONFIRM_RESTART, CONFIRM_SHUT_DOWN,
+		    CONFIRM_CONSOLE };
 
 static void confirm_open(enum confirm_kind kind);
 
@@ -2874,6 +2887,76 @@ static void power_run(const struct power_req *req)
 		return;
 	}
 	g_child_watch_add(pid, on_power_exit, (gpointer)req);
+}
+
+/* "Console": leave the desktop for a shell at the console, logged in as
+ * this user.
+ *
+ * In a desktop the graphical login started (LIKEOS_SESSION=lightdm, set by
+ * likeos-session), likeos-session-switch (setuid, for the user logged in at
+ * the console) asks likeos-dm, which ends this session -- and with it the
+ * bar -- and starts the console login.  In one started with startx the
+ * console login is already there, under it: the desktop simply ends
+ * (likeos-logout --console), without the graphical login that "Sign out"
+ * brings back there. */
+#define SESSION_SWITCH "/usr/libexec/likeos-session-switch"
+#define LOGOUT_CMD "/usr/bin/likeos-logout"
+
+static gboolean session_is_lightdm(void)
+{
+	const char *s = g_getenv("LIKEOS_SESSION");
+
+	return s && strcmp(s, "lightdm") == 0;
+}
+
+static gboolean console_offered(void)
+{
+	return g_file_test(session_is_lightdm() ? SESSION_SWITCH : LOGOUT_CMD,
+			   G_FILE_TEST_IS_EXECUTABLE);
+}
+
+static void console_failed(void)
+{
+	GtkWidget *d = gtk_message_dialog_new(
+		NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
+		"The console could not be opened.");
+
+	gtk_message_dialog_format_secondary_text(
+		GTK_MESSAGE_DIALOG(d),
+		"Only the user logged in at the console may leave the desktop "
+		"for it, and the display manager (likeos-dm) has to be "
+		"running.");
+	gtk_dialog_run(GTK_DIALOG(d));
+	gtk_widget_destroy(d);
+}
+
+static void on_console_exit(GPid pid, gint status, gpointer data)
+{
+	(void)data;
+	g_spawn_close_pid(pid);
+	/* Success means the request is on its way: the session ends
+	 * shortly.  A refusal comes back as an exit status. */
+	if (!g_spawn_check_wait_status(status, NULL))
+		console_failed();
+}
+
+static void console_switch(void)
+{
+	char *to_dm[] = { (char *)SESSION_SWITCH, (char *)"console", NULL };
+	char *end_desktop[] = { (char *)LOGOUT_CMD, (char *)"--console", NULL };
+	char **argv = session_is_lightdm() ? to_dm : end_desktop;
+	GError *err = NULL;
+	GPid pid;
+
+	if (!g_spawn_async(NULL, argv, NULL, G_SPAWN_DO_NOT_REAP_CHILD, NULL,
+			   NULL, &pid, &err)) {
+		g_warning("cannot start %s: %s", argv[0],
+			  err ? err->message : "?");
+		g_clear_error(&err);
+		console_failed();
+		return;
+	}
+	g_child_watch_add(pid, on_console_exit, NULL);
 }
 
 /* --- the panel's menus ---------------------------------------------------------- */
@@ -6576,6 +6659,13 @@ static void act_sign_out(const char *arg)
 	confirm_open(CONFIRM_SIGN_OUT);
 }
 
+static void act_console(const char *arg)
+{
+	(void)arg;
+	launcher_close();
+	confirm_open(CONFIRM_CONSOLE);
+}
+
 static void act_restart_desktop(const char *arg)
 {
 	(void)arg;
@@ -7588,6 +7678,9 @@ static void on_user_clicked(GtkButton *b, gpointer d)
 		 "Restart the desktop", act_restart_desktop, NULL);
 	card_add(card, glyph_image(GL_SIGNOUT, 16, PANEL_TEXT), "Sign out",
 		 act_sign_out, NULL);
+	if (console_offered())
+		card_add(card, glyph_image(GL_CONSOLE, 16, PANEL_TEXT),
+			 "Console", act_console, NULL);
 	gtk_widget_get_allocation(GTK_WIDGET(b), &a);
 	gtk_widget_translate_coordinates(GTK_WIDGET(b), S.overlay, 0, a.height,
 					 &x, &y);
@@ -7656,6 +7749,12 @@ static GtkWidget *header(void)
 	gtk_box_pack_end(GTK_BOX(bar),
 			 icon_button(GL_SIGNOUT, "Sign out", act_sign_out, NULL),
 			 FALSE, FALSE, 0);
+	/* Beside Sign out. */
+	if (console_offered())
+		gtk_box_pack_end(GTK_BOX(bar),
+				 icon_button(GL_CONSOLE, "Console", act_console,
+					     NULL),
+				 FALSE, FALSE, 0);
 	return bar;
 }
 
@@ -8102,6 +8201,8 @@ static const struct {
 	[CONFIRM_RESTART] = { GL_RESTART, "Restart this computer?", "Restart" },
 	[CONFIRM_SHUT_DOWN] = { GL_POWER, "Shut down this computer?",
 				"Shut down" },
+	[CONFIRM_CONSOLE] = { GL_CONSOLE, "Leave the desktop for the console?",
+			      "Console" },
 };
 
 static gboolean confirm_destroy(gpointer w)
@@ -8138,6 +8239,9 @@ static void confirm_accept(void)
 		break;
 	case CONFIRM_SHUT_DOWN:
 		power_run(&g_poweroff_req);
+		break;
+	case CONFIRM_CONSOLE:
+		console_switch();
 		break;
 	}
 }

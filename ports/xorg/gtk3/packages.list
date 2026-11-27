@@ -518,3 +518,25 @@
 -         luafilesystem      1.9.0    https://github.com/lunarmodules/luafilesystem/archive/refs/tags/v1_9_0.tar.gz
 # The browser.
 -         luakit             2.4.0    https://github.com/luakit/luakit/archive/refs/tags/%VERSION%.tar.gz
+
+# ---- the graphical login ------------------------------------------------
+# LightDM, the display manager init starts (through likeos-dm) instead of a
+# console getty, and its WebKit greeter, whose login screen is a web page --
+# LikeOS's own theme (res/lightdm/theme/likeos).
+#
+# libxklavier: the keyboard-layout registry liblightdm-gobject links, so a
+# greeter can list the layouts.  5.4 is its last release.
+-         libxklavier        5.4      https://people.freedesktop.org/~svu/libxklavier-%VERSION%.tar.bz2
+# The display manager: the daemon, its session helper, dm-tool and
+# liblightdm-gobject, the library a greeter talks to it through.  PAM is the
+# system's own (user/lib/libpam, published into the sysroot by
+# ../import-libpam.sh).
+-         lightdm            1.32.0   https://github.com/canonical/lightdm/releases/download/%VERSION%/lightdm-%VERSION%.tar.xz
+# The greeter: the web-greeter project's 2.2.5 release, which installs as
+# lightdm-webkit2-greeter.  Built against the webkit2gtk-4.1 API above with
+# the packaging patch distributions carry for it (patches/web-greeter/0001,
+# taken verbatim from Arch's lightdm-webkit2-greeter 2.2.5-9, whose package
+# tarball is kept beside this one for that reason).  The package is named
+# after the tarball and the tree it unpacks to, not the program: a name
+# starting "lightdm-webkit2-greeter-" would also match the packaging tarball.
+-         web-greeter        2.2.5    https://github.com/Antergos/web-greeter/archive/%VERSION%.tar.gz

@@ -1,0 +1,22 @@
+#!/bin/sh
+#
+# likeos-session - the LikeOS desktop as the graphical login starts it
+# (Exec of /usr/share/xsessions/likeos.desktop, run by /etc/lightdm/Xsession
+# as the user who signed in, with the X server already up).
+#
+# The desktop is the one startx gives: this runs the same session script,
+# /etc/X11/xinit/xinitrc (GPU or software GL, the keyboard layout, the
+# session bus, the desktop bar, the desktop, the window manager -- whose end
+# is the session's end), so the two cannot drift apart.  The one difference
+# a program may want to know about is said in LIKEOS_SESSION: "lightdm"
+# here.  The desktop's Sign out then simply ends the session and LightDM
+# shows the login screen again; from a startx desktop it also ends the
+# console login and asks for the login screen (likeos-logout), and only a
+# LightDM desktop offers to leave for the console (the start menu).
+#
+# Copyright (C) 2026 The LikeOS Project
+
+LIKEOS_SESSION=lightdm
+export LIKEOS_SESSION
+
+exec /bin/sh /etc/X11/xinit/xinitrc

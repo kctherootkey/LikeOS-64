@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<!--
+  LikeOS lock and sign-in screen (lightdm-webkit2-greeter theme).
+
+  Two views: the lock view (background, clock, date) and the sign-in view
+  (a card with the user's picture, name and password).  Any key, click or
+  touch on the lock view opens the sign-in view.  Everything is local: no
+  web fonts, no remote requests (the greeter blocks them anyway).
+
+  Copyright (C) 2026 The LikeOS Project
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LikeOS</title>
+<link rel="stylesheet" href="css/likeos.css">
+</head>
+<body class="view-lock">
+
+<!-- Glyphs: LikeOS geometry on a 16-unit grid, 1.5 px round strokes (the
+     same set the LikeOS taskbar draws). -->
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <symbol id="g-power" viewBox="0 0 16 16"><path d="M4.55 4.47A5.5 5.5 0 1 0 11.45 4.47M8 1.75V7.25"/></symbol>
+  <symbol id="g-restart" viewBox="0 0 16 16"><path d="M11.58 4.66A5.25 5.25 0 1 1 7.37 3.29M5.4 1.4L7.6 3.3L5.4 5.3"/></symbol>
+  <symbol id="g-keyboard" viewBox="0 0 16 16"><rect x="1.75" y="3.75" width="12.5" height="8.5" rx="1.5"/><path d="M4.6 6.4h.8M7.6 6.4h.8M10.6 6.4h.8M5.25 9.25h5.5"/></symbol>
+  <symbol id="g-arrow" viewBox="0 0 16 16"><path d="M2.75 8h10.5M9 3.75L13.25 8L9 12.25"/></symbol>
+  <symbol id="g-back" viewBox="0 0 16 16"><path d="M13.25 8H2.75M7 3.75L2.75 8L7 12.25"/></symbol>
+  <symbol id="g-swap" viewBox="0 0 16 16"><path d="M2.5 5.25h10M10 2.5l2.75 2.75L10 8M13.5 10.75h-10M6 8l-2.75 2.75L6 13.5"/></symbol>
+  <symbol id="g-caps" viewBox="0 0 16 16"><path d="M8 2.25L13.25 7.75H10.5V10.25H5.5V7.75H2.75Z M5.5 13.25h5"/></symbol>
+  <symbol id="g-alert" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.25"/><path d="M8 4.75v3.75M8 11.1v.15"/></symbol>
+  <!-- The LikeOS "LO" mark from the start orb (filled). -->
+  <symbol id="g-lo" viewBox="16 16 32 32"><path class="fill" fill-rule="evenodd" d="M18.667 21.333A2.667 2.667 0 0 1 24 21.333V38.667A1.333 1.333 0 0 0 25.333 40H42.667A2.667 2.667 0 0 1 42.667 45.333H23.467A4.8 4.8 0 0 1 18.667 40.533ZM26.667 28A9.333 9.333 0 1 0 45.333 28A9.333 9.333 0 1 0 26.667 28ZM31.333 28A4.667 4.667 0 1 1 40.667 28A4.667 4.667 0 1 1 31.333 28Z"/></symbol>
+</svg>
+
+<div id="bg-lock" class="bg"></div>
+<div id="bg-signin" class="bg"></div>
+
+<!-- Lock view -->
+<section id="lock" class="view" aria-label="Lock screen">
+  <div class="clock">
+    <div id="time" class="time"><span id="time-hm">--:--</span><span id="time-period" class="period"></span></div>
+    <div class="rule" aria-hidden="true"></div>
+    <div id="date" class="date"></div>
+  </div>
+  <p id="hint" class="hint"><svg class="glyph"><use href="#g-keyboard"/></svg><span>Press any key or click to sign in</span></p>
+</section>
+
+<!-- Sign-in view -->
+<section id="signin" class="view" aria-label="Sign in">
+  <div class="stack">
+    <form id="card" class="card" autocomplete="off" novalidate>
+      <div id="avatar" class="avatar" aria-hidden="true">
+        <img id="avatar-img" alt="">
+        <span id="avatar-letter" class="letter"></span>
+        <svg id="avatar-mark" class="mark"><use href="#g-lo"/></svg>
+      </div>
+      <h1 id="name" class="name"></h1>
+      <p id="subtitle" class="subtitle"></p>
+      <div class="fields">
+        <input id="username" class="input" type="text" placeholder="User name"
+               aria-label="User name" autocomplete="off" autocapitalize="off"
+               spellcheck="false" maxlength="256">
+        <input id="password" class="input" type="password" placeholder="Password"
+               aria-label="Password" autocomplete="off" maxlength="1024">
+      </div>
+      <div class="notes">
+        <p id="status" class="note status" role="status" aria-live="polite" hidden><svg class="glyph"><use href="#g-alert"/></svg><span id="status-text"></span></p>
+        <p id="caps" class="note caps" hidden><svg class="glyph"><use href="#g-caps"/></svg><span>Caps Lock is on</span></p>
+      </div>
+      <button id="submit" class="primary" type="submit">
+        <span class="label">Sign in</span><svg class="glyph"><use href="#g-arrow"/></svg>
+        <span class="spinner" aria-hidden="true"></span>
+      </button>
+    </form>
+    <button id="switch" class="link" type="button" hidden>
+      <svg class="glyph" id="switch-glyph"><use href="#g-swap"/></svg><span id="switch-label">Other user</span>
+    </button>
+  </div>
+</section>
+
+<footer id="footer">
+  <div class="brand" aria-label="LikeOS">
+    <span class="orb" aria-hidden="true"><svg><use href="#g-lo"/></svg></span>
+    <span class="word">LikeOS</span>
+  </div>
+  <div id="tray" class="tray">
+    <span id="layout" class="layout" hidden><svg class="glyph"><use href="#g-keyboard"/></svg><span id="layout-name"></span></span>
+    <div class="power-wrap">
+      <button id="power" class="tray-button" type="button" aria-label="Power"
+              aria-haspopup="menu" aria-expanded="false" hidden>
+        <svg class="glyph"><use href="#g-power"/></svg>
+      </button>
+      <div id="power-menu" class="menu" role="menu" aria-label="Power" hidden>
+        <button id="act-restart" class="menu-item" type="button" role="menuitem" hidden><svg class="glyph"><use href="#g-restart"/></svg><span>Restart</span></button>
+        <button id="act-shutdown" class="menu-item" type="button" role="menuitem" hidden><svg class="glyph"><use href="#g-power"/></svg><span>Shut down</span></button>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<div id="shade" aria-hidden="true"></div>
+
+<script src="js/greeter.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+[Desktop Entry]
+# The LikeOS desktop, as the graphical login starts it.
+# Copyright (C) 2026 The LikeOS Project
+Type=XSession
+Name=LikeOS
+Comment=The LikeOS desktop
+Exec=/usr/libexec/likeos-session
