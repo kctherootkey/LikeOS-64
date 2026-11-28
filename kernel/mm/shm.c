@@ -87,8 +87,10 @@ static void shm_free_detached(uint64_t *pages, unsigned long n)
 	if (!pages)
 		return;
 	for (unsigned long i = 0; i < n; i++)
-		if (pages[i])
+		if (pages[i]) {
 			mm_free_physical_page(pages[i]);
+			mm_shmem_account(-1);
+		}
 	kfree(pages);
 }
 
@@ -347,6 +349,8 @@ uint64_t shm_fault_page(void *o, uint64_t index)
 	spin_unlock_irqrestore(&g_shm_lock, f);
 	if (mine)
 		mm_free_physical_page(mine);
+	else if (p)
+		mm_shmem_account(1); /* ours went in */
 	return p;
 }
 

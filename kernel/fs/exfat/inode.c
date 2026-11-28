@@ -265,15 +265,17 @@ static void exfat_stream_put_one(exfat_stream_t *st);
  * Callable with the metadata lock held in either mode (no I/O).  A loop:
  * the parent references the evicted ones drop are put without trimming
  * again (no recursion up the directory tree). */
-static void exfat_stream_trim(exfat_fs_t *fs)
+static unsigned long exfat_stream_trim(exfat_fs_t *fs, unsigned long want)
 {
+	unsigned long gone = 0;
+
 	exfat_assert_excl(fs);
 	for (;;) {
 		exfat_stream_t *victim = NULL, *parent;
 		uint64_t flags;
 
 		spin_lock_irqsave(&fs->st_lock, &flags);
-		if (fs->lru_count > EXFAT_STREAM_LRU_MAX) {
+		if (fs->lru_count > EXFAT_STREAM_LRU_MAX || gone < want) {
 			for (exfat_stream_t *s = fs->lru_tail; s;
 			     s = s->lru_prev) {
 				if (s->refs == 0 && !s->data_dirty &&
@@ -291,11 +293,41 @@ static void exfat_stream_trim(exfat_fs_t *fs)
 		}
 		spin_unlock_irqrestore(&fs->st_lock, flags);
 		if (!victim)
-			return;
+			return gone;
+		gone++;
 		parent = exfat_stream_destroy(victim);
 		if (parent)
 			exfat_stream_put_one(parent);
 	}
+}
+
+/* ---- giving memory back ---------------------------------------------- */
+
+static unsigned long exfat_shrink_count(void *arg)
+{
+	return ((exfat_fs_t *)arg)->lru_count;
+}
+
+/* From the reclaim thread: no lock held, so the metadata lock is taken
+ * exclusive, as every other trim runs under it. */
+static unsigned long exfat_shrink_scan(void *arg, unsigned long nr)
+{
+	exfat_fs_t *fs = arg;
+	unsigned long gone;
+
+	exfat_meta_wlock(fs);
+	gone = exfat_stream_trim(fs, nr);
+	exfat_meta_wunlock(fs);
+	return gone;
+}
+
+void exfat_shrinker_register(exfat_fs_t *fs)
+{
+	fs->shrinker.name = "exfat-streams";
+	fs->shrinker.count = exfat_shrink_count;
+	fs->shrinker.scan = exfat_shrink_scan;
+	fs->shrinker.arg = fs;
+	vm_register_shrinker(&fs->shrinker);
 }
 
 /* Drop a reference.  The last one parks the stream on the LRU -- or, for
@@ -345,7 +377,7 @@ void exfat_stream_put(exfat_stream_t *st)
 	exfat_stream_put_one(st);
 	if (fs->lru_count > EXFAT_STREAM_LRU_MAX &&
 	    exfat_rwsem_held_excl(&fs->meta))
-		exfat_stream_trim(fs);
+		exfat_stream_trim(fs, 0);
 }
 
 /* The end of an exclusive hold: destroy the parked orphans and trim the
@@ -367,7 +399,7 @@ void exfat_stream_maint(exfat_fs_t *fs)
 		exfat_stream_put_one(exfat_stream_destroy(st));
 	}
 	if (fs->lru_count > EXFAT_STREAM_LRU_MAX)
-		exfat_stream_trim(fs);
+		exfat_stream_trim(fs, 0);
 }
 
 /* Fill a stream's allocation from its entry set.  Metadata lock held. */

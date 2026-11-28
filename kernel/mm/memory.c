@@ -12,6 +12,7 @@
 #include <kernel/mm/rwsem.h> // address-space semaphore
 #include <kernel/uapi/bug.h>
 #include <kernel/fs/pagecache.h> // pagecache_get_stats for memstat breakdown
+#include <kernel/mm/vmscan.h>
 #include <kernel/fs/vfs.h> // demand paging: file-backed page-in
 #include <kernel/ke/syscall.h> // PROT_* for lazy region protection
 #include <kernel/ke/timer.h> // timer_get_precise_us: the slow-fault detector
@@ -1232,6 +1233,10 @@ static uint64_t mm_alloc_page_do(void *caller)
 	}
 
 	spin_unlock_irqrestore(&mm_phys_lock, flags);
+
+	/* Running low: the reclaim thread gives cache memory back before
+	 * allocations start to fail (one comparison when there is plenty). */
+	vm_check_free_memory();
 
 	/* Zero or poison the page outside the lock; the page bit is already set
      * so only we can access it. */
@@ -4636,6 +4641,24 @@ uint64_t mm_buffercache_bytes(void)
 	return v > 0 ? (uint64_t)v : 0;
 }
 
+/* Pages of file data that lives only in memory: RAM filesystem files
+ * (tmpfs), POSIX and System V shared memory, memfd.  Reported inside the
+ * cache figure -- "Shmem" within "Cached", where programs reading
+ * /proc/meminfo look for it -- but never as available memory: nothing can
+ * drop these pages, only their owner can free them. */
+static volatile int64_t g_shmem_pages;
+
+void mm_shmem_account(long pages)
+{
+	__sync_fetch_and_add(&g_shmem_pages, (int64_t)pages);
+}
+
+uint64_t mm_shmem_pages(void)
+{
+	int64_t v = g_shmem_pages;
+	return v > 0 ? (uint64_t)v : 0;
+}
+
 // Get memory statistics
 #if MM_LEAK_INSTRUMENTATION
 /* Report which call sites are holding physical memory.
@@ -5670,6 +5693,7 @@ static uint64_t mm_alloc_page_reclaim_do(void *caller)
 	 * work is paid for by whoever touched the page. */
 	pagecache_shrink(32, 0);
 	pagecache_request_writeback();
+	vm_wake_reclaim();
 	phys = mm_alloc_page_do(caller);
 	if (phys)
 		return phys;
@@ -6002,6 +6026,21 @@ static bool mm_cow_fault_locked(uint64_t fault_addr)
 			return true;
 		}
 		return false; // Not a COW fault and not writable - genuine fault
+	}
+
+	/* Copy-on-write is how a WRITABLE private page is shared, not a
+	 * licence to write.  fork marks every user page copy-on-write,
+	 * read-only ones included, so a write to a page its mapping does not
+	 * permit (PROT_READ, program text) would otherwise be copied and
+	 * allowed.  Such a write is a protection fault; the mapping says
+	 * which. */
+	{
+		mmap_region_t *cr =
+			mm_find_mmap_region(task_mm_owner(sched_current()),
+					    page_addr);
+
+		if (cr && !(cr->prot & PROT_WRITE))
+			return false;
 	}
 
 	// Extract physical address (bits 12-51, mask off flags and NX bit)
@@ -6397,6 +6436,7 @@ static int mm_demand_fault_mm(task_t *mm, uint64_t fault_addr,
 	struct vfs_file *file = NULL;
 	uint64_t file_off = 0;
 	int found = 0;
+	int file_private = 0, file_writable = 0;
 	/* a lazy device mapping: the driver names the page */
 	uint64_t (*dev_fault)(void *, uint64_t) = NULL;
 	void *dev_obj = NULL;
@@ -6450,6 +6490,8 @@ static int mm_demand_fault_mm(task_t *mm, uint64_t fault_addr,
 			}
 			file = r->file;
 			file_off = r->offset + (page - r->start);
+			file_private = !(r->flags & MAP_SHARED);
+			file_writable = (r->prot & PROT_WRITE) != 0;
 			found = 1;
 			break;
 		}
@@ -6475,6 +6517,52 @@ static int mm_demand_fault_mm(task_t *mm, uint64_t fault_addr,
 					     map_flags | PAGE_DEVICE | dev_extra);
 		spin_unlock_irqrestore(&g_lazy_map_lock, lf2);
 		return dok ? 1 : 0;
+	}
+
+	/* A private file mapping maps the page cache's own frame where the
+	 * filesystem offers it (vfs_ops_t.cache_page): every process mapping
+	 * the same library page shares one frame, and that frame is the
+	 * cached file page, not a copy made for each of them.  The entry is
+	 * read-only -- marked copy-on-write when the mapping is writable, so
+	 * a write copies it first and the cached page is never written
+	 * through a mapping.  The mapping holds a reference on the frame of
+	 * its own: reclaim leaves a mapped page in the cache, and a page the
+	 * cache drops anyway (truncation) stays until the mapping goes.
+	 * Anything else -- no such operation, a page not wholly inside the
+	 * file -- reads a private copy below, as before. */
+	if (file && file_private && !(file_off & (PAGE_SIZE - 1))) {
+		struct pc_page *cp = vfs_cache_page(file, file_off / PAGE_SIZE);
+
+		if (cp) {
+			uint64_t cphys = cp->phys_addr;
+			uint64_t cflags = map_flags & ~(uint64_t)PAGE_WRITABLE;
+			uint64_t lfc;
+			bool cok;
+
+			if (file_writable)
+				cflags |= PAGE_COW;
+			/* The mapping's reference, taken while the cache
+			 * still holds the page for us. */
+			mm_get_page(cphys);
+			pagecache_put(cp);
+
+			spin_lock_irqsave(&g_lazy_map_lock, &lfc);
+			uint64_t *cpte =
+				mm_get_page_table_from_pml4(mm->pml4, page, false);
+			if (cpte && (*cpte & PAGE_PRESENT)) {
+				spin_unlock_irqrestore(&g_lazy_map_lock, lfc);
+				mm_put_page(cphys);
+				return 1; /* another thread mapped it first */
+			}
+			cok = mm->pml4 && mm_map_page_in_address_space(
+						  mm->pml4, page, cphys, cflags);
+			spin_unlock_irqrestore(&g_lazy_map_lock, lfc);
+			if (!cok) {
+				mm_put_page(cphys);
+				return 0;
+			}
+			return 1;
+		}
 	}
 
 	uint64_t phys = mm_alloc_page_for_fault();

@@ -101,6 +101,9 @@ Paths are absolute inside the filesystem.
   mark   nowrites (no write/discard since mark)   counts   save FILE
   tick MS (time passes, page-cache timer)   wb (flush thread pass)
   flushall   shrink N [dirty]   dropcaches   freepages N   cachestats
+  reclaim N (every registered cache shrinker asked for up to N objects)
+  cachepage P IDX (the page cache page a private mapping would map: none,
+                  or same as a read of that page -- else a failure)
   uid U G   umask M   task ID   release ID (release_locks_for_task)
   rawro on|off (call the driver on a ro mount too)   linkhop on|off
   chunk N   warnings ok|fail   leakcheck on|off   echo ...

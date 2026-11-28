@@ -2409,6 +2409,15 @@ long vfs_pread(vfs_file_t *f, void *buf, long bytes, long off)
 	return r;
 }
 
+struct pc_page *vfs_cache_page(vfs_file_t *f, unsigned long idx)
+{
+	if (!f || !vfs_ptr_plausible(f) || !vfs_ptr_plausible(f->ops))
+		return NULL;
+	if (!f->ops->cache_page)
+		return NULL;
+	return f->ops->cache_page(f, idx);
+}
+
 long vfs_write(vfs_file_t *f, const void *buf, long bytes)
 {
 	if (!f || !vfs_ptr_plausible(f) || !vfs_ptr_plausible(f->ops))

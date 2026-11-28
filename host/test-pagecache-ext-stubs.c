@@ -102,9 +102,78 @@ void mm_free_physical_page(uint64_t physical_address)
 	free(phys_to_virt(physical_address));
 }
 
+/* Frame references, as kernel/mm/memory.c counts them: one from the
+ * allocation, one more for every mapping.  Only frames with extra
+ * references are recorded here; the rest count one. */
+#define TREF_SLOTS 4096
+static struct {
+	uint64_t phys;
+	unsigned extra;
+} tref[TREF_SLOTS];
+
+static int tref_find(uint64_t phys, int create)
+{
+	int free_slot = -1;
+
+	for (int i = 0; i < TREF_SLOTS; i++) {
+		if (tref[i].phys == phys)
+			return i;
+		if (!tref[i].phys && free_slot < 0)
+			free_slot = i;
+	}
+	if (!create || free_slot < 0)
+		return -1;
+	tref[free_slot].phys = phys;
+	tref[free_slot].extra = 0;
+	return free_slot;
+}
+
+void mm_get_page(uint64_t phys)
+{
+	int i = tref_find(phys, 1);
+
+	if (i < 0)
+		test_fatal("frame reference table full", "mm_get_page");
+	tref[i].extra++;
+}
+
+void mm_put_page(uint64_t phys)
+{
+	int i = tref_find(phys, 0);
+
+	if (i >= 0 && tref[i].extra) {
+		if (--tref[i].extra == 0)
+			tref[i].phys = 0;
+		return;
+	}
+	mm_free_physical_page(phys);
+}
+
+uint16_t mm_get_page_refcount(uint64_t phys)
+{
+	int i = tref_find(phys, 0);
+
+	return (uint16_t)(1 + (i >= 0 ? tref[i].extra : 0));
+}
+
 uint64_t mm_get_free_pages(void)
 {
 	return 1UL << 20; /* plenty: reclaim never runs on its own */
+}
+
+/* Reclaim levels (kernel/mm/vmscan.c), far below the free pages above. */
+uint64_t vm_wmark_min(void)
+{
+	return 256;
+}
+
+uint64_t vm_wmark_low(void)
+{
+	return 320;
+}
+
+void vm_wake_reclaim(void)
+{
 }
 
 void mm_memset(void *dest, int val, size_t len)

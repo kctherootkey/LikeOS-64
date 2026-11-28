@@ -27,11 +27,14 @@ struct vfs_superblock; /* forward — see vfs_sb.h                    */
 // Configuration
 // ============================================================================
 
-#define IC_HASH_BUCKETS 512
+#define IC_HASH_BUCKETS 8192
 #define IC_HASH_MASK (IC_HASH_BUCKETS - 1)
 
-// Maximum cached inodes before LRU eviction of zero-refcount entries
-#define IC_MAX_ENTRIES 2048
+/* Unused inodes stay cached until memory runs short: the reclaim thread
+ * frees them, coldest first, through the cache's shrinker (vmscan.h).  This
+ * is only a ceiling against unbounded growth -- about 32 entries per hash
+ * chain -- not the working size the cache is trimmed to. */
+#define IC_MAX_ENTRIES (IC_HASH_BUCKETS * 32)
 
 // ============================================================================
 // Inode flags
@@ -111,6 +114,9 @@ void icache_init(void);
 // Look up an inode by start_cluster. Returns NULL on miss.
 // Does NOT increment refcount — caller must call icache_ref() if keeping.
 ic_inode_t *icache_lookup(struct vfs_superblock *sb, unsigned long start_cluster);
+/* Clear flags on a cached inode under the cache's lock (see icache.c). */
+void icache_clear_flags(struct vfs_superblock *sb, unsigned long start_cluster,
+			uint32_t flags);
 
 // Look up or create: returns an inode for start_cluster.
 // If not cached, allocates a new inode with the given metadata.

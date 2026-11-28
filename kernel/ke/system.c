@@ -593,7 +593,7 @@ int64_t sys_sysinfo(uint64_t info_ptr)
 	mm_get_memory_stats(&mstats);
 	info.totalram = mstats.total_memory;
 	info.freeram = mstats.free_memory;
-	info.sharedram = 0; // no tmpfs/shm accounting
+	info.sharedram = mm_shmem_pages() * PAGE_SIZE; // tmpfs, shm, memfd
 	/* buff/cache, matching what free(1)/top expect the fields to mean:
 	 *   bufferram — block/metadata buffers filesystem drivers reported
 	 *               via mm_buffercache_account()
@@ -606,9 +606,12 @@ int64_t sys_sysinfo(uint64_t info_ptr)
 	info.totalhigh = 0;
 	info.freehigh = 0;
 	info.mem_unit = 1; // byte granularity
+	/* Shared memory is cache to the eye (as in /proc/meminfo) but not
+	 * available: nothing can drop it. */
 	info.cached = mstats.pagecache_pages * PAGE_SIZE + icache_mem_bytes() +
-		      dcache_mem_bytes();
-	info.available = info.freeram + info.bufferram + info.cached;
+		      dcache_mem_bytes() + info.sharedram;
+	info.available = info.freeram + info.bufferram + info.cached -
+			 info.sharedram;
 
 	if (copy_to_user((void *)info_ptr, &info, sizeof(info)) != 0)
 		return -EFAULT;

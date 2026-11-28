@@ -755,19 +755,22 @@ static fat_stream_t *fat_stream_destroy(fat_stream_t *st)
 
 static void fat_stream_put_one(fat_stream_t *st);
 
-/* Evict unreferenced clean streams beyond the LRU cap (oldest first).
- * Metadata lock exclusive (no I/O).  A loop: the parent references the
- * evicted ones drop are put without trimming again (no recursion up the
+/* Evict unreferenced clean streams, oldest first: those beyond the LRU
+ * ceiling, and `want' more (reclaim asking for memory).  Returns how many
+ * went.  Metadata lock exclusive (no I/O).  A loop: the parent references
+ * the evicted ones drop are put without trimming again (no recursion up the
  * directory tree). */
-static void fat_stream_trim(fat_fs_t *fs)
+static unsigned long fat_stream_trim(fat_fs_t *fs, unsigned long want)
 {
+	unsigned long gone = 0;
+
 	fat_assert_excl(fs);
 	for (;;) {
 		fat_stream_t *victim = NULL, *parent;
 		uint64_t flags;
 
 		spin_lock_irqsave(&fs->st_lock, &flags);
-		if (fs->lru_count > FAT_STREAM_LRU_MAX) {
+		if (fs->lru_count > FAT_STREAM_LRU_MAX || gone < want) {
 			for (fat_stream_t *s = fs->lru_tail; s; s = s->lru_prev) {
 				if (s->refs == 0 && !s->data_dirty &&
 				    !s->meta_dirty && !s->is_root) {
@@ -784,11 +787,41 @@ static void fat_stream_trim(fat_fs_t *fs)
 		}
 		spin_unlock_irqrestore(&fs->st_lock, flags);
 		if (!victim)
-			return;
+			return gone;
+		gone++;
 		parent = fat_stream_destroy(victim);
 		if (parent)
 			fat_stream_put_one(parent);
 	}
+}
+
+/* ---- giving memory back ---------------------------------------------- */
+
+static unsigned long fat_shrink_count(void *arg)
+{
+	return ((fat_fs_t *)arg)->lru_count;
+}
+
+/* From the reclaim thread: no lock held, so the metadata lock is taken
+ * exclusive, as every other trim runs under it. */
+static unsigned long fat_shrink_scan(void *arg, unsigned long nr)
+{
+	fat_fs_t *fs = arg;
+	unsigned long gone;
+
+	fat_meta_wlock(fs);
+	gone = fat_stream_trim(fs, nr);
+	fat_meta_wunlock(fs);
+	return gone;
+}
+
+static void fat_shrinker_register(fat_fs_t *fs)
+{
+	fs->shrinker.name = "fat-streams";
+	fs->shrinker.count = fat_shrink_count;
+	fs->shrinker.scan = fat_shrink_scan;
+	fs->shrinker.arg = fs;
+	vm_register_shrinker(&fs->shrinker);
 }
 
 /* Drop a reference.  The last one parks the stream on the LRU -- or, for an
@@ -837,7 +870,7 @@ void fat_stream_put(fat_stream_t *st)
 	fs = st->fs;
 	fat_stream_put_one(st);
 	if (fs->lru_count > FAT_STREAM_LRU_MAX && fat_rwsem_held_excl(&fs->meta))
-		fat_stream_trim(fs);
+		fat_stream_trim(fs, 0);
 }
 
 /* The end of an exclusive hold: destroy the parked orphans and trim the
@@ -859,7 +892,7 @@ void fat_stream_maint(fat_fs_t *fs)
 		fat_stream_put_one(fat_stream_destroy(st));
 	}
 	if (fs->lru_count > FAT_STREAM_LRU_MAX)
-		fat_stream_trim(fs);
+		fat_stream_trim(fs, 0);
 }
 
 /* Bytes of the fixed root directory region. */
@@ -2089,6 +2122,8 @@ static void fat_streams_destroy(fat_fs_t *fs)
 
 static void fat_fs_free(fat_fs_t *fs)
 {
+	/* First: waits for a scan of this filesystem in progress. */
+	vm_unregister_shrinker(&fs->shrinker);
 	fat_streams_destroy(fs);
 	fat_mc_destroy(fs);
 	if (fs->pf)
@@ -2368,6 +2403,7 @@ static int fat_instance_up(block_device_t *b, vfs_mount_t *m, int rdonly,
 	if (fs->was_dirty && !fs->ro)
 		kprintf("fat: %s: volume was not properly unmounted; some data may be corrupt (run fsck.fat); it stays marked dirty\n",
 			b->name);
+	fat_shrinker_register(fs);
 	*out = fs;
 	return ST_OK;
 

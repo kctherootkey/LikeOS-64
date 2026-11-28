@@ -560,6 +560,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/mm_mmap.o \
 			  $(BUILD_DIR)/mm_mprotect.o \
 			  $(BUILD_DIR)/mm_madvise.o \
+			  $(BUILD_DIR)/mm_vmscan.o \
 			  $(BUILD_DIR)/mm_mremap.o \
 			  $(BUILD_DIR)/ke_fork.o \
 			  $(BUILD_DIR)/ke_exit.o \
@@ -1696,6 +1697,9 @@ $(BUILD_DIR)/mm_mprotect.o: $(KERNEL_DIR)/mm/mprotect.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/mm_madvise.o: $(KERNEL_DIR)/mm/madvise.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/mm_vmscan.o: $(KERNEL_DIR)/mm/vmscan.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/mm_mremap.o: $(KERNEL_DIR)/mm/mremap.c | $(BUILD_DIR)

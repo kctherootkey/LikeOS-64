@@ -828,6 +828,10 @@ void mm_get_memory_stats(memory_stats_t *stats);
  * knowing any filesystem specifics. */
 void mm_buffercache_account(long delta);
 uint64_t mm_buffercache_bytes(void);
+/* In-memory file data (tmpfs, shared memory, memfd), in pages: added when
+ * such a page is allocated, taken off when it is freed. */
+void mm_shmem_account(long pages);
+uint64_t mm_shmem_pages(void);
 void mm_print_memory_stats(void);
 void mm_print_heap_stats(void);
 bool mm_validate_heap(void);

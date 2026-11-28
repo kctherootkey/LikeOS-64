@@ -20,6 +20,8 @@
 #include <kernel/ke/timer.h>
 #include <kernel/ke/cred.h>
 #include <kernel/mm/memory.h>
+#include <kernel/fs/icache.h>
+#include <kernel/fs/dcache.h>
 #include <kernel/net/net.h>
 #include <kernel/ke/pipe.h>
 #include <kernel/ke/smp.h>
@@ -770,8 +772,19 @@ static long show_meminfo(struct pfs_node *n, char *buf, long cap)
 	 * (mm_alloc_page_for_fault).  It used to equal MemFree, which with a
 	 * warm cache made most of RAM look spoken for to anyone deciding when
 	 * to shed memory -- WebKit's pressure monitor reads this line. */
-	uint64_t cached = ms.pagecache_pages * PAGE_SIZE;
-	uint64_t avail = ms.free_memory + cached;
+	/* Cached is the file data held in memory: the page cache, plus files
+	 * and shared memory that live only in memory (tmpfs, /dev/shm,
+	 * memfd, System V segments), which are also listed on their own as
+	 * Shmem.  Available counts what can actually be given back -- the
+	 * page cache, the filesystems' metadata buffers and the reclaimable
+	 * inode and directory caches -- but not Shmem, which only its owner
+	 * can free. */
+	uint64_t filecache = ms.pagecache_pages * PAGE_SIZE;
+	uint64_t shmem = mm_shmem_pages() * PAGE_SIZE;
+	uint64_t buffers = mm_buffercache_bytes();
+	uint64_t sreclaim = icache_mem_bytes() + dcache_mem_bytes();
+	uint64_t cached = filecache + shmem;
+	uint64_t avail = ms.free_memory + filecache + buffers + sreclaim;
 	if (avail > ms.total_memory)
 		avail = ms.total_memory;
 	p = pfs_printf(buf, cap, p, "MemTotal:       %10llu kB\n",
@@ -780,8 +793,14 @@ static long show_meminfo(struct pfs_node *n, char *buf, long cap)
 		       (unsigned long long)(ms.free_memory / 1024));
 	p = pfs_printf(buf, cap, p, "MemAvailable:   %10llu kB\n",
 		       (unsigned long long)(avail / 1024));
+	p = pfs_printf(buf, cap, p, "Buffers:        %10llu kB\n",
+		       (unsigned long long)(buffers / 1024));
 	p = pfs_printf(buf, cap, p, "Cached:         %10llu kB\n",
 		       (unsigned long long)(cached / 1024));
+	p = pfs_printf(buf, cap, p, "Shmem:          %10llu kB\n",
+		       (unsigned long long)(shmem / 1024));
+	p = pfs_printf(buf, cap, p, "SReclaimable:   %10llu kB\n",
+		       (unsigned long long)(sreclaim / 1024));
 	p = pfs_printf(buf, cap, p, "SwapTotal:               0 kB\n");
 	p = pfs_printf(buf, cap, p, "SwapFree:                0 kB\n");
 	return p;

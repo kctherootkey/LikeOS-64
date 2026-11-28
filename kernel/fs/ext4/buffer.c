@@ -64,18 +64,230 @@ int ext4_sb_read_raw(const block_device_t *bdev, unsigned long part_lba,
  * and extent/indirect nodes constantly, and the same block is re-read many
  * times in one operation (e.g. `ls -la` stats every entry, each re-reading
  * the parent dir block + the inode-table block).  Without caching, each is a
- * separate ~4KB USB transaction — painfully slow.  This small round-robin
- * cache keeps the hottest metadata blocks in RAM.  All ext4_read_block()
- * calls happen under the I/O mutex, so the cache needs no extra locking.
- * NOTE: entries are invalidated on writes. */
-/* Sized so a metadata-heavy operation's whole working set stays resident: a big
- * directory grows to many leaf/index blocks, and a create/delete loop touches
- * dozens of inode-table + bitmap + dir blocks.  256 * 4 KB = up to 1 MB, buffers
- * allocated on demand.  (Was 32, which thrashed on htree-sized directories.) */
-/* The metadata block cache is read AND repopulated by concurrent shared-mode
- * readers (mutators hold the metadata lock exclusive, but reader–reader
- * insertions race), so it carries its own spinlock.  Copies in/out happen
- * under the lock (a block-size memcpy — sub-microsecond). */
+ * separate ~4KB USB transaction — painfully slow.
+ *
+ * The cache keeps every metadata block it has read, for as long as memory
+ * allows: a hash on the block number finds a block, an LRU list (most
+ * recently used first) says which blocks are cold, and under memory
+ * pressure the reclaim thread frees the coldest through the cache's
+ * shrinker.  It used to be 256 slots reused round robin, which on any
+ * directory tree of real size re-read the same blocks from the device over
+ * and over while memory sat unused.  A ceiling of a sixteenth of memory
+ * keeps one filesystem from crowding out everything else between two
+ * reclaim passes.
+ *
+ * The cache is read AND repopulated by concurrent shared-mode readers
+ * (mutators hold the metadata lock exclusive, but reader–reader insertions
+ * race), so it carries its own spinlock.  Copies in/out happen under the
+ * lock (a block-size memcpy — sub-microsecond).  Memory is never allocated
+ * or freed under it: a buffer is allocated before the lock is taken and
+ * freed after it is dropped (freeing a kalloc'd block buffer can shoot down
+ * other processors' TLBs, which must not happen with interrupts off).
+ *
+ * A block-sized buffer that is a whole page comes straight from the page
+ * allocator and is reached through the direct map: a kalloc of 4 KB is a
+ * "large" slab allocation costing two pages and a mapping of its own. */
+
+static inline unsigned long ext4_mbc_bucket(unsigned long pbn)
+{
+	return (pbn * 2654435761UL) & (EXT4_MBC_HASH - 1);
+}
+
+static void ext4_mbc_lru_unlink(struct ext4_mbc_ent *e)
+{
+	e->lru_prev->lru_next = e->lru_next;
+	e->lru_next->lru_prev = e->lru_prev;
+	e->lru_prev = e->lru_next = NULL;
+}
+
+static void ext4_mbc_lru_push(struct ext4_state *st, struct ext4_mbc_ent *e)
+{
+	e->lru_next = st->mbc_lru.lru_next;
+	e->lru_prev = &st->mbc_lru;
+	st->mbc_lru.lru_next->lru_prev = e;
+	st->mbc_lru.lru_next = e;
+}
+
+/* The entry for `pbn', or NULL.  Caller holds mbc_lock. */
+static struct ext4_mbc_ent *ext4_mbc_find(struct ext4_state *st,
+					  unsigned long pbn)
+{
+	struct ext4_mbc_ent *e;
+
+	if (!st->mbc_hash)
+		return NULL;
+	for (e = st->mbc_hash[ext4_mbc_bucket(pbn)]; e; e = e->hnext)
+		if (e->pbn == pbn)
+			return e;
+	return NULL;
+}
+
+/* Take an entry out of the hash and the LRU.  Caller holds mbc_lock; the
+ * entry is the caller's to free afterwards, unlocked. */
+static void ext4_mbc_detach(struct ext4_state *st, struct ext4_mbc_ent *e)
+{
+	struct ext4_mbc_ent **pp = &st->mbc_hash[ext4_mbc_bucket(e->pbn)];
+
+	while (*pp && *pp != e)
+		pp = &(*pp)->hnext;
+	if (*pp)
+		*pp = e->hnext;
+	e->hnext = NULL;
+	ext4_mbc_lru_unlink(e);
+	st->mbc_count--;
+}
+
+static struct ext4_mbc_ent *ext4_mbc_ent_alloc(ext4_fs_t *fs)
+{
+	struct ext4_mbc_ent *e = (struct ext4_mbc_ent *)kalloc(sizeof(*e));
+	unsigned size = fs->block_size;
+
+	if (!e)
+		return NULL;
+	mm_memset(e, 0, sizeof(*e));
+	if (size == PAGE_SIZE) {
+		uint64_t phys = mm_allocate_physical_page();
+
+		if (phys) {
+			e->data = (uint8_t *)phys_to_virt(phys);
+			e->page = 1;
+		}
+	} else {
+		e->data = (uint8_t *)kalloc(size);
+	}
+	if (!e->data) {
+		kfree(e);
+		return NULL;
+	}
+	e->size = size;
+	mm_buffercache_account((long)size);
+	return e;
+}
+
+/* Unlocked: see the note on freeing above. */
+static void ext4_mbc_ent_free(struct ext4_mbc_ent *e)
+{
+	if (!e)
+		return;
+	mm_buffercache_account(-(long)e->size);
+	if (e->page)
+		mm_free_physical_page(virt_to_phys(e->data));
+	else
+		kfree(e->data);
+	kfree(e);
+}
+
+/* Free a list of detached entries (linked through hnext). */
+static void ext4_mbc_free_list(struct ext4_mbc_ent *list)
+{
+	while (list) {
+		struct ext4_mbc_ent *next = list->hnext;
+
+		ext4_mbc_ent_free(list);
+		list = next;
+	}
+}
+
+/* Detach up to `nr' of the coldest entries (all of them for nr == ~0UL)
+ * into a list for the caller to free unlocked.  Caller holds mbc_lock. */
+static struct ext4_mbc_ent *ext4_mbc_take_cold(struct ext4_state *st,
+					      unsigned long nr,
+					      unsigned long *taken)
+{
+	struct ext4_mbc_ent *list = NULL;
+	unsigned long n = 0;
+
+	while (n < nr && st->mbc_lru.lru_prev != &st->mbc_lru) {
+		struct ext4_mbc_ent *e = st->mbc_lru.lru_prev;
+
+		ext4_mbc_detach(st, e);
+		e->hnext = list;
+		list = e;
+		n++;
+	}
+	if (taken)
+		*taken = n;
+	return list;
+}
+
+/* ---- giving memory back ---------------------------------------------- */
+
+static unsigned long ext4_mbc_shrink_count(void *arg)
+{
+	ext4_fs_t *fs = arg;
+
+	return fs->st ? fs->st->mbc_count : 0;
+}
+
+/* From the reclaim thread.  Dropping a cached copy is always correct: the
+ * device holds the same bytes, and newer ones live in the transaction and
+ * checkpoint sets, which are consulted before the cache. */
+static unsigned long ext4_mbc_shrink_scan(void *arg, unsigned long nr)
+{
+	ext4_fs_t *fs = arg;
+	unsigned long freed = 0;
+
+	while (freed < nr) {
+		struct ext4_mbc_ent *list;
+		unsigned long got;
+		uint64_t flags;
+
+		spin_lock_irqsave(&fs->st->mbc_lock, &flags);
+		/* In batches: a long detach loop is a long interrupts-off
+		 * stretch. */
+		list = ext4_mbc_take_cold(fs->st,
+					  nr - freed > 64 ? 64 : nr - freed,
+					  &got);
+		spin_unlock_irqrestore(&fs->st->mbc_lock, flags);
+		ext4_mbc_free_list(list);
+		if (!got)
+			break;
+		freed += got;
+	}
+	return freed;
+}
+
+/* The most blocks one filesystem keeps: a sixteenth of memory. */
+static unsigned long ext4_mbc_ceiling(ext4_fs_t *fs)
+{
+	unsigned long blocks = (unsigned long)(mm_get_usable_pages() / 16) *
+			       (PAGE_SIZE / (fs->block_size ? fs->block_size :
+							      PAGE_SIZE));
+
+	return blocks < 256 ? 256 : blocks;
+}
+
+int ext4_mbc_init(ext4_fs_t *fs)
+{
+	struct ext4_state *st = fs->st;
+
+	st->mbc_hash = (struct ext4_mbc_ent **)kalloc(EXT4_MBC_HASH *
+						     sizeof(*st->mbc_hash));
+	if (!st->mbc_hash)
+		return ST_NOMEM;
+	mm_memset(st->mbc_hash, 0, EXT4_MBC_HASH * sizeof(*st->mbc_hash));
+	st->mbc_lru.lru_prev = st->mbc_lru.lru_next = &st->mbc_lru;
+	st->mbc_count = 0;
+	st->mbc_shrinker.name = "ext4-metadata";
+	st->mbc_shrinker.count = ext4_mbc_shrink_count;
+	st->mbc_shrinker.scan = ext4_mbc_shrink_scan;
+	st->mbc_shrinker.arg = fs;
+	vm_register_shrinker(&st->mbc_shrinker);
+	return ST_OK;
+}
+
+void ext4_mbc_destroy(ext4_fs_t *fs)
+{
+	struct ext4_state *st = fs->st;
+
+	if (!st || !st->mbc_hash)
+		return;
+	/* First: waits for a scan of this filesystem in progress. */
+	vm_unregister_shrinker(&st->mbc_shrinker);
+	ext4_mbc_invalidate(fs);
+	kfree(st->mbc_hash);
+	st->mbc_hash = NULL;
+}
 
 /* ---- checksum-verification cache ----
  * Metadata checksums (directory leaves, extent nodes, xattr blocks) were
@@ -86,79 +298,73 @@ int ext4_sb_read_raw(const block_device_t *bdev, unsigned long part_lba,
  * cached content changes (fresh disk read, write-through update). */
 int ext4_mbc_verified(ext4_fs_t *fs, unsigned long pbn)
 {
+	struct ext4_mbc_ent *e;
 	uint64_t flags;
 	int v = 0;
+
 	spin_lock_irqsave(&fs->st->mbc_lock, &flags);
-	for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
-		if (fs->st->mbc[i].pbn == pbn) {
-			v = fs->st->mbc[i].verified;
-			break;
-		}
+	e = ext4_mbc_find(fs->st, pbn);
+	if (e)
+		v = e->verified;
 	spin_unlock_irqrestore(&fs->st->mbc_lock, flags);
 	return v;
 }
 
 void ext4_mbc_mark_verified(ext4_fs_t *fs, unsigned long pbn)
 {
+	struct ext4_mbc_ent *e;
 	uint64_t flags;
+
 	spin_lock_irqsave(&fs->st->mbc_lock, &flags);
-	/* All matches, not just the first — symmetric with ext4_mbc_drop, so a
-	 * duplicate entry (should no longer exist; insert dedupes) can never
-	 * diverge in verified-state from the copy lookups serve. */
-	for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
-		if (fs->st->mbc[i].pbn == pbn)
-			fs->st->mbc[i].verified = 1;
+	e = ext4_mbc_find(fs->st, pbn);
+	if (e)
+		e->verified = 1;
 	spin_unlock_irqrestore(&fs->st->mbc_lock, flags);
 }
 
+/* Forget every cached block (mount, journal replay, unmount). */
 void ext4_mbc_invalidate(ext4_fs_t *fs)
 {
-	/* Detach the buffers under the lock, free them after releasing it —
-	 * kfree of a block-sized buffer does a TLB shootdown and must not run
-	 * with IRQs off under a spinlock. */
-	uint8_t *bufs[EXT4_MBC_ENTRIES];
+	struct ext4_mbc_ent *list;
 	uint64_t flags;
-	long freed = 0;
+
+	if (!fs->st->mbc_hash)
+		return;
 	spin_lock_irqsave(&fs->st->mbc_lock, &flags);
-	for (int i = 0; i < EXT4_MBC_ENTRIES; i++) {
-		fs->st->mbc[i].pbn = 0;
-		bufs[i] = fs->st->mbc[i].data;
-		fs->st->mbc[i].data = 0;
-		freed += fs->st->mbc[i].size;
-		fs->st->mbc[i].size = 0;
-	}
-	fs->st->mbc_next = 0;
+	list = ext4_mbc_take_cold(fs->st, ~0UL, NULL);
 	spin_unlock_irqrestore(&fs->st->mbc_lock, flags);
-	mm_buffercache_account(-freed);
-	for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
-		if (bufs[i])
-			kfree(bufs[i]);
+	ext4_mbc_free_list(list);
 }
 
 /* Drop a single block from the metadata cache (on free, so a later reuse of
  * the same physical block never serves stale cached content). */
 void ext4_mbc_drop(ext4_fs_t *fs, unsigned long pbn)
 {
+	struct ext4_mbc_ent *e;
 	uint64_t flags;
+
 	spin_lock_irqsave(&fs->st->mbc_lock, &flags);
-	for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
-		if (fs->st->mbc[i].pbn == pbn)
-			fs->st->mbc[i].pbn = 0;
+	e = ext4_mbc_find(fs->st, pbn);
+	if (e)
+		ext4_mbc_detach(fs->st, e);
 	spin_unlock_irqrestore(&fs->st->mbc_lock, flags);
+	ext4_mbc_ent_free(e);
 }
 
 /* Serve `pbn` from the cache into `buf`.  Returns 1 on hit. */
 static int ext4_mbc_lookup(ext4_fs_t *fs, unsigned long pbn, void *buf)
 {
+	struct ext4_mbc_ent *e;
 	uint64_t flags;
 	int hit = 0;
+
 	spin_lock_irqsave(&fs->st->mbc_lock, &flags);
-	for (int i = 0; i < EXT4_MBC_ENTRIES; i++) {
-		if (fs->st->mbc[i].pbn == pbn && fs->st->mbc[i].data) {
-			mm_memcpy(buf, fs->st->mbc[i].data, fs->block_size);
-			hit = 1;
-			break;
-		}
+	e = ext4_mbc_find(fs->st, pbn);
+	if (e && e->size >= fs->block_size) {
+		mm_memcpy(buf, e->data, fs->block_size);
+		ext4_mbc_lru_unlink(e);
+		ext4_mbc_lru_push(fs->st, e);
+		hit = 1;
 	}
 	spin_unlock_irqrestore(&fs->st->mbc_lock, flags);
 	return hit;
@@ -168,57 +374,86 @@ static int ext4_mbc_lookup(ext4_fs_t *fs, unsigned long pbn, void *buf)
 static void ext4_mbc_insert(ext4_fs_t *fs, unsigned long pbn, const void *buf,
 			    int verified)
 {
+	struct ext4_state *st = fs->st;
+	struct ext4_mbc_ent *e, *fresh, *spare = NULL, *cold = NULL;
 	uint64_t flags;
-	spin_lock_irqsave(&fs->st->mbc_lock, &flags);
+
+	if (!st->mbc_hash)
+		return;
+	/* Allocated before the lock (see the note above); given back below
+	 * if another reader got the block in first. */
+	fresh = ext4_mbc_ent_alloc(fs);
+
+	spin_lock_irqsave(&st->mbc_lock, &flags);
 	/* DEDUPE — never create a second entry for the same pbn.  Two
 	 * shared-mode readers (fine-grained locking allows concurrent readers)
 	 * can both miss the same block, both sit in the sleeping disk read, and
-	 * both arrive here.  Blind slot assignment then caches the block TWICE.
-	 * Duplicates are fatal in slow motion: lookup and the write-side refresh
-	 * in ext4_write_block_direct touch only the FIRST match, so the second
-	 * copy keeps its old content; once round-robin reuse evicts the first
-	 * (fresh) copy, the stale duplicate becomes authoritative, and the next
+	 * both arrive here.  A second entry for one block is fatal in slow
+	 * motion: the write-side refresh updates the one it finds, the other
+	 * keeps its old content, and once it is the one served, the next
 	 * inode/bitmap RMW through it durably REVERTS every update made since
-	 * the duplicate was created (observed: /tmp htree leaf loss + ~78 lost
-	 * links_count increments + lost bitmap bits, e2fsck).  Update the
-	 * existing entry in place instead.
+	 * (observed once: /tmp htree leaf loss + ~78 lost links_count
+	 * increments + lost bitmap bits, e2fsck).  Update the existing entry in
+	 * place instead.
 	 *
 	 * INVARIANT: both racing readers read the same disk content (anything
 	 * newer lives in st->txn/st->ckpt, checked before the mbc; mutators hold
 	 * the meta lock exclusive), so an existing entry MUST equal what we
 	 * just read.  A mismatch means a stale/incoherent cached metadata
 	 * block — the corruption, caught at the moment it exists. */
-	for (int i = 0; i < EXT4_MBC_ENTRIES; i++) {
-		if (fs->st->mbc[i].pbn == pbn && fs->st->mbc[i].data) {
-			WARN_RATELIMIT(
-				ext4_memcmp(fs->st->mbc[i].data, buf,
-					    fs->block_size) != 0,
-				"ext4 mbc: cached pbn %lu differs from disk (stale metadata cache entry — corruption)",
-				pbn);
-			mm_memcpy(fs->st->mbc[i].data, buf, fs->block_size);
-			fs->st->mbc[i].verified = verified;
-			spin_unlock_irqrestore(&fs->st->mbc_lock, flags);
-			return;
+	e = ext4_mbc_find(st, pbn);
+	if (e && e->size >= fs->block_size) {
+		WARN_RATELIMIT(
+			ext4_memcmp(e->data, buf, fs->block_size) != 0,
+			"ext4 mbc: cached pbn %lu differs from disk (stale metadata cache entry — corruption)",
+			pbn);
+		mm_memcpy(e->data, buf, fs->block_size);
+		e->verified = verified;
+		ext4_mbc_lru_unlink(e);
+		ext4_mbc_lru_push(st, e);
+		spare = fresh;
+	} else if (fresh) {
+		if (e) {
+			/* Cached at a smaller block size (a remount changed
+			 * it): replaced. */
+			ext4_mbc_detach(st, e);
+			cold = e;
+		} else if (st->mbc_count >= ext4_mbc_ceiling(fs)) {
+			unsigned long got;
+
+			cold = ext4_mbc_take_cold(st, 1, &got);
 		}
+		mm_memcpy(fresh->data, buf, fs->block_size);
+		fresh->pbn = pbn;
+		fresh->verified = verified;
+		fresh->hnext = st->mbc_hash[ext4_mbc_bucket(pbn)];
+		st->mbc_hash[ext4_mbc_bucket(pbn)] = fresh;
+		ext4_mbc_lru_push(st, fresh);
+		st->mbc_count++;
 	}
-	unsigned slot = fs->st->mbc_next++ % EXT4_MBC_ENTRIES;
-	if (!fs->st->mbc[slot].data) {
-		/* One-time buffer allocation for this slot.  kalloc's
-		 * allocation path takes only spinlocks (no sleep, no TLB
-		 * shootdown — that is on the free path), so this is safe
-		 * with IRQs off; it happens once per slot per mount. */
-		fs->st->mbc[slot].data = (uint8_t *)kalloc(fs->block_size);
-		if (!fs->st->mbc[slot].data) {
-			spin_unlock_irqrestore(&fs->st->mbc_lock, flags);
-			return;
-		}
-		fs->st->mbc[slot].size = fs->block_size;
-		mm_buffercache_account((long)fs->block_size);
+	spin_unlock_irqrestore(&st->mbc_lock, flags);
+	ext4_mbc_ent_free(spare);
+	ext4_mbc_free_list(cold);
+}
+
+/* A block was just written to the device: its cached copy, if any, becomes
+ * those bytes (and has to pass its check again). */
+void ext4_mbc_written(ext4_fs_t *fs, unsigned long pbn, const void *buf)
+{
+	struct ext4_mbc_ent *e, *stale = NULL;
+	uint64_t flags;
+
+	spin_lock_irqsave(&fs->st->mbc_lock, &flags);
+	e = ext4_mbc_find(fs->st, pbn);
+	if (e && e->size >= fs->block_size) {
+		mm_memcpy(e->data, buf, fs->block_size);
+		e->verified = 0; /* content changed */
+	} else if (e) {
+		ext4_mbc_detach(fs->st, e); /* stale size: no copy at all */
+		stale = e;
 	}
-	mm_memcpy(fs->st->mbc[slot].data, buf, fs->block_size);
-	fs->st->mbc[slot].pbn = pbn;
-	fs->st->mbc[slot].verified = verified;
 	spin_unlock_irqrestore(&fs->st->mbc_lock, flags);
+	ext4_mbc_ent_free(stale); /* only what this call detached */
 }
 
 /* Read one filesystem block (block_size bytes) by physical block number,
@@ -378,27 +613,7 @@ int ext4_write_block_direct(ext4_fs_t *fs, unsigned long pbn,
 	int st = ext4_write_sectors(fs->bdev, lba, fs->sectors_per_block, buf);
 	if (st != ST_OK)
 		return st;
-	{
-		/* Refresh EVERY cached copy, not just the first match (mirror of
-		 * ext4_mbc_drop).  Refreshing only the first left a duplicate
-		 * entry stale forever — the delayed-revert corruption (see the
-		 * dedupe comment in ext4_mbc_insert).  ext4_mbc_insert now
-		 * dedupes, so >1 match means duplicate creation slipped through
-		 * some path — surface it. */
-		int matches = 0;
-		uint64_t flags;
-		spin_lock_irqsave(&fs->st->mbc_lock, &flags);
-		for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
-			if (fs->st->mbc[i].pbn == pbn && fs->st->mbc[i].data) {
-				mm_memcpy(fs->st->mbc[i].data, buf, fs->block_size);
-				fs->st->mbc[i].verified = 0; /* content changed */
-				matches++;
-			}
-		spin_unlock_irqrestore(&fs->st->mbc_lock, flags);
-		WARN_ON_ONCE(
-			matches >
-			1); /* duplicate mbc entries for one pbn: insert dedup bypassed */
-	}
+	ext4_mbc_written(fs, pbn, buf);
 	return ST_OK;
 }
 

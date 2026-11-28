@@ -10,6 +10,7 @@
  * device in test-fs-bdev.c, and the few VFS entry points a driver uses.
  *
  * Copyright (C) 2026 The LikeOS Project */
+#include <kernel/mm/vmscan.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/fs/vfs_sb.h>
 #include <kernel/fs/mount.h>
@@ -282,6 +283,138 @@ void mm_buffercache_account(long delta)
 uint64_t mm_buffercache_bytes(void)
 {
 	return test_buffercache_bytes;
+}
+
+/* In-memory file data (tmpfs), counted as the kernel counts it. */
+int64_t test_shmem_pages;
+
+void mm_shmem_account(long pages)
+{
+	test_shmem_pages += pages;
+}
+
+uint64_t mm_shmem_pages(void)
+{
+	return test_shmem_pages > 0 ? (uint64_t)test_shmem_pages : 0;
+}
+
+/* Reclaim (kernel/mm/vmscan.c): the free-memory levels are fixed here, the
+ * shrinkers the code under test registers are kept, and the runner's
+ * "shrink" command asks them for memory the way the reclaim thread does. */
+static struct vm_shrinker *test_shrinkers;
+
+uint64_t vm_wmark_min(void)
+{
+	return 256;
+}
+
+uint64_t vm_wmark_low(void)
+{
+	return 320;
+}
+
+uint64_t vm_wmark_high(void)
+{
+	return 384;
+}
+
+void vm_wake_reclaim(void)
+{
+}
+
+void vm_check_free_memory(void)
+{
+}
+
+/* Frame references, as kernel/mm/memory.c counts them: one from the
+ * allocation, one more for every mapping.  Only frames with extra
+ * references are recorded; the rest count one. */
+#define TREF_SLOTS 4096
+static struct {
+	uint64_t phys;
+	unsigned extra;
+} tref[TREF_SLOTS];
+
+static int tref_find(uint64_t phys, int create)
+{
+	int free_slot = -1;
+
+	for (int i = 0; i < TREF_SLOTS; i++) {
+		if (tref[i].phys == phys)
+			return i;
+		if (!tref[i].phys && free_slot < 0)
+			free_slot = i;
+	}
+	if (!create || free_slot < 0)
+		return -1;
+	tref[free_slot].phys = phys;
+	tref[free_slot].extra = 0;
+	return free_slot;
+}
+
+void mm_get_page(uint64_t phys)
+{
+	int i = tref_find(phys, 1);
+
+	if (i < 0)
+		test_fatal("frame reference table full", "mm_get_page");
+	tref[i].extra++;
+}
+
+void mm_put_page(uint64_t phys)
+{
+	int i = tref_find(phys, 0);
+
+	if (i >= 0 && tref[i].extra) {
+		if (--tref[i].extra == 0)
+			tref[i].phys = 0;
+		return;
+	}
+	mm_free_physical_page(phys);
+}
+
+uint16_t mm_get_page_refcount(uint64_t phys)
+{
+	int i = tref_find(phys, 0);
+
+	return (uint16_t)(1 + (i >= 0 ? tref[i].extra : 0));
+}
+
+/* All the memory the page budget allows (--pages). */
+extern uint64_t test_pages_limit;
+
+uint64_t mm_get_usable_pages(void)
+{
+	return test_pages_limit;
+}
+
+void vm_register_shrinker(struct vm_shrinker *s)
+{
+	s->next = test_shrinkers;
+	test_shrinkers = s;
+}
+
+void vm_unregister_shrinker(struct vm_shrinker *s)
+{
+	for (struct vm_shrinker **pp = &test_shrinkers; *pp; pp = &(*pp)->next)
+		if (*pp == s) {
+			*pp = s->next;
+			break;
+		}
+	s->next = NULL;
+}
+
+/* Ask every registered cache for up to `nr' objects; how many went. */
+unsigned long test_vm_shrink(unsigned long nr)
+{
+	unsigned long freed = 0;
+
+	for (struct vm_shrinker *s = test_shrinkers; s; s = s->next) {
+		unsigned long n = s->count(s->arg);
+
+		freed += s->scan(s->arg, n < nr ? n : nr);
+	}
+	return freed;
 }
 
 /* ------------------------------------------------------------------ */

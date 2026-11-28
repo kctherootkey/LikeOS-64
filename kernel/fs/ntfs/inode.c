@@ -162,6 +162,34 @@ static void ntfs_stream_trim(ntfs_fs_t *fs, uint32_t keep)
 	}
 }
 
+/* ---- giving memory back ---------------------------------------------- */
+
+static unsigned long ntfs_shrink_count(void *arg)
+{
+	return ((ntfs_fs_t *)arg)->lru_count;
+}
+
+/* From the reclaim thread.  Trimming needs no lock of the filesystem's
+ * beyond its own (it runs from any stream put as well). */
+static unsigned long ntfs_shrink_scan(void *arg, unsigned long nr)
+{
+	ntfs_fs_t *fs = arg;
+	uint32_t before = fs->lru_count;
+	uint32_t keep = before > nr ? before - (uint32_t)nr : 0;
+
+	ntfs_stream_trim(fs, keep);
+	return before > fs->lru_count ? before - fs->lru_count : 0;
+}
+
+void ntfs_shrinker_register(ntfs_fs_t *fs)
+{
+	fs->shrinker.name = "ntfs-streams";
+	fs->shrinker.count = ntfs_shrink_count;
+	fs->shrinker.scan = ntfs_shrink_scan;
+	fs->shrinker.arg = fs;
+	vm_register_shrinker(&fs->shrinker);
+}
+
 void ntfs_stream_ref(ntfs_fs_t *fs, ntfs_stream_t *st)
 {
 	uint64_t fl;

@@ -218,11 +218,21 @@ static long ext4_read_at(vfs_file_t *f, void *buf, long bytes, long off)
 
 	if (!ef || !ef->fs || off < 0)
 		return ST_INVALID;
-	ra.last_page_index = 0;
-	ra.sequential_count = 0;
-	ra.ra_pages = 0;
+	pc_readahead_init(&ra);
 	ext4_read_wb_flush(ef->fs, ef->ino);
 	return ext4_read_at_impl(f, buf, bytes, (unsigned long)off, &ra);
+}
+
+/* A private mapping's page: the page cache's own frame (vfs_ops_t
+ * .cache_page), after the read entry points' write-behind flush. */
+static struct pc_page *ext4_cache_page_op(vfs_file_t *f, unsigned long idx)
+{
+	ext4_file_t *ef = f ? (ext4_file_t *)f->fs_private : 0;
+
+	if (!ef || !ef->fs)
+		return NULL;
+	ext4_read_wb_flush(ef->fs, ef->ino);
+	return ext4_cache_page_impl(f, idx);
 }
 
 /* Largest piece of a write copied in at a time (see ext4_write_common). */
@@ -802,6 +812,7 @@ const vfs_ops_t ext4_vfs_ops = {
 	.stat = ext4_stat_vfs,
 	.read = ext4_read,
 	.read_at = ext4_read_at,
+	.cache_page = ext4_cache_page_op,
 	.write_at = ext4_write_at,
 	.write = ext4_write,
 	.seek = ext4_seek,

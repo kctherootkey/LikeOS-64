@@ -21,6 +21,7 @@
 
 #include <kernel/fs/dcache.h>
 #include <kernel/mm/memory.h>
+#include <kernel/mm/vmscan.h>
 #include <kernel/io/console.h>
 #include <kernel/uapi/bug.h>
 
@@ -58,6 +59,8 @@ static volatile uint64_t dc_stat_evictions;
 // ============================================================================
 
 static int dc_initialized = 0;
+static int dc_shrinker_registered;
+static struct vm_shrinker dc_shrinker;
 
 void dcache_init(void)
 {
@@ -76,6 +79,10 @@ void dcache_init(void)
 	dc_stat_insertions = 0;
 	dc_stat_evictions = 0;
 	dc_initialized = 1;
+	if (!dc_shrinker_registered) {
+		dc_shrinker_registered = 1;
+		vm_register_shrinker(&dc_shrinker);
+	}
 }
 
 // ============================================================================
@@ -215,44 +222,84 @@ static inline unsigned long dc_bucket_index(unsigned long parent_cluster,
 // Eviction — remove LRU tail entry when cache is full
 // ============================================================================
 
-static void dc_evict_one(void)
+/* 1 when an entry was freed (or one was found gone and may be retried),
+ * 0 when the cache is empty.
+ *
+ * Eviction runs in the reclaim thread as well as on insert, with no
+ * filesystem lock held, so it must agree with invalidation about who frees
+ * an entry.  Invalidation takes the bucket lock, then the LRU lock, unhashes
+ * and unlinks under them and frees afterwards.  Here the victim is chosen
+ * and its bucket computed under the LRU lock -- where it is certainly alive
+ * -- and it is freed only if it is still found in that bucket under the
+ * bucket lock, taken in the same order as invalidation takes them.  An entry
+ * invalidation got first is simply not found, and not touched again. */
+static int dc_evict_one(void)
 {
-	// Pick the LRU tail (least recently used)
-	uint64_t lru_flags;
-	spin_lock_irqsave(&dc_lru_lock, &lru_flags);
+	uint64_t lru_flags, bucket_flags;
+	unsigned long bucket;
+	dc_entry_t *victim;
 
-	dc_entry_t *victim = dc_lru_sentinel.lru_prev;
+	spin_lock_irqsave(&dc_lru_lock, &lru_flags);
+	victim = dc_lru_sentinel.lru_prev;
 	if (victim == &dc_lru_sentinel) {
 		spin_unlock_irqrestore(&dc_lru_lock, lru_flags);
-		return; // empty
+		return 0; // empty
 	}
-	dc_lru_remove(victim);
+	bucket = dc_bucket_index(victim->parent_cluster, victim->name_hash);
 	spin_unlock_irqrestore(&dc_lru_lock, lru_flags);
 
+	spin_lock_irqsave(&dc_hash[bucket].lock, &bucket_flags);
+	dc_entry_t **pp = &dc_hash[bucket].head;
+	while (*pp && *pp != victim)
+		pp = &(*pp)->hash_next;
+	if (!*pp) {
+		/* Gone meanwhile: whoever unhashed it frees it. */
+		spin_unlock_irqrestore(&dc_hash[bucket].lock, bucket_flags);
+		return 1;
+	}
+	*pp = victim->hash_next;
+	spin_lock_irqsave(&dc_lru_lock, &lru_flags);
+	dc_lru_remove(victim);
+	spin_unlock_irqrestore(&dc_lru_lock, lru_flags);
+	spin_unlock_irqrestore(&dc_hash[bucket].lock, bucket_flags);
+
 	/* Valid non-negative entry whose inode-id is 1 indicates filesystem
-     * corruption — on FAT32 cluster 1 is reserved; other filesystems also
-     * treat 0/1 as out-of-band. */
+	 * corruption — on FAT32 cluster 1 is reserved; other filesystems also
+	 * treat 0/1 as out-of-band. */
 	WARN_ON_ONCE((victim->flags & DC_VALID) &&
 		     !(victim->flags & DC_NEGATIVE) &&
 		     victim->start_cluster == 1);
-	unsigned long bucket =
-		dc_bucket_index(victim->parent_cluster, victim->name_hash);
-	uint64_t bucket_flags;
-	spin_lock_irqsave(&dc_hash[bucket].lock, &bucket_flags);
-	dc_entry_t **pp = &dc_hash[bucket].head;
-	while (*pp) {
-		if (*pp == victim) {
-			*pp = victim->hash_next;
-			break;
-		}
-		pp = &(*pp)->hash_next;
-	}
-	spin_unlock_irqrestore(&dc_hash[bucket].lock, bucket_flags);
-
 	kfree(victim);
 	__sync_fetch_and_sub(&dc_entry_count, 1);
 	__sync_fetch_and_add(&dc_stat_evictions, 1);
+	return 1;
 }
+
+/* ---- giving memory back ---------------------------------------------- */
+
+/* Every entry can go: lookups copy what they need out under the bucket
+ * lock (dcache_lookup_cs), so nobody holds an entry once that is dropped. */
+static unsigned long dc_shrink_count(void *arg)
+{
+	(void)arg;
+	return dc_entry_count;
+}
+
+static unsigned long dc_shrink_scan(void *arg, unsigned long nr)
+{
+	unsigned long freed = 0;
+
+	(void)arg;
+	while (freed < nr && dc_evict_one())
+		freed++;
+	return freed;
+}
+
+static struct vm_shrinker dc_shrinker = {
+	.name = "dcache",
+	.count = dc_shrink_count,
+	.scan = dc_shrink_scan,
+};
 
 // ============================================================================
 // Lookup
@@ -306,9 +353,9 @@ static dc_entry_t *dc_alloc_entry(const void *owner,
 {
 	might_sleep();
 	BUG_ON(name == NULL);
-	// Evict if at capacity
-	while (dc_entry_count >= DC_MAX_ENTRIES)
-		dc_evict_one();
+	// Past the ceiling, an old entry goes
+	while (dc_entry_count >= DC_MAX_ENTRIES && dc_evict_one())
+		;
 
 	dc_entry_t *e = (dc_entry_t *)kalloc(sizeof(dc_entry_t));
 	if (!e)

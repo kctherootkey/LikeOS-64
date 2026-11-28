@@ -219,6 +219,41 @@ static unsigned long ext4_file_size(ext4_file_t *ef)
 	return ef->size;
 }
 
+/* The page cache's page for page `idx' of the file, held, for a private
+ * mapping to map itself (vfs_ops_t.cache_page).  Looked up -- and read in
+ * on a miss -- under the same locks as a read (ext4_read_at_impl), after
+ * the same write-behind flush the read entry points do (the caller,
+ * ext4_cache_page_op).  NULL for a page not wholly inside the file: the
+ * mapping then reads a copy, whose tail past the end is zeroed. */
+pc_page_t *ext4_cache_page_impl(vfs_file_t *f, unsigned long idx)
+{
+	ext4_file_t *ef = f ? (ext4_file_t *)f->fs_private : 0;
+	pc_page_t *pg = NULL;
+
+	if (!ef || !ef->fs || ef->is_dir)
+		return NULL;
+
+	ext4_fs_t *fs = ef->fs;
+	unsigned long ino = ef->ino;
+	unsigned long chain_id = EXT4_BID_ENC(ino, 0);
+
+	if (idx > (~0UL / PAGE_SIZE) - 1)
+		return NULL;
+	ext4_ilock_shared(fs, ino);
+	ext4_meta_rlock(fs);
+	unsigned long size = ext4_file_size(ef);
+
+	if ((idx + 1) * PAGE_SIZE <= size)
+		pg = pagecache_get_held(chain_id, idx, size, &fs->sb, chain_id);
+	ext4_meta_runlock(fs);
+	ext4_iunlock_shared(fs, ino);
+	if (pg && !pg->data) {
+		pagecache_put(pg);
+		pg = NULL;
+	}
+	return pg;
+}
+
 /* Pages a read takes under the locks before it copies them out. */
 #define EXT4_RBATCH 16
 
@@ -329,15 +364,11 @@ long ext4_read_impl(vfs_file_t *f, void *buf, long bytes)
 
 	if (!ef)
 		return ST_INVALID;
-	ra.last_page_index = ef->ra_last_page;
-	ra.sequential_count = ef->ra_seq_count;
-	ra.ra_pages = ef->ra_pages;
+	ra = ef->ra;
 	r = ext4_read_at_impl(f, buf, bytes, ef->pos, &ra);
 	if (r > 0) {
 		ef->pos += (unsigned long)r;
-		ef->ra_last_page = ra.last_page_index;
-		ef->ra_seq_count = ra.sequential_count;
-		ef->ra_pages = ra.ra_pages;
+		ef->ra = ra;
 	}
 	return r;
 }

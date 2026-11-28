@@ -37,6 +37,7 @@ void procfs_init(void);
 #include <kernel/io/tty.h>
 #include <kernel/fs/devfs.h>
 #include <kernel/mm/shm.h>
+#include <kernel/mm/vmscan.h>
 #include <kernel/hal/acpi.h>
 #include <kernel/ke/workqueue.h>
 #include <kernel/dev/gpio/gpiolib.h>
@@ -567,6 +568,9 @@ __no_stack_protector void continue_system_startup(void)
 	userinit_start();
 	storage_fs_set_ready(&g_storage_state);
 	keyboard_activate();
+
+	/* Gives memory back from the caches when free memory runs low. */
+	vm_reclaim_start();
 
 	{
 		task_t *t = sched_add_task(devpoll_thread, 0, g_devpoll_stack,

@@ -15,6 +15,7 @@
 #include <kernel/fs/pagecache.h>
 #include <kernel/fs/vfs_sb.h>
 #include <kernel/mm/memory.h>
+#include <kernel/mm/vmscan.h>
 #include <kernel/io/console.h>
 #include <kernel/dev/block/block.h>
 #include <kernel/ke/sched.h>
@@ -232,13 +233,18 @@ static pc_page_t *pc_page_alloc(void)
 	return pg;
 }
 
-// Free a pc_page_t descriptor + its physical data page.
+/* Free a pc_page_t descriptor and drop the cache's reference on its frame.
+ *
+ * A reference, not the frame: a private mapping of the file may map this
+ * very frame (vfs_ops_t.cache_page) and holds a reference of its own, so
+ * the frame stays for it after the cache has let go -- detached by a
+ * truncate, say -- and goes back to the allocator with the last of them. */
 static void pc_page_free(pc_page_t *pg)
 {
 	if (!pg)
 		return;
 	if (pg->phys_addr) {
-		mm_free_physical_page(pg->phys_addr);
+		mm_put_page(pg->phys_addr);
 		pg->phys_addr = 0;
 		pg->data = 0;
 	}
@@ -669,6 +675,16 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
 		if ((fl & PC_PAGE_LOCKED) || refcount_read(&pg->refs) != 1)
 			continue;
 
+		/* Skip pages a process has mapped: the frame is the mapping's
+		 * too (it holds a reference of its own on it), and dropping
+		 * the page from the cache would leave the mapping on a frame
+		 * the cache no longer knows -- a later read would bring the
+		 * same file page in a second time, and writes to the file
+		 * would no longer reach the mapping.  It becomes reclaimable
+		 * once the last mapping is gone. */
+		if (mm_get_page_refcount(pg->phys_addr) > 1)
+			continue;
+
 		// CLOCK: if referenced, clear and give second chance
 		if (fl & PC_PAGE_REFERENCED) {
 			pc_clear_flags(pg, PC_PAGE_REFERENCED);
@@ -896,18 +912,24 @@ void pagecache_reclaim_if_needed(void)
 	 * Clean pages can still be dropped, which is what relieves the
 	 * pressure; the dirty ones are handed to the thread whose job that is,
 	 * and become reclaimable once it has written them. */
-	if (free < PC_LOW_WATERMARK_PAGES) {
-		unsigned long target = PC_HIGH_WATERMARK_PAGES - free;
+	/* Below the low level the reclaim thread takes over (vmscan.c): it
+	 * frees the page cache and the other caches together, with no lock
+	 * held.  Only below the minimum, where the next allocations would
+	 * fail before that thread got its turn, does the reader drop clean
+	 * pages itself -- a bounded batch, up to the low level. */
+	if (free < vm_wmark_low())
+		vm_wake_reclaim();
+	if (free < vm_wmark_min()) {
+		unsigned long target = vm_wmark_low() - free;
 
+		if (target > 128)
+			target = 128;
 		if (target > pc_stat_total_pages)
 			target = pc_stat_total_pages;
 		if (target > 0)
 			pagecache_shrink(target, 0);
 		/* Ask for writeback so the dirty pages stop being unreclaimable. */
 		pc_writeback_pending = 1;
-	} else if (free < PC_HIGH_WATERMARK_PAGES) {
-		// Gentle: reclaim a small batch
-		pagecache_shrink(32, 0);
 	}
 }
 
@@ -2578,55 +2600,93 @@ void pagecache_invalidate_sb(struct vfs_superblock *sb)
 // Read-ahead
 // ============================================================================
 
+/* Bring [first, first+n) into the cache, clipped to the file.  Pages already
+ * there cost one lookup; a missing one is read together with the missing
+ * pages after it in one transfer where they are contiguous on disk (pc_get
+ * coalesces). */
+static void pc_readahead_window(unsigned long cluster_id, unsigned long first,
+				unsigned long n, unsigned long file_size,
+				struct vfs_superblock *sb,
+				unsigned long start_cluster)
+{
+	unsigned long file_pages = (file_size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+	for (unsigned long p = first; p < first + n && p < file_pages; p++) {
+		if (pagecache_lookup(sb, cluster_id, p))
+			continue;
+		pc_page_t *pg = pc_get(cluster_id, p, file_size, sb,
+				       start_cluster, 1);
+		if (!pg)
+			break; /* out of memory or an I/O error: the read
+				* itself will meet it, not the read-ahead */
+		pc_set_flags(pg, PC_PAGE_READAHEAD);
+		__sync_fetch_and_add(&pc_stat_readahead, 1);
+		pagecache_put(pg);
+	}
+}
+
+/* Called for every page a read takes, after taking it.
+ *
+ * Sequential reading -- the page after the last one, or the first page of
+ * the file -- opens a window of PC_READAHEAD_INIT pages after it.  The
+ * reader stepping into the window's trigger pages opens the next window,
+ * right after the current one and twice its size (up to PC_READAHEAD_MAX),
+ * so the reads stay ahead of it and grow while it keeps going.  Anything
+ * else is random access: the window is dropped, and nothing is read ahead
+ * until reading turns sequential again.
+ *
+ * Between triggers a read costs no lookups at all -- the window is not
+ * re-examined for every page, only fetched when it opens. */
 void pagecache_readahead(pc_readahead_t *ra, unsigned long cluster_id,
 			 unsigned long current_page, unsigned long file_size,
 			 struct vfs_superblock *sb, unsigned long start_cluster)
 {
+	int seq;
+
 	if (!ra || !pc_initialized)
 		return;
 
-	// Detect sequential access
-	if (current_page == ra->last_page_index + 1) {
-		ra->sequential_count++;
-		// Grow read-ahead window: 1, 2, 4, 8, 16
-		if (ra->sequential_count >= 2 &&
-		    ra->ra_pages < PC_READAHEAD_MAX)
-			ra->ra_pages =
-				(ra->ra_pages < 1) ? 1 : ra->ra_pages * 2;
-		if (ra->ra_pages > PC_READAHEAD_MAX)
-			ra->ra_pages = PC_READAHEAD_MAX;
-	} else {
-		// Non-sequential — reset
-		ra->sequential_count = 0;
-		ra->ra_pages = 0;
-	}
+	/* The start of the file counts as sequential while nothing else has
+	 * been read -- from zeroed state as well as from pc_readahead_init(). */
+	seq = current_page == ra->last_page_index + 1 ||
+	      (current_page == 0 && ra->sequential_count == 0 &&
+	       ra->ra_pages == 0);
+	if (current_page == ra->last_page_index && ra->sequential_count > 0)
+		return; /* the same page again: nothing new */
 	ra->last_page_index = current_page;
 
-	// Issue read-ahead if window > 0
-	if (ra->ra_pages <= 0)
+	if (!seq) {
+		ra->sequential_count = 0;
+		ra->ra_pages = 0;
+		ra->ra_async = 0;
 		return;
-
-	unsigned long file_pages = (file_size + PAGE_SIZE - 1) / PAGE_SIZE;
-
-	for (int i = 1; i <= ra->ra_pages; i++) {
-		unsigned long ahead_page = current_page + (unsigned long)i;
-		if (ahead_page >= file_pages)
-			break;
-
-		// Check if already cached
-		pc_page_t *existing = pagecache_lookup(sb, cluster_id, ahead_page);
-		if (existing)
-			continue;
-
-		// Fetch the page (will do disk I/O on miss)
-		pc_page_t *pg = pc_get(cluster_id, ahead_page, file_size, sb,
-				       start_cluster, 1);
-		if (pg) {
-			pc_set_flags(pg, PC_PAGE_READAHEAD);
-			__sync_fetch_and_add(&pc_stat_readahead, 1);
-			pagecache_put(pg);
-		}
 	}
+	ra->sequential_count++;
+
+	/* The window lies ahead of the reader: pages before it were read
+	 * ahead by the window before (or are the reader's own), so a reader
+	 * there just keeps going. */
+	if (ra->ra_pages <= 0 ||
+	    current_page >= ra->ra_start + (unsigned long)ra->ra_pages) {
+		/* No window, or the reader is past it: a fresh one. */
+		ra->ra_start = current_page + 1;
+		ra->ra_pages = PC_READAHEAD_INIT;
+		ra->ra_async = PC_READAHEAD_INIT;
+	} else if (current_page + (unsigned long)ra->ra_async >=
+		   ra->ra_start + (unsigned long)ra->ra_pages) {
+		/* Into the trigger: the next window, doubled. */
+		int size = ra->ra_pages * 2;
+
+		if (size > PC_READAHEAD_MAX)
+			size = PC_READAHEAD_MAX;
+		ra->ra_start += (unsigned long)ra->ra_pages;
+		ra->ra_pages = size;
+		ra->ra_async = size;
+	} else {
+		return; /* inside the window, before its trigger */
+	}
+	pc_readahead_window(cluster_id, ra->ra_start, (unsigned long)ra->ra_pages,
+			    file_size, sb, start_cluster);
 }
 
 // ============================================================================

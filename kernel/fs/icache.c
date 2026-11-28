@@ -20,6 +20,7 @@
 #include <kernel/ke/sched.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/fs/dcache.h>
+#include <kernel/mm/vmscan.h>
 
 // ============================================================================
 // Hash table bucket
@@ -40,6 +41,7 @@ static ic_bucket_t ic_hash[IC_HASH_BUCKETS];
 static ic_inode_t ic_lru_sentinel;
 static spinlock_t ic_lru_lock;
 static volatile uint64_t ic_entry_count;
+static volatile uint64_t ic_lru_count; /* unused inodes: what reclaim can free */
 /* Bytes currently held in block-chain arrays (inode->chain), for the
  * reclaimable-cache figure icache_mem_bytes() reports.  Updated at every
  * chain kalloc/kfree; entry structs themselves are counted via
@@ -66,6 +68,8 @@ static volatile uint64_t ic_stat_evictions;
 // ============================================================================
 
 static int ic_initialized = 0;
+static int ic_shrinker_registered;
+static struct vm_shrinker ic_shrinker;
 
 void icache_init(void)
 {
@@ -81,7 +85,12 @@ void icache_init(void)
 	ic_stat_hits = 0;
 	ic_stat_misses = 0;
 	ic_stat_evictions = 0;
+	ic_lru_count = 0;
 	ic_initialized = 1;
+	if (!ic_shrinker_registered) {
+		ic_shrinker_registered = 1;
+		vm_register_shrinker(&ic_shrinker);
+	}
 }
 
 // ============================================================================
@@ -99,6 +108,7 @@ static inline unsigned long ic_bucket_index(unsigned long start_cluster)
 
 static void ic_lru_add(ic_inode_t *n)
 {
+	ic_lru_count++;
 	n->lru_next = ic_lru_sentinel.lru_next;
 	n->lru_prev = &ic_lru_sentinel;
 	ic_lru_sentinel.lru_next->lru_prev = n;
@@ -107,6 +117,8 @@ static void ic_lru_add(ic_inode_t *n)
 
 static void ic_lru_remove(ic_inode_t *n)
 {
+	if (n->lru_prev || n->lru_next)
+		ic_lru_count--;
 	if (n->lru_prev)
 		n->lru_prev->lru_next = n->lru_next;
 	if (n->lru_next)
@@ -119,17 +131,16 @@ static void ic_lru_remove(ic_inode_t *n)
 // Eviction — evict one zero-refcount inode from LRU tail
 // ============================================================================
 
-static void ic_evict_one(void)
+/* 1 when an inode was freed, 0 when every cached inode is in use. */
+static int ic_evict_one(void)
 {
 	uint64_t lru_flags;
 	spin_lock_irqsave(&ic_lru_lock, &lru_flags);
 
 	ic_inode_t *victim = ic_lru_sentinel.lru_prev;
 	if (victim == &ic_lru_sentinel) {
-		WARN_ON_ONCE(
-			1); /* eviction called on empty LRU - cache accounting bug */
 		spin_unlock_irqrestore(&ic_lru_lock, lru_flags);
-		return; // empty
+		return 0; // empty
 	}
 	// Only evict zero-refcount inodes
 	if (victim->refcount > 0) {
@@ -138,19 +149,37 @@ static void ic_evict_one(void)
 			victim = victim->lru_prev;
 		if (victim == &ic_lru_sentinel) {
 			spin_unlock_irqrestore(&ic_lru_lock, lru_flags);
-			return; // all inodes are in use, can't evict
+			return 0; // all inodes are in use, can't evict
 		}
 	}
 	ic_lru_remove(victim);
 	spin_unlock_irqrestore(&ic_lru_lock, lru_flags);
 
-	BUG_ON(victim->refcount >
-	       0); /* evicting inode still in use: LRU contains a referenced inode, data corruption will follow */
 
 	// Remove from hash bucket
 	unsigned long bucket = ic_bucket_index(victim->start_cluster);
 	uint64_t bucket_flags;
 	spin_lock_irqsave(&ic_hash[bucket].lock, &bucket_flags);
+	/* Taken again between the two locks?  icache_get() finds inodes in
+	 * the hash and takes its reference under this bucket lock, so an
+	 * inode it got hold of meanwhile is in use now -- or was, and its
+	 * last put has parked it on the LRU again.  Either way it stays, and
+	 * nothing is freed.  Checked under the LRU lock too (the order
+	 * icache_get() takes them in): a put changes both under it. */
+	{
+		uint64_t lf;
+		int keep;
+
+		spin_lock_irqsave(&ic_lru_lock, &lf);
+		keep = victim->refcount > 0 || victim->lru_prev ||
+		       victim->lru_next;
+		spin_unlock_irqrestore(&ic_lru_lock, lf);
+		if (keep) {
+			spin_unlock_irqrestore(&ic_hash[bucket].lock,
+					       bucket_flags);
+			return 1;
+		}
+	}
 	ic_inode_t **pp = &ic_hash[bucket].head;
 	while (*pp) {
 		if (*pp == victim) {
@@ -167,7 +196,32 @@ static void ic_evict_one(void)
 	kfree(victim);
 	__sync_fetch_and_sub(&ic_entry_count, 1);
 	__sync_fetch_and_add(&ic_stat_evictions, 1);
+	return 1;
 }
+
+/* ---- giving memory back ---------------------------------------------- */
+
+static unsigned long ic_shrink_count(void *arg)
+{
+	(void)arg;
+	return ic_lru_count;
+}
+
+static unsigned long ic_shrink_scan(void *arg, unsigned long nr)
+{
+	unsigned long freed = 0;
+
+	(void)arg;
+	while (freed < nr && ic_evict_one())
+		freed++;
+	return freed;
+}
+
+static struct vm_shrinker ic_shrinker = {
+	.name = "icache",
+	.count = ic_shrink_count,
+	.scan = ic_shrink_scan,
+};
 
 // ============================================================================
 // Lookup
@@ -194,6 +248,27 @@ ic_inode_t *icache_lookup(struct vfs_superblock *sb, unsigned long start_cluster
 	spin_unlock_irqrestore(&ic_hash[bucket].lock, flags);
 	__sync_fetch_and_add(&ic_stat_misses, 1);
 	return 0;
+}
+
+/* Clear `flags' on a cached inode, if there is one.  Under the bucket
+ * lock: an inode nobody holds can be freed by reclaim at any moment, so a
+ * pointer from icache_lookup() must not be written through afterwards. */
+void icache_clear_flags(struct vfs_superblock *sb, unsigned long start_cluster,
+			uint32_t flags)
+{
+	if (!ic_initialized || start_cluster < 2)
+		return;
+
+	unsigned long bucket = ic_bucket_index(start_cluster);
+	uint64_t bf;
+	spin_lock_irqsave(&ic_hash[bucket].lock, &bf);
+	for (ic_inode_t *n = ic_hash[bucket].head; n; n = n->hash_next) {
+		if (n->start_cluster == start_cluster && n->sb == sb) {
+			n->flags &= ~flags;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&ic_hash[bucket].lock, bf);
 }
 
 // ============================================================================
@@ -249,9 +324,9 @@ ic_inode_t *icache_get(struct vfs_superblock *sb, unsigned long start_cluster,
 	}
 	spin_unlock_irqrestore(&ic_hash[bucket].lock, flags);
 
-	// Not found — allocate new inode
-	while (ic_entry_count >= IC_MAX_ENTRIES)
-		ic_evict_one();
+	// Not found — allocate new inode (past the ceiling, an old one goes)
+	while (ic_entry_count >= IC_MAX_ENTRIES && ic_evict_one())
+		;
 
 	ic_inode_t *inode = (ic_inode_t *)kalloc(sizeof(ic_inode_t));
 	if (!inode)
@@ -310,18 +385,28 @@ void icache_ref(ic_inode_t *inode)
 int icache_flag_if_referenced(struct vfs_superblock *sb,
 			      unsigned long start_cluster, uint32_t flag)
 {
-	ic_inode_t *n = icache_lookup(sb, start_cluster);
-	uint64_t flags;
+	uint64_t bf, flags;
 	int held = 0;
 
-	if (!n)
+	if (!ic_initialized || start_cluster < 2)
 		return 0;
-	spin_lock_irqsave(&ic_lru_lock, &flags);
-	if (n->refcount > 0) {
-		n->flags |= flag;
-		held = 1;
+	/* Found and used under the bucket lock: an unused inode can be freed
+	 * by reclaim the moment that lock is dropped (ic_evict_one unhashes
+	 * under it before freeing). */
+	unsigned long bucket = ic_bucket_index(start_cluster);
+	spin_lock_irqsave(&ic_hash[bucket].lock, &bf);
+	for (ic_inode_t *n = ic_hash[bucket].head; n; n = n->hash_next) {
+		if (n->start_cluster != start_cluster || n->sb != sb)
+			continue;
+		spin_lock_irqsave(&ic_lru_lock, &flags);
+		if (n->refcount > 0) {
+			n->flags |= flag;
+			held = 1;
+		}
+		spin_unlock_irqrestore(&ic_lru_lock, flags);
+		break;
 	}
-	spin_unlock_irqrestore(&ic_lru_lock, flags);
+	spin_unlock_irqrestore(&ic_hash[bucket].lock, bf);
 	return held;
 }
 
@@ -688,6 +773,36 @@ static int ic_chain_extend(ic_inode_t *inode, unsigned long target_idx,
 	return 1;
 }
 
+/* Find a cached inode and take a reference on it, under the bucket lock --
+ * the same rule icache_get() follows -- so reclaim, which frees only unused
+ * inodes and only after unhashing them under that lock, cannot free it
+ * while it is being used.  Put with icache_unref().  NULL when not cached. */
+static ic_inode_t *ic_lookup_ref(struct vfs_superblock *sb,
+				 unsigned long start_cluster)
+{
+	unsigned long bucket = ic_bucket_index(start_cluster);
+	ic_inode_t *found = NULL;
+	uint64_t bf;
+
+	spin_lock_irqsave(&ic_hash[bucket].lock, &bf);
+	for (ic_inode_t *n = ic_hash[bucket].head; n; n = n->hash_next) {
+		if (n->start_cluster != start_cluster || n->sb != sb)
+			continue;
+		if (__sync_fetch_and_add(&n->refcount, 1) == 0 &&
+		    (n->lru_prev || n->lru_next)) {
+			uint64_t lf;
+
+			spin_lock_irqsave(&ic_lru_lock, &lf);
+			ic_lru_remove(n);
+			spin_unlock_irqrestore(&ic_lru_lock, lf);
+		}
+		found = n;
+		break;
+	}
+	spin_unlock_irqrestore(&ic_hash[bucket].lock, bf);
+	return found;
+}
+
 unsigned long icache_chain_get(unsigned long start_cluster, unsigned long idx,
 			       struct vfs_superblock *sb)
 {
@@ -696,8 +811,8 @@ unsigned long icache_chain_get(unsigned long start_cluster, unsigned long idx,
 
 	unsigned long eoc = vfs_sb_end_of_chain(sb);
 
-	// Look up the inode
-	ic_inode_t *inode = icache_lookup(sb, start_cluster);
+	// Look up the inode (held: see ic_lookup_ref)
+	ic_inode_t *inode = ic_lookup_ref(sb, start_cluster);
 	if (!inode) {
 		// No cached inode — fall back to linear walk via sb ops.
 		unsigned long cur = start_cluster;
@@ -724,7 +839,8 @@ unsigned long icache_chain_get(unsigned long start_cluster, unsigned long idx,
 	// hold across ic_chain_extend's sleeping next_block()/kfree(), and readers
 	// of DIFFERENT inodes never contend.  Chain teardown (icache_chain_invalidate,
 	// eviction) runs only under the metadata lock held EXCLUSIVE, which excludes
-	// every shared reader, so it needs no additional guard.
+	// every shared reader, so it needs no additional guard.  Reclaim frees
+	// only inodes nobody holds, and this one is held until the end.
 	icache_io_lock(inode);
 	unsigned long result;
 	if (idx < inode->chain_len)
@@ -734,6 +850,7 @@ unsigned long icache_chain_get(unsigned long start_cluster, unsigned long idx,
 	else
 		result = 0;
 	icache_io_unlock(inode);
+	icache_unref(inode);
 	return result;
 }
 
@@ -743,7 +860,7 @@ void icache_chain_invalidate(struct vfs_superblock *sb,
 	if (!ic_initialized || start_cluster < 2)
 		return;
 
-	ic_inode_t *inode = icache_lookup(sb, start_cluster);
+	ic_inode_t *inode = ic_lookup_ref(sb, start_cluster);
 	if (!inode)
 		return;
 
@@ -754,6 +871,7 @@ void icache_chain_invalidate(struct vfs_superblock *sb,
 		inode->chain_len = 0;
 		inode->chain_cap = 0;
 	}
+	icache_unref(inode);
 }
 
 // ============================================================================

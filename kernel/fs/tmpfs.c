@@ -314,6 +314,7 @@ static int tfs_grow_pages(struct tfs_inode *n, unsigned long want)
 		mm_memset(phys_to_virt(p), 0, PAGE_SIZE);
 		n->pages[n->npages++] = p;
 		sb->used_pages++;
+		mm_shmem_account(1);
 	}
 	return ST_OK;
 }
@@ -327,6 +328,7 @@ static void tfs_shrink_pages(struct tfs_inode *n, unsigned long keep)
 		n->npages--;
 		mm_free_physical_page(n->pages[n->npages]);
 		sb->used_pages--;
+		mm_shmem_account(-1);
 	}
 	if (keep == 0 && n->pages) {
 		kfree(n->pages);

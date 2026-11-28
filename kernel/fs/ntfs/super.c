@@ -1387,6 +1387,8 @@ static void ntfs_fs_release(ntfs_fs_t *fs)
 {
 	if (!fs)
 		return;
+	/* First: waits for a scan of this filesystem in progress. */
+	vm_unregister_shrinker(&fs->shrinker);
 	if (fs->sb.ops)
 		vfs_sb_release_caches(&fs->sb);
 	ntfs_streams_release(fs);
@@ -1818,6 +1820,7 @@ static int ntfs_fst_mount(vfs_mount_t *m, struct block_device *bdev,
 			bdev->name ? bdev->name : "?", fs->ro_reason);
 		m->flags |= VFS_MS_RDONLY;
 	}
+	ntfs_shrinker_register(fs);
 	m->ops = &ntfs_vfs_ops;
 	m->fs_data = fs;
 	m->sb = &fs->sb;

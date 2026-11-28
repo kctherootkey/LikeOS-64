@@ -1291,10 +1291,8 @@ static int ext4_set_mode_locked(ext4_fs_t *fs, unsigned long ino, unsigned mode)
 	ext4_inode_cache_flush(fs);
 	/* A mode change can re-add a set-id bit: invalidate the per-inode strip
      * hint (S_NOSEC analog) for every handle, so the next non-root modify
-     * re-evaluates.  Peek the cache without taking a ref. */
-	ic_inode_t *ic = icache_lookup(&fs->sb, EXT4_BID_ENC(ino, 0));
-	if (ic)
-		ic->flags &= ~(uint32_t)IC_SETID_CLEAN;
+     * re-evaluates.  Without taking a ref, under the cache's own lock. */
+	icache_clear_flags(&fs->sb, EXT4_BID_ENC(ino, 0), IC_SETID_CLEAN);
 	return ext4_write_inode_struct(fs, ino, &in) == ST_OK ? ST_OK : ST_IO;
 }
 

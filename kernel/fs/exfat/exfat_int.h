@@ -54,6 +54,8 @@
 #ifndef LIKEOS_EXFAT_INT_H
 #define LIKEOS_EXFAT_INT_H
 
+#include <kernel/mm/vmscan.h>
+
 /* ===========================================================================
  * 1. Configuration and in-memory types
  * =========================================================================== */
@@ -65,9 +67,12 @@
 /* Buckets of the stream key table. */
 #define EXFAT_KHASH 1024
 
-/* Unreferenced streams kept for a quick reopen before the oldest is
- * forgotten (its pages dropped, its handle freed). */
-#define EXFAT_STREAM_LRU_MAX 1024
+/* Unreferenced streams stay for a quick reopen -- with their cached pages,
+ * which are keyed by the stream's handle and go with it -- until memory
+ * runs short: the reclaim thread forgets the oldest through the
+ * filesystem's shrinker (exfat_shrink_scan).  This is only a ceiling
+ * against unbounded growth, not the number they are trimmed to. */
+#define EXFAT_STREAM_LRU_MAX 65536
 
 /* Largest extent array one stream may decode to (16 bytes each: 16 MB for
  * a file fragmented into a million pieces).  Beyond it the stream is
@@ -406,6 +411,8 @@ struct exfat_fs {
 	exfat_stream_t *khash[EXFAT_KHASH];
 	exfat_stream_t *lru_head, *lru_tail; /* head = most recent */
 	unsigned lru_count;
+	/* Gives unreferenced streams back under memory pressure. */
+	struct vm_shrinker shrinker;
 	unsigned nstreams;
 	exfat_stream_t *root;
 	exfat_stream_t *dirty_head; /* streams with meta_dirty (held) */
@@ -664,6 +671,7 @@ void exfat_stream_hold(exfat_stream_t *st);
 void exfat_stream_free(exfat_stream_t *st);
 void exfat_stream_put(exfat_stream_t *st);
 void exfat_stream_maint(exfat_fs_t *fs);
+void exfat_shrinker_register(exfat_fs_t *fs);
 int exfat_stream_decode(exfat_fs_t *fs, exfat_stream_t *st);
 exfat_stream_t *exfat_stream_get(exfat_fs_t *fs, exfat_stream_t *parent,
 				 const exfat_dentry_info_t *di,

@@ -232,6 +232,31 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 				page_flags |= PAGE_DIRTY;
 		}
 
+		/* Write permission on a page of a private mapping that is not
+		 * this mapping's alone -- copy-on-write after fork, or a page
+		 * of the page cache that a private file mapping maps -- is
+		 * granted the way a write fault grants it: the entry stays
+		 * read-only, marked copy-on-write, and the first write copies
+		 * the page.  Setting the write bit directly would let this
+		 * process write into a frame others still map (the other side
+		 * of a fork, every process using the same library page, the
+		 * cached file itself).  Taking write permission away also
+		 * takes the copy-on-write mark: such a page must fault, not be
+		 * copied, when written. */
+		if ((page_flags & PAGE_WRITABLE) && !(page_flags & PAGE_DEVICE)) {
+			uint64_t *pte =
+				mm_get_page_table_from_pml4(pml4, vaddr, false);
+			mmap_region_t *pr =
+				mm_find_mmap_region(task_mm_owner(cur), vaddr);
+			int shared_map = pr && (pr->flags & MAP_SHARED);
+
+			if (pte && !shared_map &&
+			    ((*pte & PAGE_COW) ||
+			     mm_get_page_refcount(phys & ~0xFFFULL) > 1))
+				page_flags = (page_flags & ~PAGE_WRITABLE) |
+					     PAGE_COW;
+		}
+
 		// Remap with new protection
 		mm_map_page_in_address_space(pml4, vaddr, phys, page_flags);
 	}

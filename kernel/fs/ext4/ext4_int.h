@@ -36,6 +36,7 @@
 #include <kernel/fs/mount.h>
 #include <kernel/fs/kdev_t.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/mm/vmscan.h>
 #include <kernel/dev/block/blk_internal.h>
 
 /* ext4_fs_t.mnt_opts: what a mount(2) asked for beyond its flags. */
@@ -136,11 +137,20 @@ typedef struct ext4_rhold {
 
 #define EXT4_BGLOCKS 32
 
-/* Sized so a metadata-heavy operation's whole working set stays resident: a big
- * directory grows to many leaf/index blocks, and a create/delete loop touches
- * dozens of inode-table + bitmap + dir blocks.  256 * 4 KB = up to 1 MB, buffers
- * allocated on demand.  (Was 32, which thrashed on htree-sized directories.) */
-#define EXT4_MBC_ENTRIES 256
+/* Metadata block cache: buckets of the block-number hash.  The cache itself
+ * has no fixed size -- see "Metadata block cache" in buffer.c. */
+#define EXT4_MBC_HASH 16384
+
+/* One cached metadata block. */
+struct ext4_mbc_ent {
+	unsigned long pbn;
+	uint8_t *data; /* `size' bytes                                  */
+	unsigned size; /* allocated bytes (buffer-cache accounting)     */
+	int verified; /* type-specific csum already checked once       */
+	int page; /* data is a whole page of its own (not kalloc)  */
+	struct ext4_mbc_ent *hnext; /* hash chain                      */
+	struct ext4_mbc_ent *lru_prev, *lru_next; /* most recent first */
+};
 
 #define EXT4_BPOOL 16
 
@@ -190,15 +200,12 @@ struct ext4_state {
 	ext4_rhold_t meta_rh[EXT4_META_TRACK];
 	ext4_rhold_t ilock_rh[EXT4_ILOCKS][EXT4_ILOCK_TRACK];
 
-	/* Metadata block cache. */
-	struct {
-		unsigned long pbn; /* 0 = empty slot               */
-		uint8_t *data; /* block_size bytes             */
-		unsigned size; /* allocated bytes (for buffer-cache accounting) */
-		int verified; /* type-specific csum already checked once */
-	} mbc[EXT4_MBC_ENTRIES];
-	unsigned mbc_next;
+	/* Metadata block cache (buffer.c). */
+	struct ext4_mbc_ent **mbc_hash; /* EXT4_MBC_HASH chains             */
+	struct ext4_mbc_ent mbc_lru; /* sentinel: most recent at lru_next  */
+	unsigned long mbc_count;
 	spinlock_t mbc_lock;
+	struct vm_shrinker mbc_shrinker; /* gives blocks back under pressure */
 
 	/* Recycled scratch block buffers. */
 	struct {
@@ -514,6 +521,7 @@ void ext4_meta_runlock(ext4_fs_t *fs);
 int ext4_meta_held_excl(ext4_fs_t *fs);
 
 void ext4_ilock_shared(ext4_fs_t *fs, unsigned long ino);
+pc_page_t *ext4_cache_page_impl(vfs_file_t *f, unsigned long idx);
 
 void ext4_iunlock_shared(ext4_fs_t *fs, unsigned long ino);
 
@@ -540,6 +548,11 @@ void ext4_mbc_mark_verified(ext4_fs_t *fs, unsigned long pbn);
 void ext4_mbc_invalidate(ext4_fs_t *fs);
 
 void ext4_mbc_drop(ext4_fs_t *fs, unsigned long pbn);
+/* Set up / tear down the cache of a filesystem's state (super.c). */
+int ext4_mbc_init(ext4_fs_t *fs);
+void ext4_mbc_destroy(ext4_fs_t *fs);
+/* Refresh the cached copy of a block just written to the device. */
+void ext4_mbc_written(ext4_fs_t *fs, unsigned long pbn, const void *buf);
 
 int ext4_read_block(ext4_fs_t *fs, unsigned long pbn, void *buf);
 

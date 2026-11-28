@@ -34,6 +34,7 @@
 #include <kernel/dev/block/block.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/fs/vfs_sb.h>
+#include <kernel/fs/pagecache.h>
 
 /* ===================================================================
  * On-disk structures (little-endian; x86-64 is LE so direct access OK)
@@ -541,10 +542,8 @@ typedef struct ext4_file {
 	unsigned long parent_ino;
 	/* directory iteration cursor (byte offset into the directory file)      */
 	unsigned long dir_pos;
-	/* page-cache read-ahead state (mirrors fat32_file_t)                    */
-	unsigned long ra_last_page;
-	int ra_seq_count;
-	int ra_pages;
+	/* page-cache read-ahead state of the descriptor                        */
+	pc_readahead_t ra;
 	void *inode; /* ic_inode_t* from icache           */
 } ext4_file_t;
 

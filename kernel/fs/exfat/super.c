@@ -1335,6 +1335,8 @@ static void exfat_streams_destroy(exfat_fs_t *fs)
 
 static void exfat_fs_free(exfat_fs_t *fs)
 {
+	/* First: waits for a scan of this filesystem in progress. */
+	vm_unregister_shrinker(&fs->shrinker);
 	exfat_streams_destroy(fs);
 	exfat_mc_destroy(fs);
 	if (fs->upcase)
@@ -1563,6 +1565,7 @@ static int exfat_fst_mount(vfs_mount_t *m, struct block_device *bdev,
 	if (fs->was_dirty)
 		kprintf("exfat: %s: volume was not cleanly unmounted; mounted read-write because of 'force' (it stays marked dirty)\n",
 			b->name);
+	exfat_shrinker_register(fs);
 	m->ops = &exfat_vfs_ops;
 	m->fs_data = fs;
 	m->sb = &fs->sb;

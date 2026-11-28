@@ -35,8 +35,11 @@ struct vfs_superblock; /* forward — see vfs_sb.h                    */
 #define PC_LOW_WATERMARK_PAGES 512 // ~2MB — critical, must evict now
 #define PC_HIGH_WATERMARK_PAGES 2048 // ~8MB — start gentle background eviction
 
-// Read-ahead: max pages to prefetch on sequential access
-#define PC_READAHEAD_MAX 16 // 64KB read-ahead
+/* Read-ahead on sequential reads: the first window is PC_READAHEAD_INIT
+ * pages past the page being read, each following one twice the size of the
+ * one before, up to PC_READAHEAD_MAX (128 KB). */
+#define PC_READAHEAD_INIT 4
+#define PC_READAHEAD_MAX 32
 
 // Dirty writeback interval in timer ticks (~100 Hz, so 500 = ~5 seconds)
 #define PC_WRITEBACK_INTERVAL 500
@@ -119,12 +122,30 @@ typedef struct pc_page {
 	struct pc_page *dirty_next;
 } pc_page_t;
 
-// Per-file read-ahead state, embedded in fat32_file_t.
+/* Per-file read-ahead state (one per open file, or per positioned read).
+ *
+ * A sequential reader has a window: the pages [ra_start, ra_start+ra_pages)
+ * already read ahead.  Its last ra_async pages are the trigger: the reader
+ * reaching the first of them starts the next window, so the reads stay a
+ * window ahead of the reader instead of starting when it runs out.  Zeroed
+ * (or pc_readahead_init()) is the state of a file nothing has been read
+ * from. */
 typedef struct pc_readahead {
 	unsigned long last_page_index; // Last page accessed
 	int sequential_count; // Consecutive sequential accesses
-	int ra_pages; // Current read-ahead window size
+	int ra_pages; // Size of the current window, 0 for none
+	unsigned long ra_start; // First page of the current window
+	int ra_async; // Pages at the window's end that trigger the next one
 } pc_readahead_t;
+
+static inline void pc_readahead_init(pc_readahead_t *ra)
+{
+	ra->last_page_index = (unsigned long)-1;
+	ra->sequential_count = 0;
+	ra->ra_pages = 0;
+	ra->ra_start = 0;
+	ra->ra_async = 0;
+}
 
 // ============================================================================
 // API

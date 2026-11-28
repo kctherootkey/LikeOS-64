@@ -44,6 +44,7 @@
 #ifndef LIKEOS_FAT_INT_H
 #define LIKEOS_FAT_INT_H
 
+#include <kernel/mm/vmscan.h>
 #include <kernel/fs/fat32/fat32.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/fs/vfs_sb.h>
@@ -73,9 +74,12 @@
 /* Buckets of the stream key table. */
 #define FAT_KHASH 1024
 
-/* Unreferenced streams kept for a quick reopen before the oldest is
- * forgotten (its pages dropped, its handle freed). */
-#define FAT_STREAM_LRU_MAX 1024
+/* Unreferenced streams stay for a quick reopen -- with their cached pages,
+ * which are keyed by the stream's handle and go with it -- until memory
+ * runs short: the reclaim thread forgets the oldest through the
+ * filesystem's shrinker (fat_shrink_scan).  This is only a ceiling against
+ * unbounded growth, not the number they are trimmed to. */
+#define FAT_STREAM_LRU_MAX 65536
 
 /* Largest extent array one stream may decode to (16 bytes each).  Beyond it
  * the stream is refused with ST_NOMEM rather than taking unbounded memory. */
@@ -451,6 +455,8 @@ struct fat_fs {
 	fat_stream_t *khash[FAT_KHASH];
 	fat_stream_t *lru_head, *lru_tail; /* head = most recent */
 	unsigned lru_count;
+	/* Gives unreferenced streams back under memory pressure. */
+	struct vm_shrinker shrinker;
 	unsigned nstreams;
 	fat_stream_t *root;
 	fat_stream_t *dirty_head; /* streams with meta_dirty (held) */

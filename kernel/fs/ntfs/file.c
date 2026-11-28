@@ -2231,15 +2231,11 @@ long ntfs_read(vfs_file_t *f, void *buf, long bytes)
 
 	if (!nf)
 		return ST_INVALID;
-	ra.last_page_index = nf->ra_last_page;
-	ra.sequential_count = nf->ra_seq_count;
-	ra.ra_pages = nf->ra_pages;
+	ra = nf->ra;
 	r = ntfs_read_common(nf, buf, bytes, nf->pos, &ra);
 	if (r > 0) {
 		nf->pos += (unsigned long)r;
-		nf->ra_last_page = ra.last_page_index;
-		nf->ra_seq_count = ra.sequential_count;
-		nf->ra_pages = ra.ra_pages;
+		nf->ra = ra;
 	}
 	return r;
 }
@@ -2251,9 +2247,7 @@ long ntfs_read_at(vfs_file_t *f, void *buf, long bytes, long off)
 
 	if (!nf || off < 0)
 		return ST_INVALID;
-	ra.last_page_index = 0;
-	ra.sequential_count = 0;
-	ra.ra_pages = 0;
+	pc_readahead_init(&ra);
 	return ntfs_read_common(nf, buf, bytes, (uint64_t)off, &ra);
 }
 

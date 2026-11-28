@@ -4313,9 +4313,7 @@ static int isofs_open_common(vfs_mount_t *m, const char *path, int flags,
 	ff->is_dir = (w->node.flags & ISOFS_NF_DIR) != 0;
 	ff->parent_ino = parent;
 	ff->pos = 0;
-	ff->ra.last_page_index = (unsigned long)-1;
-	ff->ra.sequential_count = 0;
-	ff->ra.ra_pages = 0;
+	pc_readahead_init(&ff->ra);
 	isofs_fill_kstat(fs, &w->node, &ff->kst);
 	if (st && !ff->is_dir)
 		/* The inode cache's entry for the open file, keyed by the
@@ -4406,9 +4404,7 @@ static long isofs_read_at_op(vfs_file_t *f, void *buf, long bytes, long off)
 		return ST_INVALID;
 	if (ff->is_dir)
 		return ST_ISDIR;
-	ra.last_page_index = (unsigned long)-1;
-	ra.sequential_count = 0;
-	ra.ra_pages = 0;
+	pc_readahead_init(&ra);
 	return isofs_read_stream(ff, buf, bytes, (uint64_t)off, &ra);
 }
 

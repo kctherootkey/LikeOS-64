@@ -44,6 +44,7 @@ struct vfs_mount;
 typedef struct vfs_mount vfs_mount_t;
 struct vfs_superblock;
 struct block_device;
+struct pc_page; /* fs/pagecache.h */
 
 /* Times for the utimens/futimens ops.  A nanosecond field may hold
  * VFS_UTIME_NOW (use the current time) or VFS_UTIME_OMIT (leave as it is). */
@@ -230,6 +231,16 @@ typedef struct {
 	 * shares its handle with the caller's open descriptor -- see
 	 * vfs_pread(). */
 	long (*read_at)(vfs_file_t *f, void *buf, long bytes, long off);
+	/* The page cache's own page holding page `idx' of the file, held
+	 * (pagecache_put() when done), or NULL.
+	 *
+	 * Optional, and only for whole pages that lie inside the file: a
+	 * private mapping maps this frame itself instead of a copy of it,
+	 * so every process mapping the same library page shares one frame
+	 * (copied on its first write).  Without it, or for the last partial
+	 * page of a file, demand paging reads a private copy through
+	 * read_at. */
+	struct pc_page *(*cache_page)(vfs_file_t *f, unsigned long idx);
 	/* Write at an explicit offset without touching the handle's position
 	 * (pwrite).  The position is the call's own: a concurrent read(),
 	 * write() or lseek() on the same description neither moves it nor is
@@ -479,6 +490,8 @@ long vfs_read(vfs_file_t *f, void *buf, long bytes);
  * the filesystem can read positionally; falls back to seek/read/seek-back
  * under the handle's page-in flag when it cannot. */
 long vfs_pread(vfs_file_t *f, void *buf, long bytes, long off);
+/* The file's ops->cache_page, or NULL when it has none (see there). */
+struct pc_page *vfs_cache_page(vfs_file_t *f, unsigned long idx);
 long vfs_write(vfs_file_t *f, const void *buf, long bytes);
 /* Write `bytes' at `off' without moving the handle's position (pwrite):
  * the filesystem's ->write_at, else seek/write/seek-back under the handle's

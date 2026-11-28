@@ -661,6 +661,7 @@ extern const uint16_t ntfs_i30_name[4];
 void ntfs_lru_del(ntfs_fs_t *fs, ntfs_stream_t *st);
 void ntfs_stream_ref(ntfs_fs_t *fs, ntfs_stream_t *st);
 void ntfs_stream_put(ntfs_fs_t *fs, ntfs_stream_t *st);
+void ntfs_shrinker_register(ntfs_fs_t *fs);
 ntfs_stream_t *ntfs_stream_find_locked(ntfs_fs_t *fs, uint64_t no,
 				       uint16_t seq, uint32_t type,
 				       const uint16_t *name,

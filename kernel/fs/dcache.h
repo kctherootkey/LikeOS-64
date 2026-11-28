@@ -21,11 +21,14 @@
 // Configuration
 // ============================================================================
 
-#define DC_HASH_BUCKETS 1024
+#define DC_HASH_BUCKETS 8192
 #define DC_HASH_MASK (DC_HASH_BUCKETS - 1)
 
-// Maximum cached dentries before LRU eviction kicks in
-#define DC_MAX_ENTRIES 4096
+/* Entries stay cached until memory runs short: the reclaim thread frees
+ * them, least recently used first, through the cache's shrinker
+ * (vmscan.h).  This is only a ceiling against unbounded growth -- about 32
+ * entries per hash chain -- not the working size the cache is trimmed to. */
+#define DC_MAX_ENTRIES (DC_HASH_BUCKETS * 32)
 
 // Maximum filename length we cache (longer names bypass the cache)
 #define DC_NAME_MAX 255

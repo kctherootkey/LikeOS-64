@@ -969,6 +969,157 @@ static void test_wb_errors_bs(unsigned long bs)
 	tfs_done(&fs);
 }
 
+/* ---- 6. frames a process maps -------------------------------------------- */
+
+/* A private mapping maps the cache's frame and takes a reference of its own
+ * (mm/memory.c): reclaim must leave such a page alone, invalidation must
+ * not free the frame under the mapping, and the frame goes with the last
+ * reference. */
+static void test_mapped_frames(void)
+{
+	struct tfs fs;
+	uint8_t src[PAGE_SIZE];
+	long pages0 = test_pages;
+
+	printf("mapped frames: reclaim and invalidation\n");
+	tfs_init(&fs, 4096, &t_ops_plain);
+	fs.st[1].nblocks = 4;
+
+	fill(src, 7);
+	pc_page_t *a = pagecache_install(&fs.sb, CID(1), 0, src, PAGE_SIZE, 1);
+	pc_page_t *b = pagecache_install(&fs.sb, CID(1), 1, src, PAGE_SIZE, 1);
+	CHECK(a && b);
+	if (!a || !b)
+		return;
+	uint64_t aphys = a->phys_addr;
+	uint8_t *adata = a->data;
+
+	/* `a' is mapped by a process; `b' is not. */
+	mm_get_page(aphys);
+	pagecache_put(a);
+	pagecache_put(b);
+	CHECK(mm_get_page_refcount(aphys) == 2);
+
+	/* Two passes: the first only takes the referenced bits. */
+	pagecache_shrink(16, 0);
+	pagecache_shrink(16, 0);
+	CHECK(pagecache_lookup(&fs.sb, CID(1), 0) != 0); /* mapped: kept */
+	CHECK(pagecache_lookup(&fs.sb, CID(1), 1) == 0); /* reclaimed */
+	CHECK(test_pages == pages0 + 1);
+
+	/* Invalidation detaches the page, the frame stays for the mapping
+	 * with its contents. */
+	pagecache_invalidate_file(&fs.sb, CID(1));
+	CHECK(pagecache_lookup(&fs.sb, CID(1), 0) == 0);
+	CHECK(test_pages == pages0 + 1);
+	CHECK(mm_get_page_refcount(aphys) == 1);
+	CHECK(memcmp(adata, src, PAGE_SIZE) == 0);
+
+	/* The mapping goes: so does the frame. */
+	mm_put_page(aphys);
+	CHECK(test_pages == pages0);
+
+	/* Mapped, then unmapped while cached: reclaimable again. */
+	pc_page_t *c = pagecache_install(&fs.sb, CID(1), 2, src, PAGE_SIZE, 1);
+	CHECK(c != 0);
+	if (c) {
+		uint64_t cphys = c->phys_addr;
+
+		mm_get_page(cphys);
+		pagecache_put(c);
+		pagecache_shrink(16, 0);
+		pagecache_shrink(16, 0);
+		CHECK(pagecache_lookup(&fs.sb, CID(1), 2) != 0);
+		mm_put_page(cphys);
+		pagecache_shrink(16, 0);
+		pagecache_shrink(16, 0);
+		CHECK(pagecache_lookup(&fs.sb, CID(1), 2) == 0);
+	}
+	CHECK(test_pages == pages0);
+	tfs_done(&fs);
+}
+
+/* ---- 7. read-ahead windows ------------------------------------------------ */
+
+static int cached(struct tfs *fs, unsigned h, unsigned long pi)
+{
+	return pagecache_lookup(&fs->sb, CID(h), pi) != 0;
+}
+
+static void test_readahead(void)
+{
+	struct tfs fs;
+	struct tstream *s;
+	pc_readahead_t ra;
+	unsigned long size = 64UL * PAGE_SIZE;
+
+	printf("read-ahead windows\n");
+	disk_reset();
+	tfs_init(&fs, 4096, &t_ops_plain);
+	s = &fs.st[1];
+	s->nblocks = 64;
+	/* Not contiguous on the disk: every page is its own read, so what
+	 * is cached is what read-ahead asked for (a contiguous file would be
+	 * read 16 pages at a time by the coalesced read). */
+	for (unsigned long b = 0; b < 64; b++)
+		s->lba[b] = 2000 + b * 16;
+
+	/* Sequential from the start: 4 pages ahead, then 8, 16, 32 -- each
+	 * window opened when the reader enters the one before. */
+	pc_readahead_init(&ra);
+	for (unsigned long pi = 0; pi < 64; pi++) {
+		pc_page_t *pg = pagecache_get_held(CID(1), pi, size, &fs.sb,
+						   CID(1));
+
+		CHECK(pg != 0);
+		pagecache_put(pg);
+		pagecache_readahead(&ra, CID(1), pi, size, &fs.sb, CID(1));
+		if (pi == 0) {
+			CHECK(cached(&fs, 1, 4) && !cached(&fs, 1, 5));
+			CHECK(ra.ra_start == 1 && ra.ra_pages == 4);
+		}
+		if (pi == 1) {
+			CHECK(cached(&fs, 1, 12) && !cached(&fs, 1, 13));
+			CHECK(ra.ra_start == 5 && ra.ra_pages == 8);
+		}
+		if (pi == 4)
+			CHECK(ra.ra_start == 5 && !cached(&fs, 1, 13));
+		if (pi == 5) {
+			CHECK(cached(&fs, 1, 28) && !cached(&fs, 1, 29));
+			CHECK(ra.ra_pages == 16);
+		}
+		if (pi == 13) {
+			CHECK(cached(&fs, 1, 60));
+			CHECK(ra.ra_pages == PC_READAHEAD_MAX);
+		}
+	}
+	for (unsigned long pi = 0; pi < 64; pi++)
+		CHECK(check_read(&fs, 1, pi, size));
+
+	/* Random access: no window. */
+	pagecache_invalidate_file(&fs.sb, CID(1));
+	pc_readahead_init(&ra);
+	pagecache_readahead(&ra, CID(1), 30, size, &fs.sb, CID(1));
+	pagecache_readahead(&ra, CID(1), 7, size, &fs.sb, CID(1));
+	CHECK(ra.ra_pages == 0);
+	CHECK(!cached(&fs, 1, 8) && !cached(&fs, 1, 31));
+
+	/* Zeroed state (how FAT32 and exFAT start): page 0 opens a window. */
+	pagecache_invalidate_file(&fs.sb, CID(1));
+	memset(&ra, 0, sizeof(ra));
+	pagecache_readahead(&ra, CID(1), 0, size, &fs.sb, CID(1));
+	CHECK(ra.ra_pages == 4 && cached(&fs, 1, 1));
+
+	/* Never past the end of the file. */
+	pagecache_invalidate_file(&fs.sb, CID(1));
+	pc_readahead_init(&ra);
+	pagecache_readahead(&ra, CID(1), 0, 3 * PAGE_SIZE, &fs.sb, CID(1));
+	CHECK(cached(&fs, 1, 2) && !cached(&fs, 1, 3));
+
+	pagecache_invalidate_file(&fs.sb, CID(1));
+	tfs_done(&fs);
+}
+
 int main(void)
 {
 	pagecache_init();
@@ -979,6 +1130,8 @@ int main(void)
 	test_wb_errors_bs(1024);
 	test_wb_errors_bs(2048);
 	test_wb_errors_bs(8192);
+	test_mapped_frames();
+	test_readahead();
 
 	CHECK(test_locks_held == 0);
 	CHECK(test_irq_flag == 0x200);

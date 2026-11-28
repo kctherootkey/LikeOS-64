@@ -282,9 +282,11 @@
 #define LIKEOS_NTFS_H
 
 #include <kernel/uapi/status.h>
+#include <kernel/mm/vmscan.h>
 #include <kernel/dev/block/block.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/fs/vfs_sb.h>
+#include <kernel/fs/pagecache.h>
 
 /* ---- Block ids (section 1) ---------------------------------------------- */
 #define NTFS_BID_TAG (1UL << 63)
@@ -820,10 +822,14 @@ extern const vfs_fstype_t ntfs_fstype;
 #define NTFS_IC_ENTRIES 256
 #define NTFS_IC_HASH 512
 /* Stream handle table: slots (handles 0..NTFS_SLOTS-1), and how many
- * unreferenced streams are kept around for their cached pages. */
+ * unreferenced streams may be kept around for their cached pages -- which
+ * are keyed by the handle and go with it.  They stay until memory runs
+ * short (the reclaim thread forgets the oldest through the filesystem's
+ * shrinker) or the handle table needs room: this is a ceiling, not the
+ * number they are trimmed to. */
 #define NTFS_SLOTS 16384
 #define NTFS_STREAM_HASH 2048
-#define NTFS_STREAM_KEEP 4096
+#define NTFS_STREAM_KEEP (NTFS_SLOTS * 3 / 4)
 /* Per-file content fences (hashed by MFT record number). */
 #define NTFS_FLOCKS 64
 /* Most runs one stream may have (an absurdly fragmented file still fits;
@@ -1124,6 +1130,8 @@ typedef struct ntfs_fs {
 	ntfs_stream_t *st_hash[NTFS_STREAM_HASH];
 	ntfs_stream_t lru; /* sentinel of unreferenced streams */
 	uint32_t lru_count;
+	/* Gives unreferenced streams back under memory pressure. */
+	struct vm_shrinker shrinker;
 	unsigned long lru_rl_bytes; /* runlist bytes of the LRU's streams */
 	uint32_t slot_hint;
 	ntfs_stream_t *st_mft; /* reserved handles, pinned */
@@ -1227,9 +1235,7 @@ typedef struct ntfs_file {
 	uint32_t mode;
 	unsigned long pos;
 	/* page-cache read-ahead state */
-	unsigned long ra_last_page;
-	int ra_seq_count;
-	int ra_pages;
+	pc_readahead_t ra; /* page-cache read-ahead state */
 	void *inode; /* ic_inode_t* */
 	/* readdir state: ordinal of the next entry and the resume key (the
 	 * name of the last entry returned) */

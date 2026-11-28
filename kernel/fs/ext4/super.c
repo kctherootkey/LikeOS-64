@@ -1095,6 +1095,11 @@ static int ext4_state_alloc(ext4_fs_t *fs)
 	st->gd_seen_lo = (unsigned)-1;
 	st->cwd_ino = EXT4_ROOT_INO;
 	fs->st = st;
+	if (ext4_mbc_init(fs) != ST_OK) {
+		fs->st = NULL;
+		kfree(st);
+		return ST_NOMEM;
+	}
 	return ST_OK;
 }
 
@@ -1125,11 +1130,7 @@ static void ext4_fs_release(ext4_fs_t *fs)
 		if (st->sysz)
 			kfree(st->sysz);
 		long cached = 0;
-		for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
-			if (st->mbc[i].data) {
-				cached += st->mbc[i].size;
-				kfree(st->mbc[i].data);
-			}
+		ext4_mbc_destroy(fs);
 		for (int i = 0; i < EXT4_BPOOL; i++)
 			if (st->bpool[i].data) {
 				WARN_ON(st->bpool[i].busy);

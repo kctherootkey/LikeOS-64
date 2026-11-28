@@ -2594,6 +2594,30 @@ static long run_cmd(int argc, char **argv)
 		h_free(b);
 		return r;
 	}
+	if (streq(c, "cachepage")) { /* cachepage PATH IDX: a mapping's page */
+		NARGS(2);
+		vfs_file_t *f;
+		long r = op_open(a1, O_RDONLY, 0, &f);
+		if (r != ST_OK)
+			return r;
+		unsigned long idx = num(a2);
+		struct pc_page *pg =
+			f->ops->cache_page ? f->ops->cache_page(f, idx) : NULL;
+		if (!pg) {
+			op_close(f);
+			OUT("cachepage %lu none\n", idx);
+			return ST_OK;
+		}
+		/* It must hold what a read of the same page returns. */
+		uint8_t *b = h_malloc(PAGE_SIZE);
+		long got = op_pread(f, b, PAGE_SIZE, (long)(idx * PAGE_SIZE));
+		int same = got == PAGE_SIZE && h_memcmp(b, pg->data, PAGE_SIZE) == 0;
+		h_free(b);
+		pagecache_put(pg);
+		op_close(f);
+		OUT("cachepage %lu %s\n", idx, same ? "same" : "DIFFERS");
+		return same ? ST_OK : ST_IO;
+	}
 	if (streq(c, "zeros")) { /* zeros PATH OFF LEN: that range reads as 0 */
 		NARGS(3);
 		vfs_file_t *f;
@@ -3120,6 +3144,12 @@ static long run_cmd(int argc, char **argv)
 	if (streq(c, "freepages")) { /* pretend memory is short */
 		NARGS(1);
 		test_free_pages_override = num(a1);
+		return ST_OK;
+	}
+	if (streq(c, "reclaim")) { /* reclaim N: every cache's shrinker */
+		extern unsigned long test_vm_shrink(unsigned long nr);
+		NARGS(1);
+		OUT("reclaim freed=%lu\n", test_vm_shrink(num(a1)));
 		return ST_OK;
 	}
 	if (streq(c, "cachestats")) {
